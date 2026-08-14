@@ -9,7 +9,7 @@
  * file path, a bare handle, a mention mid-sentence.
  */
 import { describe, expect, it } from "vitest";
-import { assignHandle, handleBase, MENTION_TRIGGER, parseMention } from "../src/mention.js";
+import { assignHandle, describeMention, handleBase, MENTION_TRIGGER, parseMention, resolveHandleToType } from "../src/mention.js";
 
 describe("handleBase", () => {
   it("lowercases so the handle matches how it is typed", () => {
@@ -56,6 +56,44 @@ describe("assignHandle", () => {
     // explore-2 finished and was evicted; reusing it is fine, but explore-3
     // is still running and must not be shadowed.
     expect(assignHandle("explore", new Set(["explore", "explore-3"]))).toBe("explore-2");
+  });
+});
+
+describe("resolveHandleToType", () => {
+  const TYPES = ["general-purpose", "Explore", "Code Review!"];
+
+  it("finds the type a handle was derived from, whatever its casing", () => {
+    expect(resolveHandleToType("explore", TYPES)).toBe("Explore");
+    expect(resolveHandleToType("EXPLORE", TYPES)).toBe("Explore");
+  });
+
+  it("resolves a type whose slug differs from its name", () => {
+    expect(resolveHandleToType("code-review", TYPES)).toBe("Code Review!");
+  });
+
+  it("is exact, not a prefix match — a partial handle must not start an agent", () => {
+    expect(resolveHandleToType("ex", TYPES)).toBeUndefined();
+    expect(resolveHandleToType("explore-2", TYPES)).toBeUndefined();
+  });
+
+  it("round-trips every registered type", () => {
+    for (const type of TYPES) expect(resolveHandleToType(handleBase(type), TYPES)).toBe(type);
+  });
+});
+
+describe("describeMention", () => {
+  it("uses the message as the agent's short label", () => {
+    expect(describeMention("find every retry marker")).toBe("find every retry marker");
+  });
+
+  it("takes the first line and collapses whitespace", () => {
+    expect(describeMention("  audit   the RPC path\nthen report back  ")).toBe("audit the RPC path");
+  });
+
+  it("clips a long message rather than putting a paragraph in every agent surface", () => {
+    const label = describeMention("x".repeat(200));
+    expect(label).toHaveLength(40);
+    expect(label.endsWith("…")).toBe(true);
   });
 });
 

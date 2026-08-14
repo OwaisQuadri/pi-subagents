@@ -137,7 +137,7 @@ Subagents are addressable. Every agent has a typeable handle — the agent type,
 ❯ @
   @explore        send message · running · find flaky tests
   @explore-2      resume · completed · audit the RPC path
-  @plan           start agent · Software architect for implementation planning.
+  @plan           start agent · Software architect agent for designing implementation plans.
   @code-review    start agent · Reviews a diff for correctness bugs.
 ```
 
@@ -161,7 +161,7 @@ The grammar mirrors Claude Code's, and is deliberately narrow so nothing gets sw
 | `@src/index.ts summarize this` | the main model, with pi's normal file attachment |
 | `@nosuchagent hello` | the main model, verbatim — no agent, no type, no interception |
 
-While an agent is live its handle addresses *it*, so `@explore` never starts a second Explore alongside a running one — use the `Agent` tool for deliberate parallelism. Instance handles live as long as their record (about 10 minutes past completion, cleared on `/new` and session switch); once it is gone, `@explore` starts a fresh agent again rather than resuming. `@<agent-id>` works too. Suggestions list live agents first, then startable types; when an `@` token names an agent, file suggestions are suppressed for it. Disable the whole thing via `/agents → Settings → Agent mentions`.
+While an agent is live its handle addresses *it*, so `@explore` never starts a second Explore alongside a running one — use the `Agent` tool for deliberate parallelism. Instance handles live as long as their record (about 10 minutes past completion, cleared on `/new` and session switch); once it is gone, `@explore` starts a fresh agent again rather than resuming. `@<agent-id>` works too. [Nested subagents](#nested-subagents) are not addressable — they are hidden from every top-level surface and only their owner may steer them, so a handle that would name one starts a fresh top-level agent instead of reaching through that boundary. Suggestions list live agents first, then startable types; when an `@` token names an agent, file suggestions are suppressed for it. Disable the whole thing via `/agents → Settings → Agent mentions`.
 
 A mention-started agent takes the non-tool spawn path shared with the scheduler and cross-extension RPC, so — like those — it writes no `.output` transcript and the widget shows it without per-tool detail. A mention-*resumed* agent goes through the full resume wiring and keeps both.
 

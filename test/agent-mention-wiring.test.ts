@@ -23,13 +23,22 @@ import subagentsExtension from "../src/index.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 let hermetic: Hermetic | undefined;
+/** The most recently booted extension, so teardown runs even when a test throws. */
+let booted: Map<string, any> | undefined;
 
 beforeEach(() => {
   vi.mocked(runAgent).mockReset();
   vi.mocked(resumeAgent).mockReset();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // The manager registry is a globalThis symbol claimed by the first activation
+  // that finds it free and released only on shutdown. A test that throws before
+  // its own shutdown would otherwise leave it pointing at a dead manager, and
+  // the NEXT test's `managerRegistry()` would silently read that one instead.
+  await booted?.get("session_shutdown")?.();
+  delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+  booted = undefined;
   hermetic?.restore();
   hermetic = undefined;
 });
@@ -70,9 +79,10 @@ function finishedRun(session: any) {
 /** Boot the real extension. `outputTranscript: false` keeps the run off disk. */
 function boot(settings: Record<string, unknown> = {}) {
   hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
-  const booted = makePi();
-  subagentsExtension(booted.pi);
-  return booted;
+  const b = makePi();
+  subagentsExtension(b.pi);
+  booted = b.lifecycle;
+  return b;
 }
 
 async function spawnBackground(tools: Map<string, any>, subagent_type = "Explore"): Promise<string> {
@@ -109,7 +119,6 @@ describe("messaging a running agent", () => {
     expect(uiCtx.ui.notify).toHaveBeenCalledWith("Sent to @explore", "info");
     expect(pi.sendMessage).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("un-consumes the result so the agent's reply is still relayed", async () => {
@@ -128,7 +137,6 @@ describe("messaging a running agent", () => {
 
     expect(record.resultConsumed).toBe(false);
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("addresses same-type siblings by their numbered handles", async () => {
@@ -148,7 +156,6 @@ describe("messaging a running agent", () => {
     expect(second.steer).toHaveBeenCalledWith("you take the second half");
     expect(first.steer).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 });
 
@@ -172,7 +179,6 @@ describe("messaging a finished agent", () => {
     expect(resumeAgent).toHaveBeenCalledWith(session, "anything else?", expect.anything());
     expect(uiCtx.ui.notify).toHaveBeenCalledWith("Resuming @explore", "info");
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("honours the agent's output_transcript: false when resuming", async () => {
@@ -184,22 +190,22 @@ describe("messaging a finished agent", () => {
       settings: { outputTranscript: true },
       agentFiles: { quiet: "---\ndescription: writes no transcript\noutput_transcript: false\n---\nbody" },
     });
-    const booted = makePi();
-    subagentsExtension(booted.pi);
+    const b = makePi();
+    subagentsExtension(b.pi);
+    booted = b.lifecycle;
     finishedRun(fakeSession());
     vi.mocked(resumeAgent).mockResolvedValue({ text: "second answer", failure: undefined } as any);
 
-    const id = await spawnBackground(booted.tools, "quiet");
+    const id = await spawnBackground(b.tools, "quiet");
     await flush();
-    const record = booted.pi.__manager?.getRecord?.(id)
+    const record = b.pi.__manager?.getRecord?.(id)
       ?? (globalThis as any)[Symbol.for("pi-subagents:manager")].getRecord(id);
     expect(record.outputFile).toBeUndefined(); // spawn honoured it
 
-    await send(booted.lifecycle, "@quiet anything else?");
+    await send(b.lifecycle, "@quiet anything else?");
 
     expect(record.outputFile).toBeUndefined();
 
-    await booted.lifecycle.get("session_shutdown")?.();
   });
 
   it("does not attribute the new answer to the tool call that spawned it", async () => {
@@ -221,7 +227,6 @@ describe("messaging a finished agent", () => {
     expect(message.content).toContain("second answer");
     expect(message.content).not.toContain("<tool-use-id>");
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("relays the resumed answer through the ordinary completion notification", async () => {
@@ -244,7 +249,6 @@ describe("messaging a finished agent", () => {
       expect.objectContaining({ triggerTurn: true }),
     );
 
-    await lifecycle.get("session_shutdown")?.();
   });
 });
 
@@ -276,7 +280,6 @@ describe("stacking the suggestion provider on pi's", () => {
     expect(first.ui.addAutocompleteProvider).toHaveBeenCalledTimes(1);
     expect(second.ui.addAutocompleteProvider).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("stays out of non-TUI modes, which have no editor to complete into", async () => {
@@ -287,7 +290,6 @@ describe("stacking the suggestion provider on pi's", () => {
 
     expect(rpc.ui.addAutocompleteProvider).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("hands pi a provider that answers a live handle", async () => {
@@ -305,7 +307,99 @@ describe("stacking the suggestion provider on pi's", () => {
 
     expect(result.items.map((i: any) => i.value)).toEqual(["@explore"]);
 
-    await lifecycle.get("session_shutdown")?.();
+  });
+});
+
+describe("resolving which agent a handle means", () => {
+  const managerRegistry = () => (globalThis as any)[Symbol.for("pi-subagents:manager")];
+
+  it("matches the handle case-insensitively", async () => {
+    // The popup lowercases as you type, but nothing stops you typing it out.
+    const { tools, lifecycle } = boot();
+    const session = fakeSession();
+    heldRun(session);
+
+    await spawnBackground(tools);
+    await flush();
+
+    expect(await send(lifecycle, "@EXPLORE shout")).toEqual({ action: "handled" });
+    expect(session.steer).toHaveBeenCalledWith("shout");
+
+  });
+
+  it("accepts the raw agent id, which the README offers as a fallback", async () => {
+    const { tools, lifecycle } = boot();
+    const session = fakeSession();
+    heldRun(session);
+
+    const id = await spawnBackground(tools);
+    await flush();
+
+    expect(await send(lifecycle, `@${id} by id`)).toEqual({ action: "handled" });
+    expect(session.steer).toHaveBeenCalledWith("by id");
+
+  });
+
+  it("queues the message for an agent still waiting on a concurrency slot", async () => {
+    // A queued agent has no session yet, so the manager parks the message and
+    // flushes it on session creation. Reporting "sent" without that would be a
+    // lie the user only discovers when the agent ignores them.
+    const { tools, lifecycle } = boot({ maxConcurrent: 1 });
+    heldRun(fakeSession());
+
+    await spawnBackground(tools);
+    const queuedId = await spawnBackground(tools);
+    await flush();
+
+    const queued = managerRegistry().getRecord(queuedId);
+    expect(queued.status).toBe("queued");
+
+    expect(await send(lifecycle, "@explore-2 wait for me")).toEqual({ action: "handled" });
+    expect(queued.pendingSteers).toEqual(["wait for me"]);
+
+  });
+
+  it("never reaches into a nested child, and starts a top-level agent instead", async () => {
+    // Nested agents are hidden from every top-level surface and only their
+    // owner may steer them. The handle still resolves — to a NEW top-level
+    // Explore — rather than punching through the ownership boundary.
+    const { tools, lifecycle } = boot();
+    const child = fakeSession();
+    heldRun(child);
+
+    const id = await spawnBackground(tools);
+    await flush();
+    managerRegistry().getRecord(id).parentAgentId = "some-parent";
+    vi.mocked(runAgent).mockClear();
+
+    expect(await send(lifecycle, "@explore reach into a child")).toEqual({ action: "handled" });
+    expect(child.steer).not.toHaveBeenCalled();
+    expect(runAgent).toHaveBeenCalledWith(
+      expect.anything(), "Explore", "reach into a child", expect.anything(),
+    );
+  });
+
+  it("starts a fresh agent once the old record has been evicted", async () => {
+    // README: handles live as long as their record, and after that the same
+    // mention starts a new agent rather than resurrecting anything.
+    const { tools, lifecycle } = boot();
+    finishedRun(fakeSession());
+
+    const id = await spawnBackground(tools);
+    await flush();
+    managerRegistry().getRecord(id).resultConsumed = true;
+    await lifecycle.get("session_before_switch")();
+    expect(managerRegistry().getRecord(id)).toBeUndefined();
+
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(runAgent).mockClear();
+    heldRun(fakeSession());
+
+    await send(lifecycle, "@explore start over");
+
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(runAgent).toHaveBeenCalledWith(expect.anything(), "Explore", "start over", expect.anything());
+
   });
 });
 
@@ -329,7 +423,6 @@ describe("mentioning an agent that has never run", () => {
     );
     expect(uiCtx.ui.notify).toHaveBeenCalledWith("Started @explore", "info");
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("leaves model, thinking and max turns to the agent's own config", async () => {
@@ -345,7 +438,6 @@ describe("mentioning an agent that has never run", () => {
     expect(opts.thinkingLevel).toBeUndefined();
     expect(opts.maxTurns).toBeUndefined();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("runs it in the background so the prompt is not blocked", async () => {
@@ -359,7 +451,6 @@ describe("mentioning an agent that has never run", () => {
     expect(record.isBackground).toBe(true);
     expect(record.description).toBe("go");
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("messages the running agent rather than starting a second one", async () => {
@@ -376,7 +467,6 @@ describe("mentioning an agent that has never run", () => {
     expect(runAgent).not.toHaveBeenCalled();
     expect(session.steer).toHaveBeenCalledWith("actually do this instead");
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("reports a failed start instead of silently doing nothing", async () => {
@@ -397,7 +487,6 @@ describe("mentioning an agent that has never run", () => {
       "error",
     );
 
-    await lifecycle.get("session_shutdown")?.();
   });
 });
 
@@ -419,7 +508,6 @@ describe("input that is not a mention", () => {
     expect(await send(lifecycle, "@explore")).toEqual({ action: "continue" });
     expect(session.steer).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("leaves a leading file attachment alone", async () => {
@@ -431,7 +519,6 @@ describe("input that is not a mention", () => {
 
     expect(await send(lifecycle, "@src/index.ts summarize this")).toEqual({ action: "continue" });
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("ignores input the extension layer submitted", async () => {
@@ -447,7 +534,6 @@ describe("input that is not a mention", () => {
     expect(await send(lifecycle, "@explore relayed text", "extension")).toEqual({ action: "continue" });
     expect(session.steer).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("falls through entirely when mentions are disabled", async () => {
@@ -461,7 +547,6 @@ describe("input that is not a mention", () => {
     expect(await send(lifecycle, "@explore do this")).toEqual({ action: "continue" });
     expect(session.steer).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("disabled also blocks starting an agent, not just messaging one", async () => {
@@ -473,7 +558,6 @@ describe("input that is not a mention", () => {
     expect(await send(lifecycle, "@explore go")).toEqual({ action: "continue" });
     expect(runAgent).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("disabled also blocks resuming a finished agent", async () => {
@@ -487,7 +571,6 @@ describe("input that is not a mention", () => {
     expect(await send(lifecycle, "@explore anything else?")).toEqual({ action: "continue" });
     expect(resumeAgent).not.toHaveBeenCalled();
 
-    await lifecycle.get("session_shutdown")?.();
   });
 
   it("the suggestion popup goes quiet too, so @ means only 'attach a file'", async () => {
@@ -512,6 +595,5 @@ describe("input that is not a mention", () => {
 
     expect(await provider.getSuggestions(["@ex"], 0, 3, { signal: new AbortController().signal })).toBe(files);
 
-    await lifecycle.get("session_shutdown")?.();
   });
 });
