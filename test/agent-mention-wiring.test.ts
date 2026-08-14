@@ -538,6 +538,42 @@ describe("input that is not a mention", () => {
 
   });
 
+  it("leaves a headless prompt to the main model", async () => {
+    // Pi defaults session.prompt() to source "interactive", so `pi -p "@explore
+    // …"` lands in this hook too. Claiming it there would answer with silence:
+    // the agent detaches, notify is a no-op outside the TUI, and print mode
+    // exits having printed nothing.
+    const { lifecycle } = boot();
+    heldRun(fakeSession());
+
+    const result = await lifecycle.get("input")(
+      { type: "input", text: "@explore go", source: "interactive" },
+      ctx({ mode: "print" }),
+    );
+
+    expect(result).toEqual({ action: "continue" });
+    expect(runAgent).not.toHaveBeenCalled();
+
+  });
+
+  it("leaves an RPC-driven prompt to the main model", async () => {
+    const { tools, lifecycle } = boot();
+    const session = fakeSession();
+    heldRun(session);
+
+    await spawnBackground(tools);
+    await flush();
+
+    const result = await lifecycle.get("input")(
+      { type: "input", text: "@explore also check this", source: "rpc" },
+      ctx({ mode: "rpc" }),
+    );
+
+    expect(result).toEqual({ action: "continue" });
+    expect(session.steer).not.toHaveBeenCalled();
+
+  });
+
   it("falls through entirely when mentions are disabled", async () => {
     const { tools, lifecycle } = boot({ agentMentions: false });
     const session = fakeSession();

@@ -696,6 +696,16 @@ export default function (pi: ExtensionAPI) {
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
+    // TUI only, matching the `@` completion that teaches the syntax. Pi defaults
+    // `session.prompt()` to source "interactive", so a headless `pi -p "@explore
+    // …"` reaches here too — and claiming it would answer with silence, which
+    // the background hold cannot fix: `handled` returns from prompt() before any
+    // turn starts, so the loop that patch wraps never runs (it holds subagents
+    // spawned by the Agent tool MID-turn, a different path). The agent would
+    // detach, `ctx.ui.notify` is a no-op outside the TUI, and print mode would
+    // exit having printed nothing. Falling through sends the prompt to the main
+    // model, exactly as it did before mentions existed.
+    if (ctx.mode !== "tui") return { action: "continue" };
 
     const mention = parseMention(event.text);
     if (!mention) return { action: "continue" };
