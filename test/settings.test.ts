@@ -116,6 +116,15 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
+  it("round-trips agentMentions (true and false); keeps boolean, drops non-boolean", () => {
+    saveSettings({ agentMentions: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ agentMentions: false });
+    saveSettings({ agentMentions: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ agentMentions: true });
+    writeProject({ agentMentions: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
+  });
+
   it("round-trips widgetMode; keeps valid values, drops invalid", () => {
     saveSettings({ widgetMode: "off" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "off" });
@@ -431,6 +440,7 @@ describe("settings persistence", () => {
         setDisableDefaultAgents: vi.fn(),
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
+        setAgentMentions: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
@@ -518,6 +528,13 @@ describe("settings persistence", () => {
       expect(appliers.setFleetView).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
+    it("applies agentMentions; skips it when absent", () => {
+      applySettings({ agentMentions: false }, appliers);
+      expect(appliers.setAgentMentions).toHaveBeenCalledWith(false);
+      applySettings({}, appliers);
+      expect(appliers.setAgentMentions).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
     it("applies scopeModels: false", () => {
       applySettings({ scopeModels: false }, appliers);
       expect(appliers.setScopeModels).toHaveBeenCalledWith(false);
@@ -598,6 +615,7 @@ describe("settings persistence", () => {
         setDisableDefaultAgents: vi.fn(),
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
+        setAgentMentions: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
         setMaxSubagentDepth: vi.fn(),

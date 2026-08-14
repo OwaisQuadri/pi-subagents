@@ -13,6 +13,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { assignHandle, handleBase } from "./mention.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -210,6 +211,10 @@ export class AgentManager {
     const record: AgentRecord = {
       id,
       type,
+      // Nested children are filtered out of every top-level surface, so no
+      // handle: nothing can address them and they must not consume a name a
+      // top-level sibling could otherwise take.
+      handle: options.parentAgentId === undefined ? assignHandle(handleBase(type), this.takenHandles()) : undefined,
       description: options.description,
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
@@ -732,6 +737,35 @@ export class AgentManager {
 
   getRecord(id: string): AgentRecord | undefined {
     return this.agents.get(id);
+  }
+
+  /** Handles already in use, so a fresh spawn can pick an unclaimed one. */
+  private takenHandles(): Set<string> {
+    const taken = new Set<string>();
+    for (const record of this.agents.values()) {
+      if (record.handle) taken.add(record.handle);
+    }
+    return taken;
+  }
+
+  /**
+   * Resolve an `@name` from the prompt. Matches a top-level agent's handle
+   * case-insensitively, preferring one that can still be steered and otherwise
+   * the most recently started (which is the one a resume should continue), then
+   * falls back to an exact agent id so `@<agentId>` works too.
+   */
+  resolveMention(name: string): AgentRecord | undefined {
+    const wanted = name.toLowerCase();
+    let fallback: AgentRecord | undefined;
+    for (const record of this.agents.values()) {
+      if (record.parentAgentId !== undefined) continue;
+      if (record.handle?.toLowerCase() !== wanted) continue;
+      if (record.status === "running" || record.status === "queued") return record;
+      if (!fallback || record.startedAt > fallback.startedAt) fallback = record;
+    }
+    if (fallback) return fallback;
+    const byId = this.agents.get(name);
+    return byId?.parentAgentId === undefined ? byId : undefined;
   }
 
   listAgents(): AgentRecord[] {

@@ -86,6 +86,14 @@ export interface SubagentsSettings {
    */
   fleetView?: boolean;
   /**
+   * Whether `@handle message` typed at the prompt is routed to that subagent
+   * instead of the main model, and whether `@` offers running agents alongside
+   * pi's file completion. Defaults to `true`. Pure-UI and applied live: when
+   * off, the input hook falls straight through and the stacked autocomplete
+   * provider delegates everything back to pi's built-in one.
+   */
+  agentMentions?: boolean;
+  /**
    * Display mode for the persistent above-editor agent widget:
    *   - `all`: show every agent (foreground + background).
    *   - `background`: hide foreground agents — they already render inline as the
@@ -145,6 +153,7 @@ export interface SettingsAppliers {
   setDisableDefaultAgents: (b: boolean) => void;
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
   setFleetView: (b: boolean) => void;
+  setAgentMentions: (b: boolean) => void;
   setWidgetMode: (mode: WidgetMode) => void;
   setOutputTranscript: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
@@ -219,6 +228,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.fleetView === "boolean") {
     out.fleetView = r.fleetView;
+  }
+  if (typeof r.agentMentions === "boolean") {
+    out.agentMentions = r.agentMentions;
   }
   if (typeof r.widgetMode === "string" && VALID_WIDGET_MODES.has(r.widgetMode)) {
     out.widgetMode = r.widgetMode as WidgetMode;
@@ -298,6 +310,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.disableDefaultAgents === "boolean") appliers.setDisableDefaultAgents(s.disableDefaultAgents);
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);
   if (typeof s.fleetView === "boolean") appliers.setFleetView(s.fleetView);
+  if (typeof s.agentMentions === "boolean") appliers.setAgentMentions(s.agentMentions);
   if (s.widgetMode) appliers.setWidgetMode(s.widgetMode);
   if (typeof s.outputTranscript === "boolean") appliers.setOutputTranscript(s.outputTranscript);
 }

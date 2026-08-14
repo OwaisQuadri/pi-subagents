@@ -26,6 +26,7 @@ import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { describeMention, parseMention, resolveHandleToType } from "./mention.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -35,6 +36,7 @@ import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -571,6 +573,8 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  /** Whether the `@handle` autocomplete wrapper has been stacked on pi's provider. */
+  let mentionProviderRegistered = false;
 
   // ---- Subagent scheduler ----
   // Session-scoped: store is constructed inside session_start once sessionId
@@ -624,6 +628,95 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:ready", {});
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
+    // Stack `@handle` suggestions on pi's built-in autocomplete. Registered at
+    // most once per activation: pi appends wrappers to a list it never prunes,
+    // so a second call would layer a duplicate provider on the first. TUI only
+    // — print mode has no such method, and RPC mode's is a no-op.
+    if (ctx.mode === "tui" && !mentionProviderRegistered) {
+      mentionProviderRegistered = true;
+      ctx.ui.addAutocompleteProvider(current =>
+        createMentionProvider(current, () => mentionRoster(manager, mentionTypes()), isAgentMentionsEnabled),
+      );
+    }
+  });
+
+  /** Agent types `@` can start, in the shape the roster wants. */
+  const mentionTypes = (): TypeInfo[] =>
+    getAvailableTypes().map(name => ({ name, description: getAgentConfig(name)?.description ?? name }));
+
+  /**
+   * `@handle message` typed at the prompt addresses that agent instead of the
+   * main model — Claude Code's prompt mention, same grammar (see mention.ts).
+   *
+   * The handle names the *agent*, not one process, so one syntax covers its
+   * whole lifecycle: message it while it runs, resume it once it has finished,
+   * start it if it never ran. Everything that isn't an agent mention falls
+   * through untouched, which is what keeps `@src/foo.ts summarize this`, a bare
+   * `@handle`, and ordinary prose working. A delivered mention costs no
+   * main-model turn; the answer arrives through the ordinary completion
+   * notification either way.
+   */
+  pi.on("input", async (event, ctx) => {
+    // Never hijack text the extension layer itself submitted (pi.sendMessage,
+    // scheduled prompts) — only something a person typed can be a mention.
+    if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
+
+    const mention = parseMention(event.text);
+    if (!mention) return { action: "continue" };
+
+    const record = manager.resolveMention(mention.handle);
+    const target = `@${record?.handle ?? mention.handle}`;
+
+    if (record?.status === "running" || record?.status === "queued") {
+      // Steering interrupts after the current tool call, exactly like the
+      // steer_subagent tool. Un-consume the result so the agent's reply to this
+      // message is still relayed even if the LLM already read its last answer.
+      record.resultConsumed = false;
+      manager.steer(record.id, mention.message);
+      pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
+      ctx.ui.notify(`Sent to ${target}`, "info");
+      return { action: "handled" };
+    }
+
+    if (record?.session) {
+      // Both derived from the record's OWN type: a mention names an existing
+      // agent, so its frontmatter is what governs — `output_transcript: false`
+      // must keep holding, since record.outputFile is the sole gate every
+      // downstream consumer keys off and a resume must not re-open it.
+      const config = getAgentConfig(record.type);
+      const resumed = await startBackgroundResume(ctx, record, mention.message, {
+        outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+        maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
+      });
+      ctx.ui.notify(
+        resumed ? `Resuming ${target}` : `Could not resume ${target}.`,
+        resumed ? "info" : "warning",
+      );
+      return { action: "handled" };
+    }
+
+    // No live agent under that handle — but the name may still be an agent
+    // type, in which case the mention starts one. A record with no session
+    // lands here too: it never got far enough to continue, so a fresh run is
+    // the only thing "message this agent" can honestly mean.
+    const type = resolveHandleToType(mention.handle, getAvailableTypes());
+    if (!type) return { action: "continue" };
+
+    try {
+      // Nothing else to pass: runAgent resolves model, thinking and max turns
+      // from the agent's own config when the spawn omits them, and the
+      // manager's onStart/onComplete callbacks own the widget, the fleet list
+      // and the completion notification — the same contract the scheduler and
+      // cross-extension RPC spawns run under.
+      spawnTopLevel(pi, ctx, type, mention.message, {
+        description: describeMention(mention.message),
+        isBackground: true,
+      });
+      ctx.ui.notify(`Started ${target}`, "info");
+    } catch (err) {
+      ctx.ui.notify(`Could not start ${target}: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+    return { action: "handled" };
   });
 
   pi.on("session_before_switch", () => {
@@ -667,6 +760,14 @@ export default function (pi: ExtensionAPI) {
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
+
+  // Claude Code-style `@handle message` prompt mentions. Read live by both the
+  // `input` hook and the stacked autocomplete provider, so the toggle applies
+  // immediately — the provider itself can never be unregistered (pi's wrapper
+  // list is append-only), it just delegates everything when this is off.
+  let agentMentionsEnabled = true;
+  function isAgentMentionsEnabled(): boolean { return agentMentionsEnabled; }
+  function setAgentMentionsEnabled(b: boolean): void { agentMentionsEnabled = b; }
 
   // Project/global default for writing the subagent .output transcript lives in
   // output-file.ts (both spawn paths read it). A custom agent's
@@ -751,6 +852,100 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Launch a detached resume of an existing agent and wire everything a
+   * re-running agent needs: transcript anchoring, activity tracking, join-mode
+   * batching, the widget/fleet refresh, and the `subagents:created` event.
+   *
+   * Shared by the Agent tool's `resume` + `run_in_background` branch and the
+   * `@handle message` prompt mention — they differ only in how they report the
+   * outcome. Returns the record, or undefined when the manager refused because
+   * the agent is still running (see AgentManager.resume).
+   *
+   * Callers must have already established that the record has a session.
+   */
+  async function startBackgroundResume(
+    ctx: ExtensionContext,
+    existing: AgentRecord,
+    prompt: string,
+    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+  ): Promise<AgentRecord | undefined> {
+    const id = existing.id;
+    const joinMode = resolveJoinMode(defaultJoinMode, true);
+    // Assigned unconditionally: the completion notification carries this as
+    // `<tool-use-id>`, so a mention-resume (which passes none) has to CLEAR the
+    // id left by the spawn that created the record. Keeping it would point the
+    // orchestrator's new result at a tool call that was answered runs ago.
+    existing.toolCallId = opts.toolCallId;
+    if (joinMode) existing.joinMode = joinMode;
+    // Reuse the agent's transcript rather than starting a fresh one: the
+    // path is deterministic per agent+session, so writing an initial entry
+    // would truncate the previous run's turns (see ensureOutputFile).
+    if (opts.outputTranscript) {
+      existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+      ensureOutputFile(existing.outputFile);
+    }
+    // Anchor streaming past the turns already on disk, captured BEFORE the
+    // run starts. The resumed prompt lands as an ordinary user message at
+    // this index, so it is written exactly once.
+    const transcriptAnchor = existing.session?.messages.length ?? 0;
+
+    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(opts.maxTurns);
+    // resumeAgent has no onSessionCreated — the session predates this run —
+    // so seed it directly, or the widget shows no context % for the agent.
+    bgState.session = existing.session;
+
+    // No `signal`: a background spawn deliberately omits it, and a detached
+    // resume must behave the same. Passing it would abort this agent when
+    // the parent turn is interrupted (user Esc), while agents started with
+    // run_in_background in that same turn keep going.
+    const record = await manager.resume(id, prompt, undefined, {
+      isBackground: true,
+      onToolActivity: bgCallbacks.onToolActivity,
+      onAssistantUsage: bgCallbacks.onAssistantUsage,
+      // Fires when the run actually starts — immediately, or on queue
+      // drain. Wiring it here (rather than after resume() returns) means a
+      // resume stopped while still queued never started streaming, so
+      // there is no subscription left behind for a later run to trip over.
+      onStarted: () => {
+        const rec = manager.getRecord(id);
+        if (rec?.session && rec.outputFile) {
+          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
+        }
+      },
+    });
+    if (!record) return undefined;
+
+    if (joinMode != null && joinMode !== 'async') {
+      currentBatchAgents.push({ id, joinMode });
+      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = setTimeout(finalizeBatch, 100);
+    }
+
+    agentActivity.set(id, bgState);
+    // This agent already finished once, so the widget holds a finished-age
+    // for it that is past the linger limit — without clearing it, the
+    // resumed run's ✓/✗ line never renders and the agent just vanishes.
+    widget.markRunning(id);
+    widget.ensureTimer();
+    widget.update();
+    fleet.ensureTimer();
+    fleet.update();
+
+    // Resume ignores subagent_type (the record keeps the type it was
+    // spawned with), so report the record's own identity — a "created"
+    // event carrying the caller's type would re-register the agent under
+    // the wrong one in cross-extension mirrors keyed by id.
+    pi.events.emit("subagents:created", {
+      id,
+      type: existing.type,
+      description: existing.description,
+      isBackground: true,
+    });
+
+    return record;
+  }
+
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
     widget.setUICtx(ctx.ui as UICtx);
@@ -806,6 +1001,7 @@ export default function (pi: ExtensionAPI) {
       setDisableDefaultAgents: setDisableDefaultAgents,
       setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
+      setAgentMentions: setAgentMentionsEnabled,
       setWidgetMode: setWidgetMode,
       setOutputTranscript: setOutputTranscriptDefault,
       setMaxSubagentDepth: setMaxSubagentDepth,
@@ -1306,75 +1502,14 @@ Terse command-style prompts produce shallow, generic work.
             );
           }
 
-          const joinMode = resolveJoinMode(defaultJoinMode, true);
-          existing.toolCallId = toolCallId;
-          if (joinMode) existing.joinMode = joinMode;
-          // Reuse the agent's transcript rather than starting a fresh one: the
-          // path is deterministic per agent+session, so writing an initial entry
-          // would truncate the previous run's turns (see ensureOutputFile).
-          if (outputTranscript) {
-            existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
-            ensureOutputFile(existing.outputFile);
-          }
-          // Anchor streaming past the turns already on disk, captured BEFORE the
-          // run starts. The resumed prompt lands as an ordinary user message at
-          // this index, so it is written exactly once.
-          const transcriptAnchor = existing.session.messages.length;
-
-          const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
-          // resumeAgent has no onSessionCreated — the session predates this run —
-          // so seed it directly, or the widget shows no context % for the agent.
-          bgState.session = existing.session;
-
-          // No `signal`: a background spawn deliberately omits it, and a detached
-          // resume must behave the same. Passing it would abort this agent when
-          // the parent turn is interrupted (user Esc), while agents started with
-          // run_in_background in that same turn keep going.
-          const record = await manager.resume(params.resume, params.prompt, undefined, {
-            isBackground: true,
-            onToolActivity: bgCallbacks.onToolActivity,
-            onAssistantUsage: bgCallbacks.onAssistantUsage,
-            // Fires when the run actually starts — immediately, or on queue
-            // drain. Wiring it here (rather than after resume() returns) means a
-            // resume stopped while still queued never started streaming, so
-            // there is no subscription left behind for a later run to trip over.
-            onStarted: () => {
-              const rec = manager.getRecord(id);
-              if (rec?.session && rec.outputFile) {
-                rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
-              }
-            },
+          const record = await startBackgroundResume(ctx, existing, params.prompt, {
+            outputTranscript,
+            maxTurns: effectiveMaxTurns,
+            toolCallId,
           });
           if (!record) {
             return textResult(`Failed to resume agent "${params.resume}".`);
           }
-
-          if (joinMode != null && joinMode !== 'async') {
-            currentBatchAgents.push({ id, joinMode });
-            if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-            batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-          }
-
-          agentActivity.set(id, bgState);
-          // This agent already finished once, so the widget holds a finished-age
-          // for it that is past the linger limit — without clearing it, the
-          // resumed run's ✓/✗ line never renders and the agent just vanishes.
-          widget.markRunning(id);
-          widget.ensureTimer();
-          widget.update();
-          fleet.ensureTimer();
-          fleet.update();
-
-          // Resume ignores subagent_type (the record keeps the type it was
-          // spawned with), so report the record's own identity — a "created"
-          // event carrying the caller's type would re-register the agent under
-          // the wrong one in cross-extension mirrors keyed by id.
-          pi.events.emit("subagents:created", {
-            id,
-            type: existing.type,
-            description: existing.description,
-            isBackground: true,
-          });
 
           const isQueued = record.status === "queued";
           return textResult(
@@ -2292,6 +2427,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
       fleetView: isFleetViewEnabled(),
+      agentMentions: isAgentMentionsEnabled(),
       widgetMode: getWidgetMode(),
       outputTranscript: getOutputTranscriptDefault(),
       maxSubagentDepth: getMaxSubagentDepth(),
@@ -2416,6 +2552,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["on", "off"],
         },
         {
+          id: "agentMentions",
+          label: "Agent mentions",
+          description: "Route `@handle message` typed at the prompt to that agent, and offer running agents on `@`",
+          currentValue: isAgentMentionsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
           id: "widgetMode",
           label: "Widget",
           description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
@@ -2511,6 +2654,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
         notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "agentMentions") {
+        const enabled = value === "on";
+        setAgentMentionsEnabled(enabled);
+        notifyApplied(ctx, `Agent mentions ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "widgetMode") {
         setWidgetMode(value as WidgetMode);
         notifyApplied(ctx, `Widget set to ${value}`);

@@ -91,6 +91,13 @@ export type WidgetMode = 'all' | 'background' | 'off';
 export interface AgentRecord {
   id: string;
   type: SubagentType;
+  /**
+   * Typeable name for the `@handle message` prompt mention, derived from the
+   * agent type and numbered when siblings collide (`explore`, `explore-2`).
+   * Top-level agents only — nested children are hidden from every top-level
+   * surface, so nothing can address them.
+   */
+  handle?: string;
   description: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
   result?: string;
