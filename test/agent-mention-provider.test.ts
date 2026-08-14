@@ -11,7 +11,7 @@
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
-import type { AgentRecord } from "../src/types.js";
+import type { AgentRecord, AgentTombstone } from "../src/types.js";
 import { createMentionProvider, mentionRoster } from "../src/ui/agent-mention.js";
 
 const FILE_SUGGESTIONS = { items: [{ value: "@src/index.ts", label: "src/index.ts" }], prefix: "@src/" };
@@ -42,7 +42,30 @@ function record(over: Partial<AgentRecord>): AgentRecord {
 
 function managerWith(...records: AgentRecord[]): AgentManager {
   // listAgents() is newest-first, matching the real manager's contract.
-  return { listAgents: () => [...records].sort((a, b) => b.startedAt - a.startedAt) } as unknown as AgentManager;
+  return {
+    listAgents: () => [...records].sort((a, b) => b.startedAt - a.startedAt),
+    listTombstones: () => [],
+  } as unknown as AgentManager;
+}
+
+/** A manager holding only evicted agents, to exercise the resume rows. */
+function managerWithTombstones(...entries: AgentTombstone[]): AgentManager {
+  return {
+    listAgents: () => [],
+    listTombstones: () => [...entries].sort((a, b) => b.completedAt - a.completedAt),
+  } as unknown as AgentManager;
+}
+
+function tombstone(over: Partial<AgentTombstone> = {}): AgentTombstone {
+  return {
+    handle: "explore",
+    id: "t1",
+    type: "Explore" as AgentTombstone["type"],
+    description: "audit the RPC path",
+    sessionFile: "/sessions/explore.jsonl",
+    completedAt: 5000,
+    ...over,
+  };
 }
 
 /** Ask for suggestions on a single line, cursor at the end. */
@@ -354,5 +377,134 @@ describe("insertion and trigger plumbing", () => {
     const provider = createMentionProvider(builtIn(), () => mentionRoster(managerWith(), []), () => true);
 
     expect(provider.triggerCharacters).toEqual(["@"]);
+  });
+});
+
+describe("named agents and evicted ones", () => {
+  it("lists a named agent once, under its alias, and says what type it is", async () => {
+    // Two rows for one agent would read as two agents; and `@auth-audit`
+    // alone says nothing about what it is, which the handle used to carry.
+    const provider = createMentionProvider(
+      builtIn(),
+      () => mentionRoster(managerWith(record({ handle: "explore", alias: "auth-audit", type: "Explore", status: "running", description: "audit the auth flow" })), []),
+      () => true,
+    );
+
+    const items = (await suggest(provider, "@"))!.items;
+
+    expect(items).toEqual([
+      { value: "@auth-audit", label: "@auth-audit", description: "send message · Explore · running · audit the auth flow" },
+    ]);
+  });
+
+  it("leaves an unnamed agent's row free of a redundant type", async () => {
+    const provider = createMentionProvider(
+      builtIn(),
+      () => mentionRoster(managerWith(record({ handle: "explore", type: "Explore", status: "running", description: "find flaky tests" })), []),
+      () => true,
+    );
+
+    expect((await suggest(provider, "@"))!.items[0].description).toBe("send message · running · find flaky tests");
+  });
+
+  it("still resolves the unlisted type handle of a named agent", () => {
+    // The row shows the alias, but `@explore` must keep reaching this agent —
+    // that is what stops it from starting a second Explore.
+    const roster = mentionRoster(
+      managerWith(record({ handle: "explore", alias: "auth-audit", type: "Explore", status: "running" })),
+      [{ name: "Explore", description: "search" }],
+    );
+
+    // The type is NOT offered as startable: its handle belongs to the live agent.
+    expect(roster.map(t => t.handle)).toEqual(["auth-audit"]);
+  });
+
+  it("offers an evicted agent as a resume, after the live ones", async () => {
+    const provider = createMentionProvider(
+      builtIn(),
+      () => mentionRoster(managerWithTombstones(tombstone()), []),
+      () => true,
+    );
+
+    expect((await suggest(provider, "@"))!.items).toEqual([
+      { value: "@explore", label: "@explore", description: "resume · Explore · audit the RPC path" },
+    ]);
+  });
+
+  it("puts live agents ahead of resumable ones", async () => {
+    // A running agent is the likelier target, and a resume is the slower,
+    // more surprising action to land on by pressing Enter too quickly.
+    const manager = {
+      listAgents: () => [record({ handle: "plan", type: "Plan", status: "running" })],
+      listTombstones: () => [tombstone()],
+    } as unknown as AgentManager;
+    const provider = createMentionProvider(builtIn(), () => mentionRoster(manager, []), () => true);
+
+    expect((await suggest(provider, "@"))!.items.map(i => i.value)).toEqual(["@plan", "@explore"]);
+  });
+
+  it("keeps an aliased tombstone's type handle reserved too", () => {
+    // It lists under its alias, but `@explore` still resumes it — so the
+    // Explore type must not also be offered as startable under that name.
+    const roster = mentionRoster(
+      managerWithTombstones(tombstone({ handle: "explore", alias: "auth-audit" })),
+      [{ name: "Explore", description: "search" }],
+    );
+
+    expect(roster.map(t => t.handle)).toEqual(["auth-audit"]);
+  });
+
+  it("does not offer a startable type whose handle a tombstone still holds", () => {
+    // `@explore` resumes the old conversation, so advertising "start agent"
+    // under the same name would promise the wrong action.
+    const roster = mentionRoster(managerWithTombstones(tombstone()), [{ name: "Explore", description: "search" }]);
+
+    expect(roster).toHaveLength(1);
+    expect(roster[0].kind).toBe("tombstone");
+  });
+});
+
+// FleetView, the widget, the tool header and the conversation viewer all render
+// `display_name` (via getConfig). The popup rendering the raw type instead would
+// make `@` the one surface that calls the same agent something else.
+describe("rows carry the display name, not the raw type", () => {
+  const label = (type: string) => (type === "Explore" ? "Auth Auditor" : type);
+
+  it("names an aliased agent by its label", async () => {
+    const provider = createMentionProvider(
+      builtIn(),
+      () => mentionRoster(
+        managerWith(record({ handle: "explore", alias: "auth-audit", type: "Explore", status: "running", description: "audit the auth flow" })),
+        [],
+        label,
+      ),
+      () => true,
+    );
+
+    expect((await suggest(provider, "@"))!.items[0].description)
+      .toBe("send message · Auth Auditor · running · audit the auth flow");
+  });
+
+  it("names a resumable agent by its label", async () => {
+    const provider = createMentionProvider(
+      builtIn(),
+      () => mentionRoster(managerWithTombstones(tombstone()), [], label),
+      () => true,
+    );
+
+    expect((await suggest(provider, "@"))!.items[0].description)
+      .toBe("resume · Auth Auditor · audit the RPC path");
+  });
+
+  it("falls back to the raw type when no resolver is supplied", async () => {
+    // Which is also what getConfig does for an agent with no display_name, so
+    // the default keeps a caller without a registry honest rather than blank.
+    const provider = createMentionProvider(
+      builtIn(),
+      () => mentionRoster(managerWithTombstones(tombstone()), []),
+      () => true,
+    );
+
+    expect((await suggest(provider, "@"))!.items[0].description).toContain("· Explore ·");
   });
 });

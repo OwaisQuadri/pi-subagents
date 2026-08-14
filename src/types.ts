@@ -88,6 +88,30 @@ export type JoinMode = 'async' | 'group' | 'smart';
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
+/**
+ * What survives a record's eviction so `@handle` keeps working. The live record
+ * is discarded after ~10 minutes, but the pi session it wrote is still on disk,
+ * and this is the little that is needed to find and describe it again.
+ */
+export interface AgentTombstone {
+  handle: string;
+  alias?: string;
+  id: string;
+  type: SubagentType;
+  description: string;
+  /** Always set — a record with no session file is never tombstoned. */
+  sessionFile: string;
+  completedAt: number;
+}
+
+/**
+ * What `@handle` resolved to: an agent still in memory, or the remains of one
+ * whose conversation can be reopened from disk.
+ */
+export type MentionResolution =
+  | { kind: "live"; record: AgentRecord }
+  | { kind: "tombstone"; entry: AgentTombstone };
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -98,6 +122,13 @@ export interface AgentRecord {
    * surface, so nothing can address them.
    */
   handle?: string;
+  /**
+   * A second, memorable handle from the spawner's `name` (`@auth-audit`), drawn
+   * from the same namespace as `handle` so the two can never collide. Purely
+   * additive: `handle` is assigned regardless, so a named agent stays reachable
+   * by its type and `@explore` never comes to mean "start another one".
+   */
+  alias?: string;
   description: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
   result?: string;
@@ -122,6 +153,13 @@ export interface AgentRecord {
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
   outputFile?: string;
+  /**
+   * The agent's pi session file, when it was persisted (`persist_session`, or
+   * the `rememberAgents` default). Captured so a mention can reopen the
+   * conversation after the record itself has been evicted; undefined for an
+   * in-memory session, which leaves nothing to reopen.
+   */
+  sessionFile?: string;
   /** Cleanup function for the output file stream subscription. */
   outputCleanup?: () => void;
   /**

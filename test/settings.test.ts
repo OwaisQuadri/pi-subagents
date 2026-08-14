@@ -125,6 +125,15 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
+  it("round-trips rememberAgents (true and false); keeps boolean, drops non-boolean", () => {
+    saveSettings({ rememberAgents: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ rememberAgents: false });
+    saveSettings({ rememberAgents: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ rememberAgents: true });
+    writeProject({ rememberAgents: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
+  });
+
   it("round-trips widgetMode; keeps valid values, drops invalid", () => {
     saveSettings({ widgetMode: "off" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "off" });
@@ -441,6 +450,7 @@ describe("settings persistence", () => {
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
         setAgentMentions: vi.fn(),
+      setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
@@ -535,6 +545,13 @@ describe("settings persistence", () => {
       expect(appliers.setAgentMentions).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
+    it("applies rememberAgents; skips it when absent", () => {
+      applySettings({ rememberAgents: false }, appliers);
+      expect(appliers.setRememberAgents).toHaveBeenCalledWith(false);
+      applySettings({}, appliers);
+      expect(appliers.setRememberAgents).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
     it("applies scopeModels: false", () => {
       applySettings({ scopeModels: false }, appliers);
       expect(appliers.setScopeModels).toHaveBeenCalledWith(false);
@@ -616,6 +633,7 @@ describe("settings persistence", () => {
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
         setAgentMentions: vi.fn(),
+      setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
         setMaxSubagentDepth: vi.fn(),

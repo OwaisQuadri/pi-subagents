@@ -17,16 +17,16 @@ import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Tex
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
-import { buildNewAgentFile, disableInContent, enableInContent, findAgentFile, isEmptyStub, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
+import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
-import { describeMention, parseMention, resolveHandleToType } from "./mention.js";
+import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -530,6 +530,22 @@ export default function (pi: ExtensionAPI) {
   const MANAGER_KEY = Symbol.for("pi-subagents:manager");
   // Process-external callers may supply arbitrary options. Nested ownership and
   // config-root metadata are internal capabilities issued only by scoped tools.
+  /**
+   * Resolve the agent type and spawn. Trusts its options — every caller must
+   * either be in-process or have gone through `spawnTopLevel` first.
+   */
+  const spawnResolved = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
+    // Cross-extension callers get the same dispatch contract as the LLM (#183).
+    // The RPC layer already throws for an unresolvable model rather than falling
+    // back silently; a bad agent type should not be quieter. Throws become error
+    // envelopes at the RPC boundary. Reload first so an agent file added mid
+    // session is spawnable here too, not only through the Agent tool.
+    reloadCustomAgents();
+    const dispatch = resolveSpawnType(type);
+    if (!dispatch.ok) throw new Error(dispatch.message);
+    return manager.spawn(piRef, ctxRef, dispatch.type, prompt, options);
+  };
+
   const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
     const safeOptions = { ...(options ?? {}) };
     delete safeOptions.parentAgentId;
@@ -539,16 +555,30 @@ export default function (pi: ExtensionAPI) {
     // Also internal: it names a transcript directory, so a forged value would
     // be a path-traversal primitive.
     delete safeOptions.rootSessionId;
-    // Cross-extension callers get the same dispatch contract as the LLM (#183).
-    // The RPC layer already throws for an unresolvable model rather than falling
-    // back silently; a bad agent type should not be quieter. Throws become error
-    // envelopes at the RPC boundary. Reload first so an agent file added mid
-    // session is spawnable here too, not only through the Agent tool.
-    reloadCustomAgents();
-    const dispatch = resolveSpawnType(type);
-    if (!dispatch.ok) throw new Error(dispatch.message);
-    return manager.spawn(piRef, ctxRef, dispatch.type, prompt, safeOptions);
+    // Worse than rootSessionId: this one names a file to OPEN and replay as a
+    // conversation. Only the mention dispatcher may set it, and only from a
+    // path this extension itself recorded — never from anything a caller sent.
+    delete safeOptions.resumeSessionFile;
+    // Bypasses handle allocation, so a forged value would duplicate a live
+    // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
+    delete safeOptions.reclaim;
+    return spawnResolved(piRef, ctxRef, type, prompt, safeOptions);
   };
+
+  /**
+   * Resolve a tool's `agent_id` as an id OR a handle, so the model addresses
+   * agents by the same names the user types. Ids are tried first, keeping the
+   * existing behaviour exact — a handle is only consulted when the string is
+   * not an id at all. Only live records: a tombstone has nothing to steer and
+   * no result to read. Callers still enforce the nested-ownership rejection.
+   */
+  const resolveAgentRef = (ref: string): AgentRecord | undefined => {
+    const byId = manager.getRecord(ref);
+    if (byId) return byId;
+    const resolved = manager.resolveMention(ref);
+    return resolved?.kind === "live" ? resolved.record : undefined;
+  };
+
   const registryEntry = {
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
@@ -635,7 +665,13 @@ export default function (pi: ExtensionAPI) {
     if (ctx.mode === "tui" && !mentionProviderRegistered) {
       mentionProviderRegistered = true;
       ctx.ui.addAutocompleteProvider(current =>
-        createMentionProvider(current, () => mentionRoster(manager, mentionTypes()), isAgentMentionsEnabled),
+        createMentionProvider(
+          current,
+          // Plain text, not renderAgentName: the same label FleetView and the
+          // widget show, but the autocomplete description cannot carry ANSI.
+          () => mentionRoster(manager, mentionTypes(), type => getConfig(type).displayName),
+          isAgentMentionsEnabled,
+        ),
       );
     }
   });
@@ -664,42 +700,124 @@ export default function (pi: ExtensionAPI) {
     const mention = parseMention(event.text);
     if (!mention) return { action: "continue" };
 
-    const record = manager.resolveMention(mention.handle);
-    const target = `@${record?.handle ?? mention.handle}`;
+    // `@main` addresses the main conversation, never a subagent — the one name
+    // `assignHandle` refuses to allocate. An explicit escape hatch for text
+    // that would otherwise read as a mention, so the prefix is dropped and the
+    // rest goes to the model with its attachments intact.
+    if (isReservedHandle(mention.handle)) {
+      return { action: "transform", text: mention.message, ...(event.images && { images: event.images }) };
+    }
 
-    if (record?.status === "running" || record?.status === "queued") {
-      // Steering interrupts after the current tool call, exactly like the
-      // steer_subagent tool. Un-consume the result so the agent's reply to this
-      // message is still relayed even if the LLM already read its last answer.
-      record.resultConsumed = false;
-      manager.steer(record.id, mention.message);
-      pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
-      ctx.ui.notify(`Sent to ${target}`, "info");
+    // As typed first, so an agent actually called `agent-foo` wins over Claude
+    // Code's `@agent-` + `foo` spelling rather than being shadowed by it.
+    const alias = stripAgentPrefix(mention.handle);
+    const resolved = manager.resolveMention(mention.handle)
+      ?? (alias ? manager.resolveMention(alias) : undefined);
+
+    if (resolved?.kind === "live") {
+      const record = resolved.record;
+      const target = `@${record.alias ?? record.handle ?? mention.handle}`;
+
+      if (record.status === "running" || record.status === "queued") {
+        // Steering interrupts after the current tool call, exactly like the
+        // steer_subagent tool. Un-consume the result so the agent's reply to
+        // this message is still relayed even if the LLM read its last answer.
+        record.resultConsumed = false;
+        manager.steer(record.id, mention.message);
+        pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
+        ctx.ui.notify(`Sent to ${target}`, "info");
+        return { action: "handled" };
+      }
+
+      if (record.session) {
+        // Both derived from the record's OWN type: a mention names an existing
+        // agent, so its frontmatter is what governs — `output_transcript: false`
+        // must keep holding, since record.outputFile is the sole gate every
+        // downstream consumer keys off and a resume must not re-open it.
+        const config = getAgentConfig(record.type);
+        const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
+          outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+          maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
+        });
+        ctx.ui.notify(
+          resumedRecord ? `Resuming ${target}` : `Could not resume ${target} — it is still running.`,
+          resumedRecord ? "info" : "warning",
+        );
+        return { action: "handled" };
+      }
+      // A live record with no session never got far enough to continue, so it
+      // falls through to the start-fresh path below, like Claude's
+      // `no_transcript`.
+    }
+
+    // Evicted, but its conversation is still on disk: reopen it. This is an
+    // ordinary spawn carrying a session file, so the new record picks up the
+    // widget, fleet row, transcript and completion notification unchanged —
+    // and `reclaim` hands it back the names the tombstone was holding.
+    if (resolved?.kind === "tombstone") {
+      const entry = resolved.entry;
+      const target = `@${entry.alias ?? entry.handle}`;
+
+      // Checked here rather than left to SessionManager.open: that runs inside
+      // runAgent, whose rejection lands on the record as an agent error, not in
+      // the catch below. A `/new` in another pi window or a manual delete makes
+      // the conversation unrecoverable (Claude Code's `not_reachable`), so drop
+      // the entry — a row that can only ever fail is worse than none — and say
+      // so rather than quietly sending this message to an unrelated agent.
+      if (!existsSync(entry.sessionFile)) {
+        manager.dropTombstone(entry.handle);
+        ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
+        return { action: "handled" };
+      }
+
+      // The Agent tool deliberately falls back to general-purpose for a type it
+      // cannot resolve (#183), which covers a deleted file AND a merely
+      // disabled one. A resume must not inherit that: reopening this
+      // conversation under a different agent's prompt and tools is not
+      // continuing it, and the new record would re-tombstone under the
+      // substitute, so the handle would never find its way back.
+      reloadCustomAgents();
+      const dispatch = resolveSpawnType(entry.type);
+      if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
+        // The tombstone stays: re-enabling the agent makes the handle work
+        // again, which a drop would foreclose.
+        ctx.ui.notify(`Could not resume ${target} — the ${entry.type} agent is no longer available.`, "warning");
+        return { action: "handled" };
+      }
+
+      try {
+        // spawnResolved, not spawnTopLevel: the latter strips
+        // `resumeSessionFile` and `reclaim` as untrusted. This path is the
+        // exception — both come from a tombstone this extension wrote.
+        spawnResolved(pi, ctx, dispatch.type, mention.message, {
+          description: entry.description,
+          reclaim: { handle: entry.handle, alias: entry.alias },
+          resumeSessionFile: entry.sessionFile,
+          isBackground: true,
+        });
+        // The tombstone deliberately stays. `resolveMention` prefers the live
+        // record holding these same names, so it cannot shadow the resume — and
+        // if this run dies before establishing its own session, the original
+        // transcript is still the right thing for the next mention to reopen.
+        // Once the resumed record is evicted it overwrites this entry in place,
+        // keyed by the same handle, so nothing accumulates.
+        ctx.ui.notify(`Resuming ${target}`, "info");
+      } catch (err) {
+        // The type is already settled above, so what is left is a spawn-time
+        // failure: a strict worktree-isolation error, an unusable cwd.
+        ctx.ui.notify(
+          `Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`,
+          "warning",
+        );
+      }
       return { action: "handled" };
     }
 
-    if (record?.session) {
-      // Both derived from the record's OWN type: a mention names an existing
-      // agent, so its frontmatter is what governs — `output_transcript: false`
-      // must keep holding, since record.outputFile is the sole gate every
-      // downstream consumer keys off and a resume must not re-open it.
-      const config = getAgentConfig(record.type);
-      const resumed = await startBackgroundResume(ctx, record, mention.message, {
-        outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
-        maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
-      });
-      ctx.ui.notify(
-        resumed ? `Resuming ${target}` : `Could not resume ${target}.`,
-        resumed ? "info" : "warning",
-      );
-      return { action: "handled" };
-    }
-
-    // No live agent under that handle — but the name may still be an agent
-    // type, in which case the mention starts one. A record with no session
-    // lands here too: it never got far enough to continue, so a fresh run is
-    // the only thing "message this agent" can honestly mean.
-    const type = resolveHandleToType(mention.handle, getAvailableTypes());
+    // No agent under that handle — but the name may still be an agent type, in
+    // which case the mention starts one.
+    const typeHandle = mention.handle;
+    const type = resolveHandleToType(typeHandle, getAvailableTypes())
+      ?? (alias ? resolveHandleToType(alias, getAvailableTypes()) : undefined);
     if (!type) return { action: "continue" };
 
     try {
@@ -712,9 +830,9 @@ export default function (pi: ExtensionAPI) {
         description: describeMention(mention.message),
         isBackground: true,
       });
-      ctx.ui.notify(`Started ${target}`, "info");
+      ctx.ui.notify(`Started @${handleBase(type)}`, "info");
     } catch (err) {
-      ctx.ui.notify(`Could not start ${target}: ${err instanceof Error ? err.message : String(err)}`, "error");
+      ctx.ui.notify(`Could not start @${handleBase(type)}: ${err instanceof Error ? err.message : String(err)}`, "error");
     }
     return { action: "handled" };
   });
@@ -1002,6 +1120,7 @@ export default function (pi: ExtensionAPI) {
       setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
       setAgentMentions: setAgentMentionsEnabled,
+      setRememberAgents,
       setWidgetMode: setWidgetMode,
       setOutputTranscript: setOutputTranscriptDefault,
       setMaxSubagentDepth: setMaxSubagentDepth,
@@ -1157,6 +1276,12 @@ Terse command-style prompts produce shallow, generic work.
       description: Type.String({
         description: "A short (3-5 word) description of the task (shown in UI).",
       }),
+      name: Type.Optional(
+        Type.String({
+          description:
+            'Optional memorable name for this agent, e.g. "auth-audit", so it can be addressed as `@name` at the prompt and by steer_subagent / get_subagent_result. Letters, digits, `_` and `-`. Worth setting when several agents of the same type run at once; omit for one-off work. The agent stays reachable by its type either way.',
+        }),
+      ),
       subagent_type: Type.String({
         description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
       }),
@@ -1561,6 +1686,7 @@ Terse command-style prompts produce shallow, generic work.
         // reads to the model as a subagent that ran and reported this (#179).
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
+          name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
           isolated,
@@ -1685,6 +1811,7 @@ Terse command-style prompts produce shallow, generic work.
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
           description: params.description,
+          name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
           isolated,
@@ -1745,7 +1872,7 @@ Terse command-style prompts produce shallow, generic work.
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to check.",
+        description: "The agent ID to check. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       wait: Type.Optional(
         Type.Boolean({
@@ -1759,7 +1886,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
-      const record = manager.getRecord(params.agent_id);
+      const record = resolveAgentRef(params.agent_id);
       if (!record || record.parentAgentId) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
@@ -1831,14 +1958,14 @@ Terse command-style prompts produce shallow, generic work.
     promptSnippet: "Send a steering message to redirect a running background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to steer (must be currently running).",
+        description: "The agent ID to steer (must be currently running). The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       message: Type.String({
         description: "The steering message to send. This will appear as a user message in the agent's conversation.",
       }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
-      const record = manager.getRecord(params.agent_id);
+      const record = resolveAgentRef(params.agent_id);
       if (!record || record.parentAgentId) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
@@ -2079,7 +2206,7 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const file = findAgentFile(name);
+    const file = locateAgentFile(name, cfg.sourcePath);
     const isDefault = cfg.isDefault === true;
     const disabled = cfg.enabled === false;
 
@@ -2164,7 +2291,7 @@ Terse command-style prompts produce shallow, generic work.
 
   /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
   async function disableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = findAgentFile(name);
+    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
     if (file) {
       // Existing file — set enabled: false in frontmatter (idempotent)
       const content = readFileSync(file.path, "utf-8");
@@ -2205,7 +2332,7 @@ Terse command-style prompts produce shallow, generic work.
 
   /** Enable a disabled agent by removing enabled: false from its frontmatter. */
   async function enableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = findAgentFile(name);
+    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
     if (!file) return;
 
     const content = readFileSync(file.path, "utf-8");
@@ -2428,6 +2555,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       toolDescriptionMode: getToolDescriptionMode(),
       fleetView: isFleetViewEnabled(),
       agentMentions: isAgentMentionsEnabled(),
+      rememberAgents: getRememberAgents(),
       widgetMode: getWidgetMode(),
       outputTranscript: getOutputTranscriptDefault(),
       maxSubagentDepth: getMaxSubagentDepth(),
@@ -2559,6 +2687,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["on", "off"],
         },
         {
+          id: "rememberAgents",
+          label: "Remember agents",
+          description: "Persist subagent sessions so `@handle` can resume one long after it finished (they also appear in /resume)",
+          currentValue: getRememberAgents() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
           id: "widgetMode",
           label: "Widget",
           description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
@@ -2658,6 +2793,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setAgentMentionsEnabled(enabled);
         notifyApplied(ctx, `Agent mentions ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "rememberAgents") {
+        const enabled = value === "on";
+        setRememberAgents(enabled);
+        notifyApplied(ctx, `Remember agents ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "widgetMode") {
         setWidgetMode(value as WidgetMode);
         notifyApplied(ctx, `Widget set to ${value}`);

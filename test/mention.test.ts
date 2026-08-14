@@ -9,7 +9,7 @@
  * file path, a bare handle, a mention mid-sentence.
  */
 import { describe, expect, it } from "vitest";
-import { assignHandle, describeMention, handleBase, MENTION_TRIGGER, parseMention, resolveHandleToType } from "../src/mention.js";
+import { assignHandle, describeMention, handleBase, isReservedHandle, MENTION_TRIGGER, parseMention, resolveHandleToType, stripAgentPrefix } from "../src/mention.js";
 
 describe("handleBase", () => {
   it("lowercases so the handle matches how it is typed", () => {
@@ -32,6 +32,16 @@ describe("handleBase", () => {
     expect(handleBase("")).toBe("agent");
   });
 
+  it("caps a long name so one agent can't own an unreadable row", () => {
+    const slug = handleBase("x".repeat(200));
+    expect(slug).toHaveLength(64);
+  });
+
+  it("never leaves a trailing hyphen the cap sliced into", () => {
+    // 63 chars, then a hyphen run: a naive slice(0, 64) keeps that hyphen.
+    expect(handleBase(`${"x".repeat(63)}   tail`).endsWith("-")).toBe(false);
+  });
+
   it("only ever produces handles the suggestion trigger can match", () => {
     for (const type of ["Explore", "general-purpose", "Code Review!", "!!!", "デバッグ"]) {
       expect(MENTION_TRIGGER.test(`@${handleBase(type)}`)).toBe(true);
@@ -50,6 +60,12 @@ describe("assignHandle", () => {
 
   it("keeps counting past every taken form", () => {
     expect(assignHandle("explore", new Set(["explore", "explore-2"]))).toBe("explore-3");
+  });
+
+  it("never hands out the reserved main handle", () => {
+    // `@main` addresses the main conversation. An agent holding that name
+    // would silently swallow the one escape hatch out of the mention grammar.
+    expect(assignHandle("main", new Set())).toBe("main-2");
   });
 
   it("skips a gap rather than reusing a live handle", () => {
@@ -78,6 +94,48 @@ describe("resolveHandleToType", () => {
 
   it("round-trips every registered type", () => {
     for (const type of TYPES) expect(resolveHandleToType(handleBase(type), TYPES)).toBe(type);
+  });
+
+  it("refuses to resolve the reserved handle, even to a type named for it", () => {
+    // Otherwise `@main do this` would start an agent instead of reaching the
+    // main model — and `assignHandle` already denies its instances that name,
+    // so resolving the type here would promise something unreachable.
+    expect(resolveHandleToType("main", ["main", ...TYPES])).toBeUndefined();
+  });
+});
+
+describe("isReservedHandle", () => {
+  it("recognizes main whatever its casing", () => {
+    expect(isReservedHandle("main")).toBe(true);
+    expect(isReservedHandle("MAIN")).toBe(true);
+  });
+
+  it("leaves every ordinary handle alone", () => {
+    for (const handle of ["explore", "mainframe", "main-2", "ma"]) {
+      expect(isReservedHandle(handle)).toBe(false);
+    }
+  });
+});
+
+describe("stripAgentPrefix", () => {
+  it("unwraps Claude Code's manual @agent-<type> spelling", () => {
+    expect(stripAgentPrefix("agent-explore")).toBe("explore");
+  });
+
+  it("keeps the remainder intact when it is itself prefixed", () => {
+    expect(stripAgentPrefix("agent-agent-foo")).toBe("agent-foo");
+  });
+
+  it("returns nothing when there is no prefix or nothing behind it", () => {
+    expect(stripAgentPrefix("explore")).toBeUndefined();
+    expect(stripAgentPrefix("agent-")).toBeUndefined();
+    expect(stripAgentPrefix("agentexplore")).toBeUndefined();
+  });
+
+  it("only unwraps a prefix at the very start", () => {
+    // `@sub-agent-explore` names an agent called `sub-agent-explore`. Matching
+    // `agent-` anywhere would silently redirect it to `@explore`.
+    expect(stripAgentPrefix("sub-agent-explore")).toBeUndefined();
   });
 });
 

@@ -13,9 +13,10 @@
  *
  * A record's own identity is a UUID plus a deliberately non-unique description,
  * neither of which is typeable, so the handle is derived from the agent type.
- * Claude Code resolves a name collision latest-wins; this extension spawns
- * same-type agents in parallel as the normal case, where that would make the
- * older siblings unreachable, so colliding handles are numbered instead.
+ * Colliding handles are numbered (`explore`, `explore-2`), which is also what
+ * Claude Code's `allocateName` does — it recycles a name only once the task
+ * behind it is gone. Its SendMessage prompt describes the *registry* as
+ * latest-wins, which is a different thing and not how names are allocated.
  */
 
 /**
@@ -28,17 +29,45 @@ export const MENTION_TRIGGER = /(^|[\s。、？！])@([\w-]*)$/;
 /** Send grammar: leading `@handle`, then a non-empty message. */
 const MENTION_SEND = /^@([\w-]+)\s+([\s\S]+)$/;
 
-/** Slug of an agent type, restricted to the `[\w-]` the mention grammar allows. */
+/**
+ * Upper bound on a handle, matching Claude Code's `dSS`. Nothing here generates
+ * a name this long, but an agent type or a model-supplied name can be arbitrary
+ * text, and an unbounded handle would wrap the suggestion popup.
+ */
+const MAX_HANDLE_LENGTH = 64;
+
+/**
+ * Handles that address something other than a subagent, and so can never be
+ * allocated to one. Claude Code reserves exactly this name (`Vq = "main"`),
+ * refusing it at spawn and routing it to the main conversation instead.
+ */
+const RESERVED_HANDLES: ReadonlySet<string> = new Set(["main"]);
+
+/** Whether `@handle` names the main conversation rather than any subagent. */
+export function isReservedHandle(handle: string): boolean {
+  return RESERVED_HANDLES.has(handle.toLowerCase());
+}
+
+/** Slug of an agent type or name, restricted to the `[\w-]` the grammar allows. */
 export function handleBase(type: string): string {
-  const slug = type.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  const slug = type.toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, MAX_HANDLE_LENGTH)
+    // The slice can land mid-run and leave the trailing hyphen back.
+    .replace(/-+$/, "");
   return slug || "agent";
 }
 
-/** `base`, else `base-2`, `base-3`, … — the first form not already `taken`. */
+/**
+ * `base`, else `base-2`, `base-3`, … — the first form that is neither `taken`
+ * nor reserved. Callers pass one shared `taken` set covering type-derived
+ * handles and model-supplied aliases alike, so the two can never collide.
+ */
 export function assignHandle(base: string, taken: ReadonlySet<string>): string {
   let candidate = base;
   let n = 1;
-  while (taken.has(candidate)) {
+  while (taken.has(candidate) || RESERVED_HANDLES.has(candidate)) {
     n++;
     candidate = `${base}-${n}`;
   }
@@ -53,7 +82,22 @@ export function assignHandle(base: string, taken: ReadonlySet<string>): string {
  */
 export function resolveHandleToType(handle: string, types: readonly string[]): string | undefined {
   const wanted = handle.toLowerCase();
+  // A type slugging to a reserved name is unaddressable rather than shadowing
+  // it — `assignHandle` refuses that name too, so its instances never hold one.
+  if (RESERVED_HANDLES.has(wanted)) return undefined;
   return types.find(type => handleBase(type) === wanted);
+}
+
+/**
+ * Claude Code documents `@agent-<name>` as the form you type by hand when the
+ * picker isn't involved. Accepted here as an exact synonym: the caller tries the
+ * handle as written first, so an agent genuinely called `agent-foo` still wins
+ * over `@agent-` + `foo`, and only falls back to this when that finds nothing.
+ * Returns undefined when the prefix is absent or is the whole handle.
+ */
+export function stripAgentPrefix(handle: string): string | undefined {
+  const rest = /^agent-(.+)$/i.exec(handle)?.[1];
+  return rest || undefined;
 }
 
 /**

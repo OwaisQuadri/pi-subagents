@@ -2,10 +2,16 @@
  * agent-mention.ts — what `@` can address, and the suggestions pi renders for it.
  *
  * A subagent is addressable whether or not it is currently running: a live
- * record is messaged or resumed, and an agent *type* with no live instance is
- * started. That is the point of the handle — `@explore` means the Explore
- * agent, not "the Explore process that happens to exist right now" — so the
- * roster below unions both, and the dispatcher and the popup read the same list.
+ * record is messaged or resumed, an evicted one whose session is still on disk
+ * is reopened, and an agent *type* with no instance at all is started. That is
+ * the point of the handle — `@explore` means the Explore agent, not "the
+ * Explore process that happens to exist right now" — so the roster below unions
+ * all three, and the dispatcher and the popup read the same list.
+ *
+ * Rows are per *agent*, not per handle. An agent given a `name` holds two names
+ * (its alias and its type-derived handle) and both resolve, but it lists once,
+ * under the alias, with its type moved into the description so the row still
+ * says what it is.
  *
  * pi's `CombinedAutocompleteProvider` already owns `@`, where it means "attach a
  * file". Extensions can wrap it (`ctx.ui.addAutocompleteProvider`), so this
@@ -23,11 +29,17 @@
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { handleBase, MENTION_TRIGGER } from "../mention.js";
-import type { AgentRecord } from "../types.js";
+import type { AgentRecord, AgentTombstone } from "../types.js";
 
-/** One thing `@` can address, and what sending to it will do. */
+/**
+ * One thing `@` can address, and what sending to it will do. `typeLabel` is the
+ * agent's `display_name`, resolved by the caller: this module stays independent
+ * of the type registry, but the popup must agree with FleetView and the widget,
+ * which both render the label rather than the raw type.
+ */
 export type MentionTarget =
-  | { kind: "record"; handle: string; record: AgentRecord }
+  | { kind: "record"; handle: string; record: AgentRecord; typeLabel: string }
+  | { kind: "tombstone"; handle: string; entry: AgentTombstone; typeLabel: string }
   | { kind: "type"; handle: string; type: string; description: string };
 
 /** The registry facts the roster needs, so it stays independent of agent-types. */
@@ -40,14 +52,42 @@ export type TypeInfo = { name: string; description: string };
  * name addresses the existing agent, which is what makes `@explore` mean
  * "message the one that's running" and only otherwise "start one".
  */
-export function mentionRoster(manager: AgentManager, types: readonly TypeInfo[]): MentionTarget[] {
+export function mentionRoster(
+  manager: AgentManager,
+  types: readonly TypeInfo[],
+  // Identity by default: a caller with no registry to consult gets the raw
+  // type, which is also what `getConfig` falls back to when no label is set.
+  displayNameOf: (type: string) => string = type => type,
+): MentionTarget[] {
   const live = (r: AgentRecord) => r.status === "running" || r.status === "queued";
   const records = manager.listAgents()
     .filter(r => r.handle !== undefined && r.parentAgentId === undefined)
     .sort((a, b) => (Number(live(b)) - Number(live(a))) || (a.startedAt - b.startedAt));
 
-  const taken = new Set(records.map(r => r.handle!.toLowerCase()));
-  const targets: MentionTarget[] = records.map(record => ({ kind: "record", handle: record.handle!, record }));
+  const taken = new Set<string>();
+  const targets: MentionTarget[] = [];
+
+  // One row per agent, not per handle. An aliased agent lists under its alias
+  // only — both names resolve, but showing two rows for one agent reads as two
+  // agents. The type handle stays addressable whether or not it is listed.
+  for (const record of records) {
+    const handle = record.alias ?? record.handle!;
+    taken.add(handle.toLowerCase());
+    if (record.handle) taken.add(record.handle.toLowerCase());
+    targets.push({ kind: "record", handle, record, typeLabel: displayNameOf(record.type) });
+  }
+
+  // Then agents that are gone but whose conversation can be reopened. After the
+  // live ones: a running agent is the likelier target, and this keeps the
+  // ordering "what exists now, then what can be brought back, then what can be
+  // started".
+  for (const entry of manager.listTombstones()) {
+    const handle = entry.alias ?? entry.handle;
+    if (taken.has(handle.toLowerCase())) continue;
+    taken.add(handle.toLowerCase());
+    taken.add(entry.handle.toLowerCase());
+    targets.push({ kind: "tombstone", handle, entry, typeLabel: displayNameOf(entry.type) });
+  }
 
   for (const type of types) {
     const handle = handleBase(type.name);
@@ -103,9 +143,18 @@ function mentionItems(roster: MentionTarget[], line: string, cursorCol: number):
 /** Name the action that will actually happen, so the list never mispromises. */
 function describeTarget(target: MentionTarget): string {
   if (target.kind === "type") return `start agent · ${summarize(target.description)}`;
-  const { status, description } = target.record;
+  if (target.kind === "tombstone") {
+    // No status: the record is gone, and "completed" would imply one is still
+    // being tracked. The type carries the identity the handle may not.
+    return `resume · ${target.typeLabel} · ${target.entry.description}`;
+  }
+  const { status, description, alias } = target.record;
   const action = status === "running" || status === "queued" ? "send message" : "resume";
-  return `${action} · ${status} · ${description}`;
+  // A row listed under its alias has lost the type its handle would have shown,
+  // so name it — `@auth-audit` alone says nothing about what the agent is.
+  // A type-derived row already reads as its type and would just repeat itself.
+  const identity = alias ? `${target.typeLabel} · ` : "";
+  return `${action} · ${identity}${status} · ${description}`;
 }
 
 /** First sentence of an agent description, clipped — these run to paragraphs. */
