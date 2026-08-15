@@ -17,30 +17,38 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
 // over ordinary top-level consts.
-const { createAgentSession, inMemory } = vi.hoisted(() => ({
+const { buildSessionContext, createAgentSession, inMemory } = vi.hoisted(() => ({
+  buildSessionContext: vi.fn(),
   createAgentSession: vi.fn(),
   inMemory: vi.fn(),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", async () => {
   const actual = await vi.importActual<any>("@earendil-works/pi-coding-agent");
-  return { ...actual, createAgentSession, SessionManager: { ...actual.SessionManager, inMemory } };
+  return {
+    ...actual,
+    buildSessionContext,
+    createAgentSession,
+    SessionManager: { ...actual.SessionManager, inMemory },
+  };
 });
 
 import { agentMentionReminder } from "../src/mention.js";
 import { runMentionClone } from "../src/mention-clone.js";
 
+/** One user turn and its reply, as buildSessionContext resolves them. */
+const CONVERSATION = [
+  { role: "user", content: [{ type: "text", text: "hi" }] },
+  { role: "assistant", content: [{ type: "text", text: "hello" }] },
+] as any[];
+
 beforeEach(() => {
   createAgentSession.mockReset();
   inMemory.mockReset();
   inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
+  buildSessionContext.mockReset();
+  buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
 });
-
-/** One user turn and its reply, as the session stores them. */
-const CONVERSATION = [
-  { type: "message", message: { role: "user", content: [{ type: "text", text: "hi" }] } },
-  { type: "message", message: { role: "assistant", content: [{ type: "text", text: "hello" }] } },
-] as any[];
 
 /** The main session's context — the one the spawn must be attributed to. */
 function mainCtx(overrides: Record<string, unknown> = {}) {
@@ -50,7 +58,10 @@ function mainCtx(overrides: Record<string, unknown> = {}) {
     thinkingLevel: "high",
     modelRegistry: { runtime: { kind: "runtime" } },
     getSystemPrompt: vi.fn(() => "the live system prompt"),
-    sessionManager: { buildContextEntries: vi.fn(() => CONVERSATION) },
+    sessionManager: {
+      getEntries: vi.fn(() => [{ type: "message" }] as any[]),
+      getLeafId: vi.fn(() => "leaf-1"),
+    },
     ...overrides,
   } as any;
 }
@@ -119,17 +130,41 @@ describe("cloning the conversation", () => {
 
     await runMentionClone(o);
 
-    expect(o.ctx.sessionManager.buildContextEntries).toHaveBeenCalled();
+    expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
     expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
       kind: "in-memory-session-manager",
     });
+  });
+
+  it("thinks at the level the session is really on", async () => {
+    cloneSession(callsAgent());
+
+    await runMentionClone(opts());
+
+    expect(createAgentSession.mock.calls[0][0].thinkingLevel).toBe("high");
+  });
+
+  it("omits the level rather than taking buildSessionContext's, which lies", async () => {
+    // getSessionContextSettings starts at "off" and moves only on an explicit
+    // thinking_level_change entry, so a session where nobody ran /think reports
+    // "off". Passing that would silently think less than the user asked for;
+    // omitting it lets createAgentSession resolve the real level from settings.
+    // Also the Pi <0.82.0 path, where ctx has no thinkingLevel at all.
+    buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "off", model: null } as any);
+    const o = opts({ ctx: mainCtx({ thinkingLevel: undefined }) });
+    cloneSession(callsAgent());
+
+    await runMentionClone(o);
+
+    expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("thinkingLevel");
   });
 
   it("clones a conversation that has not started yet", async () => {
     // First input of a fresh session. There is no history to carry, which is an
     // answer and not a failure — the copy still runs on the main model and
     // system prompt, and still makes the call.
-    const o = opts({ ctx: mainCtx({ sessionManager: { buildContextEntries: () => [] } }) });
+    buildSessionContext.mockReturnValue({ messages: [], thinkingLevel: "medium", model: null } as any);
+    const o = opts();
     const session = cloneSession(callsAgent());
 
     const result = await runMentionClone(o);
