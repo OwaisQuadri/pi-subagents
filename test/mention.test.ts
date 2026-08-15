@@ -9,7 +9,7 @@
  * file path, a bare handle, a mention mid-sentence.
  */
 import { describe, expect, it } from "vitest";
-import { assignHandle, describeMention, handleBase, isReservedHandle, MENTION_TRIGGER, parseMention, resolveHandleToType, stripAgentPrefix } from "../src/mention.js";
+import { agentMentionReminder, assignHandle, describeMention, handleBase, isReservedHandle, MENTION_TRIGGER, parseMention, resolveHandleToType, stripAgentPrefix } from "../src/mention.js";
 
 describe("handleBase", () => {
   it("lowercases so the handle matches how it is typed", () => {
@@ -182,5 +182,21 @@ describe("parseMention", () => {
   it("rejects a mention that is not at the start of the input", () => {
     expect(parseMention("hey @explore look at this")).toBeNull();
     expect(parseMention(" @explore look at this")).toBeNull();
+  });
+});
+
+describe("agentMentionReminder", () => {
+  it("is Claude Code's string, byte for byte", () => {
+    // Ported from the 2.1.233 bundle rather than paraphrased, so the model gets
+    // the wording it was trained against. Asserted whole — including the
+    // trailing space before the closing newline, which is in the original
+    // template literal and is exactly the kind of thing a tidy-up would drop.
+    expect(agentMentionReminder("code-review")).toBe(
+      '<system-reminder>\nThe user has expressed a desire to invoke the agent "code-review". Please invoke the agent appropriately, passing in the required context to it. \n</system-reminder>',
+    );
+  });
+
+  it("names the agent it was given", () => {
+    expect(agentMentionReminder("Plan")).toContain('invoke the agent "Plan"');
   });
 });

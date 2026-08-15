@@ -27,6 +27,7 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
+import { runMentionClone } from "./mention-clone.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -35,7 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -696,16 +697,21 @@ export default function (pi: ExtensionAPI) {
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
-    // TUI only, matching the `@` completion that teaches the syntax. Pi defaults
-    // `session.prompt()` to source "interactive", so a headless `pi -p "@explore
-    // …"` reaches here too — and claiming it would answer with silence, which
-    // the background hold cannot fix: `handled` returns from prompt() before any
-    // turn starts, so the loop that patch wraps never runs (it holds subagents
-    // spawned by the Agent tool MID-turn, a different path). The agent would
-    // detach, `ctx.ui.notify` is a no-op outside the TUI, and print mode would
-    // exit having printed nothing. Falling through sends the prompt to the main
-    // model, exactly as it did before mentions existed.
-    if (ctx.mode !== "tui") return { action: "continue" };
+    // Claiming the turn is TUI only, matching the `@` completion that teaches
+    // the syntax. Pi defaults `session.prompt()` to source "interactive", so a
+    // headless `pi -p "@explore …"` reaches here too — and claiming it would
+    // answer with silence, which the background hold cannot fix: `handled`
+    // returns from prompt() before any turn starts, so the loop that patch wraps
+    // never runs (it holds subagents spawned by the Agent tool MID-turn, a
+    // different path). The agent would detach, `ctx.ui.notify` is a no-op
+    // outside the TUI, and print mode would exit having printed nothing.
+    //
+    // `model` mode has none of that problem: it queues a reminder and lets the
+    // turn run, so the answer is the model's own, printed as usual. It is the
+    // only branch allowed to act headlessly; everything else falls through to
+    // the main model exactly as it did before mentions existed.
+    const canDispatchDirectly = ctx.mode === "tui";
+    if (!canDispatchDirectly && getAgentMentionMode() !== "model") return { action: "continue" };
 
     const mention = parseMention(event.text);
     if (!mention) return { action: "continue" };
@@ -723,6 +729,12 @@ export default function (pi: ExtensionAPI) {
     const alias = stripAgentPrefix(mention.handle);
     const resolved = manager.resolveMention(mention.handle)
       ?? (alias ? manager.resolveMention(alias) : undefined);
+
+    // Steering and resuming are direct in every mode, so headless they are not
+    // available at all. Falling through here rather than dropping to the start
+    // path below matters: the handle names an agent that already exists, and
+    // asking the model to start another one is not what was typed.
+    if (resolved && !canDispatchDirectly) return { action: "continue" };
 
     if (resolved?.kind === "live") {
       const record = resolved.record;
@@ -830,6 +842,46 @@ export default function (pi: ExtensionAPI) {
       ?? (alias ? resolveHandleToType(alias, getAvailableTypes()) : undefined);
     if (!type) return { action: "continue" };
 
+    // Claude Code never starts the agent itself: `@agent-<type>` becomes an
+    // attachment asking the main model to do it, and the model writes the
+    // agent's prompt from the conversation rather than forwarding the typed
+    // text. That buys a real `Agent` tool call — transcript, per-tool widget
+    // detail, tool-use-id correlation, join grouping — and a prompt with the
+    // context a cold spawn lacks.
+    //
+    // It also costs a visible turn, spent narrating a decision the user already
+    // made by typing the handle. So the turn is taken by a clone of this
+    // conversation instead (mention-clone.ts): same messages, same system
+    // prompt, off-screen, holding only the `Agent` tool. Nothing reaches the
+    // chat, and what it starts is an ordinary top-level agent.
+    if (getAgentMentionMode() === "model") {
+      const label = `@${handleBase(type)}`;
+      ctx.ui.notify(`Starting ${label}…`, "info");
+      // Not awaited: the clone runs a full model turn, and prompt() is blocked
+      // until this hook returns. The user gets their prompt back immediately
+      // and the agent appears in the widget when it starts.
+      void runMentionClone({ ctx, type, message: mention.message, agentTool })
+        .then((result) => {
+          if (result.spawned) return;
+          // A clone that could not run must not swallow the mention: start the
+          // agent the direct way rather than leaving the user with a toast and
+          // nothing running.
+          try {
+            spawnTopLevel(pi, ctx, type, mention.message, {
+              description: describeMention(mention.message),
+              isBackground: true,
+            });
+            ctx.ui.notify(`Started ${label} directly — ${result.error}`, "warning");
+          } catch (err) {
+            ctx.ui.notify(
+              `Could not start ${label}: ${err instanceof Error ? err.message : String(err)}`,
+              "error",
+            );
+          }
+        });
+      return { action: "handled" };
+    }
+
     try {
       // Nothing else to pass: runAgent resolves model, thinking and max turns
       // from the agent's own config when the spawn omits them, and the
@@ -893,9 +945,13 @@ export default function (pi: ExtensionAPI) {
   // `input` hook and the stacked autocomplete provider, so the toggle applies
   // immediately — the provider itself can never be unregistered (pi's wrapper
   // list is append-only), it just delegates everything when this is off.
-  let agentMentionsEnabled = true;
-  function isAgentMentionsEnabled(): boolean { return agentMentionsEnabled; }
-  function setAgentMentionsEnabled(b: boolean): void { agentMentionsEnabled = b; }
+  let agentMentionMode: AgentMentionMode = "model";
+  function getAgentMentionMode(): AgentMentionMode { return agentMentionMode; }
+  function setAgentMentionMode(mode: AgentMentionMode): void { agentMentionMode = mode; }
+  // `model` and `direct` differ only in who starts a not-yet-running agent, so
+  // everything that just asks "are mentions live at all" — the suggestion list,
+  // the steer and resume branches — reads this instead of the mode.
+  function isAgentMentionsEnabled(): boolean { return agentMentionMode !== "off"; }
 
   // Project/global default for writing the subagent .output transcript lives in
   // output-file.ts (both spawn paths read it). A custom agent's
@@ -1129,7 +1185,7 @@ export default function (pi: ExtensionAPI) {
       setDisableDefaultAgents: setDisableDefaultAgents,
       setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
-      setAgentMentions: setAgentMentionsEnabled,
+      setAgentMentions: setAgentMentionMode,
       setRememberAgents,
       setWidgetMode: setWidgetMode,
       setOutputTranscript: setOutputTranscriptDefault,
@@ -1268,7 +1324,10 @@ Terse command-style prompts produce shallow, generic work.
     return fullAgentToolDescription;
   })();
 
-  pi.registerTool(defineTool({
+  // Held rather than registered inline: the mention clone reuses this exact
+  // definition, so the agent it starts is an ordinary top-level spawn instead
+  // of a second implementation that has to be kept in step with this one.
+  const agentTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
     label: "Agent",
     description: agentToolDescription,
@@ -1870,7 +1929,8 @@ Terse command-style prompts produce shallow, generic work.
         details,
       );
     },
-  }));
+  });
+  pi.registerTool(agentTool);
 
   // ---- get_subagent_result tool ----
 
@@ -2564,7 +2624,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
       fleetView: isFleetViewEnabled(),
-      agentMentions: isAgentMentionsEnabled(),
+      agentMentions: getAgentMentionMode(),
       rememberAgents: getRememberAgents(),
       widgetMode: getWidgetMode(),
       outputTranscript: getOutputTranscriptDefault(),
@@ -2692,9 +2752,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "agentMentions",
           label: "Agent mentions",
-          description: "Route `@handle message` typed at the prompt to that agent, and offer running agents on `@`",
-          currentValue: isAgentMentionsEnabled() ? "on" : "off",
-          values: ["on", "off"],
+          description: "Route `@handle message` at the prompt to that agent. model = an off-screen clone of this conversation calls the Agent tool, so the agent gets a context-written prompt, a transcript and per-tool detail, and the chat stays clean; direct = started here from your text, no model call. Messaging and resuming are direct either way.",
+          currentValue: getAgentMentionMode(),
+          values: ["model", "direct", "off"],
         },
         {
           id: "rememberAgents",
@@ -2800,9 +2860,16 @@ Write the file using the write tool. Only write the file, nothing else.`;
         setFleetViewEnabled(enabled);
         notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "agentMentions") {
-        const enabled = value === "on";
-        setAgentMentionsEnabled(enabled);
-        notifyApplied(ctx, `Agent mentions ${enabled ? "enabled" : "disabled"}`);
+        const mode = value as AgentMentionMode;
+        setAgentMentionMode(mode);
+        notifyApplied(
+          ctx,
+          mode === "off"
+            ? "Agent mentions disabled"
+            : mode === "model"
+              ? "Agent mentions on — a conversation clone starts a mentioned agent off-screen"
+              : "Agent mentions on — a mentioned agent starts here, with no model call",
+        );
       } else if (id === "rememberAgents") {
         const enabled = value === "on";
         setRememberAgents(enabled);

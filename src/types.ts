@@ -89,6 +89,19 @@ export type JoinMode = 'async' | 'group' | 'smart';
 export type WidgetMode = 'all' | 'background' | 'off';
 
 /**
+ * How `@handle message` starts an agent that is not already running.
+ * - `model`: inject Claude Code's `agent_mention` reminder and let the main
+ *   model spawn it with the `Agent` tool, which is what Claude Code does.
+ * - `direct`: spawn it here, immediately, with the typed message as its prompt
+ *   and no main-model turn spent.
+ * - `off`: `@` means only "attach a file" again.
+ *
+ * Messaging a running agent and resuming a finished one are direct in every
+ * mode — Claude Code only differs from us on the *new* invocation.
+ */
+export type AgentMentionMode = 'model' | 'direct' | 'off';
+
+/**
  * What survives a record's eviction so `@handle` keeps working. The live record
  * is discarded after ~10 minutes, but the pi session it wrote is still on disk,
  * and this is the little that is needed to find and describe it again.

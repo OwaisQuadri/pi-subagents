@@ -116,13 +116,23 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
-  it("round-trips agentMentions (true and false); keeps boolean, drops non-boolean", () => {
-    saveSettings({ agentMentions: false }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ agentMentions: false });
-    saveSettings({ agentMentions: true }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ agentMentions: true });
+  it("round-trips agentMentions modes; drops an unknown one", () => {
+    for (const mode of ["model", "direct", "off"] as const) {
+      saveSettings({ agentMentions: mode }, projectDir);
+      expect(loadSettings(projectDir)).toEqual({ agentMentions: mode });
+    }
     writeProject({ agentMentions: "on" } as any);
-    expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
+    expect(loadSettings(projectDir)).toEqual({}); // unknown mode dropped
+  });
+
+  it("reads the pre-mode agentMentions booleans as their modes", () => {
+    // The setting shipped as a boolean before `model` existed, so a config
+    // written then — or hand-written from the old README — must keep working.
+    // `true` meant "on", and on is now `model`.
+    writeProject({ agentMentions: true } as any);
+    expect(loadSettings(projectDir)).toEqual({ agentMentions: "model" });
+    writeProject({ agentMentions: false } as any);
+    expect(loadSettings(projectDir)).toEqual({ agentMentions: "off" });
   });
 
   it("round-trips rememberAgents (true and false); keeps boolean, drops non-boolean", () => {
@@ -539,8 +549,8 @@ describe("settings persistence", () => {
     });
 
     it("applies agentMentions; skips it when absent", () => {
-      applySettings({ agentMentions: false }, appliers);
-      expect(appliers.setAgentMentions).toHaveBeenCalledWith(false);
+      applySettings({ agentMentions: "direct" }, appliers);
+      expect(appliers.setAgentMentions).toHaveBeenCalledWith("direct");
       applySettings({}, appliers);
       expect(appliers.setAgentMentions).toHaveBeenCalledTimes(1); // absence is "use default"
     });

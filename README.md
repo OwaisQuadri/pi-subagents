@@ -19,7 +19,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
-- **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, no turn spent. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
+- **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes in the foreground by default, or pass `run_in_background: true` to resume detached and be notified on completion, just like a background spawn
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
@@ -148,9 +148,36 @@ The handle names the **agent**, not one process, so a single syntax covers its w
 | running or queued | sends the message into its conversation, exactly as `steer_subagent` would |
 | finished | **resumes** it in the background from its existing session, continuing where it left off |
 | finished long ago, record gone | **reopens** its session from disk and continues there |
-| never started | **starts** it in the background, with your message as its prompt |
+| never started | **starts** it — by default, through a clone of this conversation ([below](#starting-a-new-agent)) |
 
-No main-model turn is spent in any case. The answer comes back as the ordinary background-completion notification, so the main model can relay it. A started agent honours its own frontmatter — `model:`, `thinking:`, `max_turns:` all apply, since the spawn passes none of them and lets the agent's config win.
+No turn is ever spent in the main conversation, and nothing about the mention enters the chat. The answer comes back as the ordinary background-completion notification, so the main model can relay it.
+
+#### Starting a new agent
+
+Claude Code does not start a mentioned agent itself. `@agent-<type>` becomes an *attachment* appending a `<system-reminder>` to your prompt — "the user has expressed a desire to invoke the agent X; please invoke the agent appropriately, passing in the required context to it" — and the main model makes the tool call. There is no tool forcing and no allowed-tools narrowing: the mention constrains *which* agent, not what it is told. So the model writes the agent's prompt, giving it the conversation context a cold spawn lacks.
+
+The cost is a visible turn — the model's reasoning and its tool block, narrating a decision you already made by typing the handle. This extension keeps the mechanism and moves it off-screen. The conversation is copied into a throwaway in-memory session, that clone takes the turn holding only the `Agent` tool, and what it starts is an ordinary top-level agent:
+
+```
+@cyan whats your favorite color        →  (nothing in the chat)
+  └─ clone of this conversation, off-screen
+       └─ Agent(subagent_type: "cyan", prompt: …)
+            ▸ Cyan Agent   favorite color        ← widget, fleet row, handle
+```
+
+It is a literal clone — the session's own entries and the same system prompt, not [`inherit_context`](#agent-frontmatter)'s text rendering of them — taken from memory and compaction-aware, so what the copy reads is what the main model is working from. The clone gets one tool and one job; it cannot read, write or run anything, because an invisible turn with the full toolset could do invisible work. The agent it starts is attributed to the *real* session, so its transcript and `rootSessionId` land where they would have anyway, and it carries no `tool-use-id` — the main conversation never issued one.
+
+| Mode | `@plan sketch the migration`, with no Plan agent running |
+|------|----------------------------------------------------------|
+| `model` (default) | a clone of this conversation takes the turn off-screen and calls `Agent`, so the agent starts with a prompt **written from the conversation**. Nothing reaches the chat but a `Starting @plan…` toast |
+| `direct` | the agent starts here, immediately, with your message verbatim as its prompt. No model call at all, so no latency before it begins |
+| `off` | `@` means only "attach a file" again |
+
+Either way the started agent honours its own frontmatter — `model:`, `thinking:`, `max_turns:` all apply, since neither path passes them and the agent's config wins. Mentioning something as the very first thing in a session works: there is simply no history to carry, and the clone still runs on your model and system prompt. If it cannot deliver at all — a model can always answer in prose instead of calling the tool — the agent is started directly with your text and the toast says so, rather than leaving you with nothing running.
+
+`model` is also the only mode that works outside the TUI: `pi -p '@plan the migration'` clones, spawns, and reports through the normal completion path, where a direct start would have detached the agent and printed nothing. Messaging and resuming stay TUI-only for that reason, in both modes.
+
+Two things to weigh against `direct`: the clone re-sends the whole conversation, and the agent does not start until that turn finishes.
 
 **Named agents.** The `Agent` tool takes an optional `name`, so the orchestrator can call one `auth-audit` instead of leaving you to tell `@explore-2` from `@explore-3`. A name is *additive*: the type-derived handle is still assigned, so `@explore` keeps reaching that agent rather than starting a second one beside it. Both names share one namespace — an alias can never shadow a live handle or the reverse — and the popup shows one row per agent, under its alias, with the type moved into the description. `steer_subagent` and `get_subagent_result` accept a handle too, so you and the model address agents the same way.
 
@@ -170,7 +197,7 @@ The grammar mirrors Claude Code's, and is deliberately narrow so nothing gets sw
 
 While an agent is live its handle addresses *it*, so `@explore` never starts a second Explore alongside a running one — use the `Agent` tool for deliberate parallelism. `@<agent-id>` works too. `main` is reserved and can never be an agent's handle (a type slugging to it gets `main-2`); handles are capped at 64 characters. A handle written as typed always wins over the `@agent-` form, so an agent genuinely called `agent-explore` stays reachable. [Nested subagents](#nested-subagents) are not addressable — they are hidden from every top-level surface and only their owner may steer them, so a handle that would name one starts a fresh top-level agent instead of reaching through that boundary. Suggestions list live agents first, then startable types; when an `@` token names an agent, file suggestions are suppressed for it. Disable the whole thing via `/agents → Settings → Agent mentions`.
 
-A mention-started agent takes the non-tool spawn path shared with the scheduler and cross-extension RPC, so — like those — it writes no `.output` transcript and the widget shows it without per-tool detail. A mention-*resumed* agent goes through the full resume wiring and keeps both.
+A `direct`-mode start takes the non-tool spawn path shared with the scheduler and cross-extension RPC, so — like those — it writes no `.output` transcript and the widget shows it without per-tool detail. That is the trade for skipping the model call: a `model`-mode start goes through the real `Agent` tool and keeps everything. A mention-*resumed* agent goes through the full resume wiring and keeps both in either mode.
 
 Individual agent results render Claude Code-style in the conversation:
 
@@ -498,7 +525,7 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 
 **Disable defaults** (`disableDefaultAgents`, default `false`): when on, the three built-in agents (general-purpose, Explore, Plan) are not registered — only your project/global custom agents are advertised and spawnable. User-defined agents are unaffected, including ones that override a default by name. The Agent tool's type list updates on the next pi session (the tool schema is registered at startup).
 
-**Agent mentions** (`agentMentions`, default `true`): whether [`@handle message`](#agent-mentions) at the prompt addresses that subagent instead of the main model — messaging, resuming or starting it — and whether `@` offers agents alongside pi's file completion. Toggle via `/agents → Settings → Agent mentions`; applied live, and it gates all three actions plus the suggestion list, so with it off `@` means only "attach a file" again and every `@…` prompt reaches the main model verbatim.
+**Agent mentions** (`agentMentions`, default `"model"`): whether [`@handle message`](#agent-mentions) at the prompt addresses that subagent instead of the main model — messaging, resuming or starting it — and whether `@` offers agents alongside pi's file completion. `"model"` and `"direct"` differ only in [who starts an agent that isn't running](#starting-a-new-agent): an off-screen clone of this conversation, via a `<system-reminder>` and a real `Agent` call, or this extension, immediately and with no model call. Messaging and resuming are direct in both. `"off"` gates all three actions plus the suggestion list, so `@` means only "attach a file" again and every `@…` prompt reaches the main model verbatim. Toggle via `/agents → Settings → Agent mentions`; applied live. The booleans this setting used to take are still read — `true` as `"model"`, `false` as `"off"`.
 
 **Remember agents** (`rememberAgents`, default `true`): whether subagents persist their pi session, which is what lets [`@handle`](#agent-mentions) reopen an agent's conversation after its in-memory record has been evicted. Two visible consequences of the default: top-level subagents write a session file, and they nest under the session that spawned them in pi's `/resume`. Agents spawned by another agent are excluded — they get no handle, so nothing could reopen their transcript. A custom agent's `persist_session` frontmatter overrides this per agent, in both directions. Toggle via `/agents → Settings → Remember agents`; with it off, handles expire with their record (roughly ten minutes past completion) and `@explore` then starts a fresh agent rather than resuming — the behaviour before this setting existed.
 

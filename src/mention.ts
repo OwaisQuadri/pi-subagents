@@ -112,6 +112,24 @@ export function describeMention(message: string): string {
 }
 
 /**
+ * What Claude Code sends the main model when a mention names an agent it could
+ * start. Its `@agent-<type>` mention is not a spawn at all: it becomes an
+ * `agent_mention` attachment, which renders to a synthetic `isMeta` user
+ * message placed after the user's own untouched text — no tool forcing, no
+ * allowed-tools narrowing, and the Task tool is not even named. The model reads
+ * this and calls the tool itself.
+ *
+ * Ported verbatim from the 2.1.233 bundle's attachment renderer, trailing space
+ * before the closing newline included, so the wording the model was trained
+ * against is the wording it gets. The one substitution is ours: pi's equivalent
+ * of Task is the `Agent` tool, and the agent listing that teaches valid
+ * `subagent_type` values is the tool spec rather than a separate attachment.
+ */
+export function agentMentionReminder(type: string): string {
+  return `<system-reminder>\nThe user has expressed a desire to invoke the agent "${type}". Please invoke the agent appropriately, passing in the required context to it. \n</system-reminder>`;
+}
+
+/**
  * Split `@handle message` into its parts, or null when the text isn't a send —
  * a bare handle, a leading file path, or a mention that isn't at the start.
  */
