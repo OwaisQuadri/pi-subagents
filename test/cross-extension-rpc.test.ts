@@ -30,6 +30,7 @@ describe("cross-extension RPC", () => {
     events = createEventBus();
     manager = {
       spawn: vi.fn().mockReturnValue("agent-42"),
+      awaitStartup: vi.fn().mockResolvedValue(undefined),
       abort: vi.fn().mockReturnValue(true),
       consumeResult: vi.fn().mockReturnValue(true),
     };
@@ -134,6 +135,28 @@ describe("cross-extension RPC", () => {
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({ success: false, error: "unknown agent type" });
+    });
+
+    it("returns error when the agent fails to start after spawn returns", async () => {
+      // With isolation: "worktree" the agent is not running when spawn() hands
+      // back an id — the repo copy is an awaited git call. A failure there has
+      // to be an error envelope, not an id for an agent that never ran.
+      (manager.awaitStartup as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error('Cannot run with isolation: "worktree"'),
+      );
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-s4b", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-s4b", type: "general-purpose", prompt: "x",
+        options: { isolation: "worktree" },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false, error: 'Cannot run with isolation: "worktree"',
+      });
+      expect(manager.awaitStartup).toHaveBeenCalledWith("agent-42");
     });
 
     it("scopes replies — other requestIds do not receive it", async () => {
