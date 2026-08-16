@@ -1,4 +1,58 @@
+import { Type } from "@sinclair/typebox";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+
+/**
+ * The model-facing `isolation` parameter, shared by the `Agent` tool and the
+ * nested delegation tool so the two cannot drift.
+ *
+ * Shape matters more than wording here. As a single-value optional literal,
+ * models that fill every optional parameter — the transcript on #231 shows one
+ * emitting `resume: ""`, `schedule: ""` and `model: "default"` alongside it —
+ * had only `"worktree"` available to fill it with, and kept spawning worktrees
+ * across three turns while their own reasoning said to omit the field. Every
+ * other optional parameter has an inert filler; this one did not. `"off"` is
+ * listed first and described as the default so the harmless value is the
+ * obvious one to reach for.
+ */
+const isolationParamShape = {
+  isolation: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("off", {
+          description: "No isolation — the agent works in the current checkout. Same as omitting the field.",
+        }),
+        Type.Literal("worktree", {
+          description:
+            "Run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.",
+        }),
+      ],
+      {
+        description:
+          'Isolation mode. Default "off". Only use "worktree" when the agent must modify files in parallel with other agents — it works in a copy of the repo, so it cannot see uncommitted or staged changes in the main checkout.',
+      },
+    ),
+  ),
+};
+
+/**
+ * Build the `isolation` parameter for a tool schema, or nothing when the
+ * project disabled worktrees (`worktreeIsolation: false`).
+ *
+ * Dropping the field beats accepting it and quietly downgrading. The setting is
+ * for a project whose model passes `"worktree"` on *every* call, so a
+ * per-result "isolation was disabled" note would be noise on every result and
+ * would keep raising the salience of a capability that isn't there. With no
+ * field there is nothing to pass, nothing to drop, and nothing to explain — the
+ * same trade `scheduleParam` makes for disabled scheduling, at zero LLM-context
+ * cost. The resolver gate and the `agent-manager` check still cover the paths a
+ * schema can't reach: agent files, the scheduler, and cross-extension RPC.
+ *
+ * Like `scheduleParam`, this is read once at tool registration — flipping the
+ * setting needs a new pi session for the schema to change.
+ */
+export function isolationParam(enabled: boolean): Partial<typeof isolationParamShape> {
+  return enabled ? isolationParamShape : {};
+}
 
 interface AgentInvocationParams {
   model?: string;
@@ -7,12 +61,31 @@ interface AgentInvocationParams {
   run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
-  isolation?: IsolationMode;
+  /**
+   * Untyped on purpose. Both tool schemas now build this field conditionally
+   * and spread it, which erases TypeBox's literal inference to `unknown` (the
+   * `schedule` param has the same shape). The resolver below narrows by
+   * comparison rather than trusting the declaration, which also makes it safe
+   * for the cross-extension RPC path, where options arrive unvalidated.
+   */
+  isolation?: unknown;
+}
+
+interface ResolveOptions {
+  /**
+   * Whether worktree isolation is permitted at all. False when the project set
+   * `worktreeIsolation: false`, which drops a requested worktree rather than
+   * failing the call: the fail-loud precedent covers spawns that *cannot* work,
+   * while this one is the user opting out, and throwing would break exactly the
+   * calls the `"off"` value exists to tolerate. Defaults to allowed.
+   */
+  worktreeAllowed?: boolean;
 }
 
 export function resolveAgentInvocationConfig(
   agentConfig: AgentConfig | undefined,
   params: AgentInvocationParams,
+  opts?: ResolveOptions,
 ): {
   modelInput?: string;
   modelFromParams: boolean;
@@ -23,6 +96,12 @@ export function resolveAgentInvocationConfig(
   isolated: boolean;
   isolation?: IsolationMode;
 } {
+  // Precedence first, collapse second — reversing these loses the veto, since
+  // an agent file's "off" only outranks a caller's "worktree" while it is still
+  // a value. Everything downstream then sees "worktree" or nothing at all.
+  const requested = agentConfig?.isolation ?? params.isolation;
+  const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
+
   return {
     modelInput: agentConfig?.model ?? params.model,
     modelFromParams: agentConfig?.model == null && params.model != null,
@@ -31,7 +110,7 @@ export function resolveAgentInvocationConfig(
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
-    isolation: agentConfig?.isolation ?? params.isolation,
+    isolation,
   };
 }
 

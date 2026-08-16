@@ -294,7 +294,7 @@ All fields are optional — sensible defaults for everything.
 | `skills` | `true` | `true` inherits the parent's skills; `false` inherits none. A comma-separated list preloads **only** those skills into the system prompt and does not inherit the rest (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
-| `isolation` | — | Set to `worktree` to run in an isolated git worktree |
+| `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
@@ -400,7 +400,7 @@ Launch a sub-agent.
 | `run_in_background` | boolean | no | Run without blocking |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
-| `isolation` | `"worktree"` | no | Run in an isolated git worktree |
+| `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
 
 ### `get_subagent_result`
@@ -530,6 +530,8 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 **Remember agents** (`rememberAgents`, default `true`): whether subagents persist their pi session, which is what lets [`@handle`](#agent-mentions) reopen an agent's conversation after its in-memory record has been evicted. Two visible consequences of the default: top-level subagents write a session file, and they nest under the session that spawned them in pi's `/resume`. Agents spawned by another agent are excluded — they get no handle, so nothing could reopen their transcript. A custom agent's `persist_session` frontmatter overrides this per agent, in both directions. Toggle via `/agents → Settings → Remember agents`; with it off, handles expire with their record (roughly ten minutes past completion) and `@explore` then starts a fresh agent rather than resuming — the behaviour before this setting existed.
 
 **Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
+
+**Worktree isolation** (`worktreeIsolation`, default `true`): whether `isolation: "worktree"` may create a worktree at all. Toggle via `/agents → Settings → Worktree isolation`, or set `false` in `subagents.json` on a repo where a copy costs too much time or disk. Off, the `Agent` tool's `isolation` parameter is dropped from the schema entirely — nothing to pass, and no context spent describing it — and worktrees are refused on every other path too (agent files, scheduled jobs, cross-extension RPC). A requested worktree is downgraded to a normal run rather than failing the call, since declining one is the point. The refusal applies immediately; the parameter appears or disappears on the next pi session. See [Turning worktrees off](#turning-worktrees-off).
 
 **Tool description** (`toolDescriptionMode`, default `"full"`): which Agent tool description the LLM sees. `"full"` is the rich Claude Code-style prompt (~1,400 tokens with the default agents); `"compact"` is ~75% smaller — one-line agent type list, terse usage notes — for small/local models where tool-spec tokens are expensive. Per-option details stay in the parameter descriptions in every mode (the parameter schema is never customizable). Applies on the next pi session.
 
@@ -696,6 +698,16 @@ The agent's system prompt names the worktree as an isolated copy and tells it to
 The automatic preservation commit uses `--no-verify`, so local pre-commit hooks can't block it — the commit is local-only and never pushed, and pre-push/server-side hooks still apply.
 
 If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` call fails with a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
+
+A worktree is a *copy*, so the agent cannot see uncommitted or staged changes in the main checkout. Never use it to review a working-tree or staged diff: the agent finds an empty `git diff` and reports nothing wrong.
+
+### Turning worktrees off
+
+Three levers, from narrowest to broadest:
+
+- **Per call** — omit `isolation`, or pass `isolation: "off"`. The explicit value exists because some models fill every optional parameter they are offered; with `worktree` as the only legal value they had no way to decline one (#231, #184).
+- **Per agent** — `isolation: off` in an agent file. Frontmatter is authoritative, so this refuses a worktree even when the caller passes `isolation: "worktree"` — the only way to override a caller.
+- **Per project** — `"worktreeIsolation": false` in `subagents.json`. The `Agent` tool's `isolation` parameter disappears from the schema entirely (so it costs the model no context and cannot be passed), and worktree creation is refused on every other path too: agent files, scheduled jobs, and cross-extension RPC. Use it on a repo large enough that a copy costs real time and disk. The schema is built at tool registration, so the parameter appears or disappears in the next pi session; the refusal itself takes effect immediately.
 
 ## Skill Preloading
 

@@ -136,6 +136,20 @@ export interface SubagentsSettings {
    */
   outputTranscript?: boolean;
   /**
+   * Whether `isolation: "worktree"` may create a worktree at all. Defaults to
+   * `true`. Set `false` on a repo where worktrees are too slow or too large to
+   * be worth it (#184): a requested worktree is then dropped and the agent runs
+   * in the main checkout, with a note on the result so the orchestrator doesn't
+   * go on to claim its changes landed on a `pi-agent-*` branch.
+   *
+   * Deliberately a downgrade rather than an error. The fail-loud rule covers
+   * worktrees that *cannot* be created; this is the user declining one, and
+   * throwing would reject exactly the calls that the `isolation: "off"` value
+   * exists to tolerate. Enforced below the tool boundary, so it also covers the
+   * scheduler and the unvalidated cross-extension RPC path.
+   */
+  worktreeIsolation?: boolean;
+  /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
    * disables nesting project-wide. Read when a subagent session is built, so a
@@ -177,6 +191,7 @@ export interface SettingsAppliers {
   setRememberAgents: (b: boolean) => void;
   setWidgetMode: (mode: WidgetMode) => void;
   setOutputTranscript: (b: boolean) => void;
+  setWorktreeIsolation: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
 }
@@ -267,6 +282,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.outputTranscript === "boolean") {
     out.outputTranscript = r.outputTranscript;
   }
+  if (typeof r.worktreeIsolation === "boolean") {
+    out.worktreeIsolation = r.worktreeIsolation;
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -343,6 +361,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.rememberAgents === "boolean") appliers.setRememberAgents(s.rememberAgents);
   if (s.widgetMode) appliers.setWidgetMode(s.widgetMode);
   if (typeof s.outputTranscript === "boolean") appliers.setOutputTranscript(s.outputTranscript);
+  if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation(s.worktreeIsolation);
 }
 
 /**
