@@ -162,6 +162,27 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
+  it("round-trips backgroundByDefault (true and false), and absence stays absent", () => {
+    // `false` is the load-bearing case: it's how a user restores the pre-0.17
+    // foreground default, so it must survive a save/load rather than being
+    // read back as absent and re-defaulting to background.
+    saveSettings({ backgroundByDefault: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ backgroundByDefault: false });
+
+    saveSettings({ backgroundByDefault: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ backgroundByDefault: true });
+
+    saveSettings({}, projectDir);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("sanitize drops non-boolean backgroundByDefault silently", () => {
+    writeProject({ backgroundByDefault: "yes" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ backgroundByDefault: 0 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("sanitize drops non-boolean schedulingEnabled silently", async () => {
     writeProject({ schedulingEnabled: "yes" } as any);
     expect(loadSettings(projectDir)).toEqual({});
@@ -453,6 +474,7 @@ describe("settings persistence", () => {
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
+        setBackgroundByDefault: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
         setStrictAgentFiles: vi.fn(),
@@ -589,6 +611,20 @@ describe("settings persistence", () => {
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
     });
 
+    it("calls setBackgroundByDefault with either boolean", () => {
+      applySettings({ backgroundByDefault: false }, appliers);
+      expect(appliers.setBackgroundByDefault).toHaveBeenCalledWith(false);
+      applySettings({ backgroundByDefault: true }, appliers);
+      expect(appliers.setBackgroundByDefault).toHaveBeenCalledWith(true);
+    });
+
+    // Absence must leave the in-memory default (background) alone — calling
+    // the applier with `undefined` would read as foreground at the spawn site.
+    it("does not call setBackgroundByDefault when the field is absent", () => {
+      applySettings({ maxConcurrent: 4 }, appliers);
+      expect(appliers.setBackgroundByDefault).not.toHaveBeenCalled();
+    });
+
     // Wiring tests for the master switch — ensures the schedulingEnabled
     // field flows from the parsed settings into the applier callback that
     // sets the in-memory flag in index.ts.
@@ -636,6 +672,7 @@ describe("settings persistence", () => {
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
+        setBackgroundByDefault: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
         setStrictAgentFiles: vi.fn(),
