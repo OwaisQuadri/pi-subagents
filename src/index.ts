@@ -1234,7 +1234,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.
-- isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch. It works in a copy, so it cannot see uncommitted or staged changes — omit it (or pass "off") for anything that reviews the current checkout.`;
+- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1264,7 +1264,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
 - Use thinking to control extended thinking level.
 - Use inherit_context if the agent needs the parent conversation history.
-- Leave isolation unset (or "off") unless the agent must modify files in parallel with other agents. Use isolation: "worktree" for that case: it runs the agent in an isolated git worktree, cleaned up automatically if the agent makes no changes, otherwise the path and branch are returned in the result. Because it is a fresh copy of the repo, the agent cannot see uncommitted or staged work in the main checkout — never use it for reviewing a working-tree or staged diff.${scheduleGuideline}
+- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.${scheduleGuideline}
 
 ## Writing the prompt
 

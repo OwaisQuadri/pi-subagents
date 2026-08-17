@@ -13,24 +13,24 @@ import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./type
  * other optional parameter has an inert filler; this one did not. `"off"` is
  * listed first and described as the default so the harmless value is the
  * obvious one to reach for.
+ *
+ * The wording tracks Claude Code's own `isolation` parameter, whose phrasing
+ * models have the most exposure to: one description on the union rather than
+ * per-value ones, opening "Isolation mode.", then a sentence per value in
+ * schema order, each with its caveats in a trailing parenthetical. Two clauses
+ * are ours, because our shape is not theirs — `"off"` has no counterpart there
+ * (their enum is `worktree | remote`, so both of their values do something),
+ * and neither does the uncommitted-work warning, which is the specific trap
+ * #231 fell into. Deliberately absent is any "only use a worktree when…"
+ * restriction: Claude Code's `Agent` tool states the capability and stops, and
+ * a second legal value is what lets a model decline one, not being told to.
  */
 const isolationParamShape = {
   isolation: Type.Optional(
-    Type.Union(
-      [
-        Type.Literal("off", {
-          description: "No isolation — the agent works in the current checkout. Same as omitting the field.",
-        }),
-        Type.Literal("worktree", {
-          description:
-            "Run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.",
-        }),
-      ],
-      {
-        description:
-          'Isolation mode. Default "off". Only use "worktree" when the agent must modify files in parallel with other agents — it works in a copy of the repo, so it cannot see uncommitted or staged changes in the main checkout.',
-      },
-    ),
+    Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
+      description:
+        'Isolation mode. Default "off". "off" runs the agent in the current checkout, the same as omitting the field. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo (a copy cannot see uncommitted or staged changes in the main checkout).',
+    }),
   ),
 };
 
