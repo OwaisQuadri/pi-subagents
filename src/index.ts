@@ -1221,6 +1221,21 @@ export default function (pi: ExtensionAPI) {
     ? `\n- Use \`schedule\` only when the user explicitly asked for scheduled / recurring / delayed execution (e.g. "every Monday", "in an hour"). Don't auto-schedule from vague intent like "monitor X" — run once now or ask.`
     : "";
 
+  // Same trade as scheduleParam/scheduleGuideline above: `isolationParam` drops
+  // the field from the schema when the project set `worktreeIsolation: false`,
+  // so the prose has to go with it. Left in, it would teach the model to pass a
+  // parameter that isn't declared — accepted (TypeBox sets no
+  // `additionalProperties: false`) and then silently dropped by the resolver.
+  // With no per-result note by design, the model would have every reason to go
+  // on reporting a `pi-agent-*` branch that was never created.
+  const isolationGuideline = isWorktreeIsolationEnabled()
+    ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
+    : "";
+
+  const isolationCompactGuideline = isWorktreeIsolationEnabled()
+    ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
+    : "";
+
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
   // the same load-bearing facts as the full version at ~75% fewer tokens, for
   // small/local models. Per-option details live in the param descriptions.
@@ -1233,8 +1248,7 @@ Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
-- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`;
+- resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1263,8 +1277,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
 - Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.
-- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.${scheduleGuideline}
+- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -1288,6 +1301,7 @@ Terse command-style prompts produce shallow, generic work.
       typeList: buildTypeListText,
       compactTypeList: buildCompactTypeListText,
       agentDir: getAgentDir,
+      isolationGuideline: () => isolationGuideline,
       scheduleGuideline: () => scheduleGuideline,
     };
     // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
@@ -2488,8 +2502,15 @@ inherit_context: <true to fork parent conversation into agent so it sees chat hi
 run_in_background: <true to run in background by default. Default: false>
 output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
 isolated: <true for no extension/MCP tools, only built-in tools. Default: false>
-memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>
-isolation: <"worktree" to run in isolated git worktree; "off" to refuse one even when the caller asks. Omit for normal>
+memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>${
+      // Offering the field on a project that turned worktrees off would bake a
+      // request that is refused at spawn time into a file that outlives the
+      // session — the #231 pathology (models fill the fields they are shown)
+      // one layer up. Built per invocation, so this read is live.
+      isWorktreeIsolationEnabled()
+        ? `\nisolation: <"worktree" to run in isolated git worktree; "off" to refuse one even when the caller asks. Omit for normal>`
+        : ""
+    }
 ---
 
 <system prompt body — instructions for the agent>
