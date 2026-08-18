@@ -103,8 +103,25 @@ function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | 
  * goes, not how WIDE. A parent's only limit on concurrent children is that each
  * spawn costs it a turn, which is unbounded when max turns is unlimited.
  */
-function occupiesPoolSlot(record: Pick<AgentRecord, "isBackground" | "parentAgentId">): boolean {
-  return !!record.isBackground && record.parentAgentId === undefined;
+function occupiesPoolSlot(
+  record: Pick<AgentRecord, "isBackground" | "parentAgentId" | "workflowId">,
+): boolean {
+  return !!record.isBackground && isTopLevelAgent(record);
+}
+
+/**
+ * Whether a record is one of the session's own agents, rather than something
+ * another agent or a workflow owns.
+ *
+ * The single definition behind every user-facing surface — the fleet list, the
+ * widget, the `/agents` menus, `@handle` resolution, and the completion events
+ * and session entries. An owned child reports through its owner, so surfacing
+ * it separately would double-count the same work in the places a person reads.
+ */
+export function isTopLevelAgent(
+  record: Pick<AgentRecord, "parentAgentId" | "workflowId">,
+): boolean {
+  return record.parentAgentId === undefined && record.workflowId === undefined;
 }
 
 /**
@@ -122,11 +139,19 @@ function occupiesPoolSlot(record: Pick<AgentRecord, "isBackground" | "parentAgen
  * behind its own parent is a guaranteed deadlock rather than a possible one.
  * Enforced here rather than at the call site so no caller can reintroduce it.
  *
+ * A workflow's children go out through `spawnAndWait` and so are `blocking`
+ * too, and are excluded on the same `isTopLevelAgent` test as the background
+ * pool: the run already caps how many of its agents run at once, and charging
+ * them here as well would let one fan-out queue behind a limit meant for the
+ * session's own work.
+ *
  * Like the background pool this bounds width at the top level only — a parent's
  * own fan-out is limited by nothing but its turn budget.
  */
-function occupiesForegroundSlot(record: Pick<AgentRecord, "blocking" | "parentAgentId">): boolean {
-  return !!record.blocking && record.parentAgentId === undefined;
+function occupiesForegroundSlot(
+  record: Pick<AgentRecord, "blocking" | "parentAgentId" | "workflowId">,
+): boolean {
+  return !!record.blocking && isTopLevelAgent(record);
 }
 
 /** Which concurrency pool a spawn is charged to, if any. */
@@ -191,6 +216,16 @@ interface SpawnOptions {
    * defer a detached start behind a queue its caller cannot see or release.
    */
   blocking?: boolean;
+  /**
+   * The workflow run this child belongs to, when a workflow spawned it.
+   *
+   * Ownership, not decoration. A workflow's children are the workflow's — they
+   * report through its card, its notification and its dialog, so they are
+   * filtered out of every top-level surface exactly as nested children are, and
+   * they take no `maxConcurrent` slot: the run has its own concurrency cap, and
+   * counting them twice would let one workflow starve the whole session.
+   */
+  workflowId?: string;
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
   /**
@@ -462,10 +497,10 @@ export class AgentManager {
     const record: AgentRecord = {
       id,
       type,
-      // Nested children are filtered out of every top-level surface, so no
-      // handle: nothing can address them and they must not consume a name a
-      // top-level sibling could otherwise take.
-      handle: options.parentAgentId !== undefined
+      // Owned children — nested, or a workflow's — are filtered out of every
+      // top-level surface, so no handle: nothing can address them and they must
+      // not consume a name a top-level sibling could otherwise take.
+      handle: !isTopLevelAgent(options)
         ? undefined
         // A reclaimed handle is used as-is: it belongs to the conversation this
         // spawn is reopening, and re-deriving it would lose the numbering.
@@ -474,7 +509,7 @@ export class AgentManager {
       // Reclaimed here, or filled in below from `name` — in which case it must
       // see the handle this record just took, since both come out of the same
       // namespace.
-      alias: options.parentAgentId === undefined ? options.reclaim?.alias : undefined,
+      alias: isTopLevelAgent(options) ? options.reclaim?.alias : undefined,
       // Overwritten below when the spawn is actually queued; a foreground spawn
       // that queues flips to "queued" there rather than being guessed at here,
       // since the pool decision needs the finished record.
@@ -497,6 +532,7 @@ export class AgentManager {
       invocation: options.invocation,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
+      workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
     };
