@@ -163,7 +163,7 @@ describe("settings persistence", () => {
   });
 
   it("round-trips backgroundByDefault (true and false), and absence stays absent", () => {
-    // `false` is the load-bearing case: it's how a user restores the pre-0.17
+    // `false` is the load-bearing case: it's how a user restores the previous
     // foreground default, so it must survive a save/load rather than being
     // read back as absent and re-defaulting to background.
     saveSettings({ backgroundByDefault: false }, projectDir);
@@ -181,6 +181,15 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
     writeProject({ backgroundByDefault: 0 } as any);
     expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("round-trips worktreeIsolation; drops non-boolean", () => {
+    saveSettings({ worktreeIsolation: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: false });
+    saveSettings({ worktreeIsolation: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: true });
+    writeProject({ worktreeIsolation: "off" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
   it("sanitize drops non-boolean schedulingEnabled silently", async () => {
@@ -485,6 +494,7 @@ describe("settings persistence", () => {
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
+        setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
       };
@@ -606,6 +616,13 @@ describe("settings persistence", () => {
       expect(appliers.setOutputTranscript).toHaveBeenCalledWith(true);
     });
 
+    it("applies worktreeIsolation (both true and false)", () => {
+      applySettings({ worktreeIsolation: false }, appliers);
+      expect(appliers.setWorktreeIsolation).toHaveBeenCalledWith(false);
+      applySettings({ worktreeIsolation: true }, appliers);
+      expect(appliers.setWorktreeIsolation).toHaveBeenCalledWith(true);
+    });
+
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
       applySettings({ defaultMaxTurns: 0 }, appliers);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
@@ -683,6 +700,7 @@ describe("settings persistence", () => {
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
+        setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
       };

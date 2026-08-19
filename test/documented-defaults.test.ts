@@ -54,12 +54,12 @@ describe("documented defaults (README:441)", () => {
   it("top-level spawns default to background, nested spawns to foreground", async () => {
     const { resolveAgentInvocationConfig } = await import("../src/invocation-config.js");
     // The setting's default (true) is what index.ts passes for top-level calls.
-    expect(resolveAgentInvocationConfig(undefined, {}, true).runInBackground).toBe(true);
+    expect(resolveAgentInvocationConfig(undefined, {}, { defaultRunInBackground: true }).runInBackground).toBe(true);
     // nested-tools.ts passes false unconditionally.
-    expect(resolveAgentInvocationConfig(undefined, {}, false).runInBackground).toBe(false);
+    expect(resolveAgentInvocationConfig(undefined, {}, { defaultRunInBackground: false }).runInBackground).toBe(false);
     // An explicit param still wins over either default.
-    expect(resolveAgentInvocationConfig(undefined, { run_in_background: false }, true).runInBackground).toBe(false);
-    expect(resolveAgentInvocationConfig(undefined, { run_in_background: true }, false).runInBackground).toBe(true);
+    expect(resolveAgentInvocationConfig(undefined, { run_in_background: false }, { defaultRunInBackground: true }).runInBackground).toBe(false);
+    expect(resolveAgentInvocationConfig(undefined, { run_in_background: true }, { defaultRunInBackground: false }).runInBackground).toBe(true);
   });
 
   it("model scope is off by default", async () => {

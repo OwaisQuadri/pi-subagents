@@ -16,7 +16,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { resolveAgentInvocationConfig } from "./invocation-config.js";
+import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
@@ -34,6 +34,7 @@ import type {
   ThinkingLevel,
 } from "./types.js";
 import { addUsage } from "./usage.js";
+import { isWorktreeIsolationEnabled } from "./worktree.js";
 
 /**
  * Hard ceiling on nesting for every branch: main session = 0, its subagents = 1,
@@ -175,7 +176,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
       inherit_context: Type.Optional(Type.Boolean()),
-      isolation: Type.Optional(Type.Literal("worktree")),
+      ...isolationParam(isWorktreeIsolationEnabled()),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
@@ -220,8 +221,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
       const config = getAgentConfigIn(registry, resolvedType);
       // Foreground regardless of `backgroundByDefault` — see the reasoning on
-      // resolveAgentInvocationConfig. An explicit `true` here still opts in.
-      const invocation = resolveAgentInvocationConfig(config, params, false);
+      // ResolveOptions. An explicit `true` here still opts in.
+      const invocation = resolveAgentInvocationConfig(config, params, {
+        worktreeAllowed: isWorktreeIsolationEnabled(),
+        defaultRunInBackground: false,
+      });
       let model = ctx.model;
       if (invocation.modelInput) {
         const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
