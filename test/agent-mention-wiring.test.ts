@@ -460,6 +460,22 @@ describe("mentioning an agent that has never run", () => {
 
   });
 
+  it("tracks its tool activity, so the widget shows what it is doing (#181)", async () => {
+    // A mention spawn never passes through the Agent tool, which is where the
+    // activity tracker is normally created. Without one the widget and
+    // FleetView have no tool name and no turn count for the agent, so its row
+    // reads `thinking…` from start to finish.
+    const { lifecycle } = bootDirect();
+    heldRun(fakeSession());
+
+    await send(lifecycle, "@explore go");
+
+    const opts = vi.mocked(runAgent).mock.calls[0][3] as any;
+    expect(opts.onToolActivity).toBeTypeOf("function");
+    expect(opts.onTurnEnd).toBeTypeOf("function");
+    expect(opts.onSessionCreated).toBeTypeOf("function");
+  });
+
   it("runs it in the background so the prompt is not blocked", async () => {
     const { lifecycle } = bootDirect();
     heldRun(fakeSession());

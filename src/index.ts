@@ -22,7 +22,7 @@ import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
-import { type RpcHandle, registerRpcHandlers, type SpawnCapable } from "./cross-extension-rpc.js";
+import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
@@ -610,7 +610,20 @@ export default function (pi: ExtensionAPI) {
     reloadCustomAgents();
     const dispatch = resolveSpawnType(type);
     if (!dispatch.ok) throw new Error(dispatch.message);
-    return manager.spawn(piRef, ctxRef, dispatch.type, prompt, options);
+    // Every programmatic spawn lands here — cross-extension RPC, both `@handle`
+    // mention paths, and the `Symbol.for("pi-subagents:manager")` registry — and
+    // none of them came through the Agent tool, which is where the UI activity
+    // tracker is otherwise created. Without one the widget and FleetView have no
+    // tool name, no turn count and no context % to render, so the row sits at
+    // `thinking…` for the agent's whole life while the header's tool-use count
+    // climbs beside it (#181). The Agent tool cannot end up double-tracked: it
+    // calls `manager.spawn` directly and never reaches this function.
+    const { state, callbacks } = createActivityTracker(options?.maxTurns);
+    // Repainting is left to the manager's `onStart` callback, which already
+    // starts the widget/fleet timers for agents that enter this way.
+    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
+    agentActivity.set(id, state);
+    return id;
   };
 
   const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
@@ -659,35 +672,6 @@ export default function (pi: ExtensionAPI) {
   if (ownsManagerRegistry) {
     (globalThis as any)[MANAGER_KEY] = registryEntry;
   }
-
-  // Cross-extension callers such as pi-tasks bypass the Agent tool, so they do
-  // not create its UI activity tracker. Wrap only that programmatic spawn path
-  // with the same callbacks before AgentManager starts the child session.
-  const rpcManager: SpawnCapable = {
-    spawn(piRef, ctxRef, type, prompt, options) {
-      const { state, callbacks } = createActivityTracker(options.maxTurns);
-      // Wrap spawnTopLevel (not raw manager.spawn) so RPC-spawned agents keep
-      // the #164 internal-option sanitization while gaining activity tracking.
-      const id = spawnTopLevel(
-        piRef,
-        ctxRef,
-        type,
-        prompt,
-        { ...options, ...callbacks },
-      );
-      agentActivity.set(id, state);
-      widget.ensureTimer();
-      widget.update();
-      fleet.ensureTimer();
-      fleet.update();
-      return id;
-    },
-    // Preserve the #164 guard: RPC must not abort nested (child) agents.
-    abort: (id) => {
-      const record = manager.getRecord(id);
-      return !record?.parentAgentId && manager.abort(id);
-    },
-  };
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
@@ -740,7 +724,13 @@ export default function (pi: ExtensionAPI) {
         events: pi.events,
         pi,
         getCtx: () => currentCtx,
-        manager: rpcManager,
+        manager: {
+          spawn: spawnTopLevel,
+          abort: (id) => {
+            const record = manager.getRecord(id);
+            return !record?.parentAgentId && manager.abort(id);
+          },
+        },
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
