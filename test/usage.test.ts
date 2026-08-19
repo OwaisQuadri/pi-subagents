@@ -115,13 +115,14 @@ describe("usage", () => {
   describe("cost accumulation", () => {
     it("sums cost across messages but keeps it out of the token total", () => {
       const usage = { input: 0, output: 0, cacheWrite: 0 };
-      addUsage(usage, { input: 100, output: 50, cacheWrite: 10, cost: 0.002 });
-      addUsage(usage, { input: 200, output: 80, cacheWrite: 20, cost: 0.004 });
+      addUsage(usage, { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.002 });
+      addUsage(usage, { input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: 0.004 });
 
       expect(getLifetimeCost(usage)).toBeCloseTo(0.006, 10);
-      // The load-bearing half: cost is money on a token accumulator, and a
-      // total that quietly included it would read as 460.006 tokens.
+      // The load-bearing half: the display total takes neither the money nor
+      // the re-read prefix, even though both are accumulated on the same object.
       expect(getLifetimeTotal(usage)).toBe(460);
+      expect(usage.cacheRead).toBe(2700);
     });
 
     it("leaves cost absent when nothing priced anything", () => {
@@ -144,16 +145,17 @@ describe("usage", () => {
   describe("PendingUsagePool", () => {
     it("drains what it accumulated as a complete pi Usage", () => {
       const pool = new PendingUsagePool();
-      pool.add({ input: 100, output: 50, cacheWrite: 10, cost: 0.01 });
-      pool.add({ input: 200, output: 80, cacheWrite: 20, cost: 0.02 });
+      pool.add({ input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.01 });
+      pool.add({ input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: 0.02 });
 
       expect(pool.drain()).toEqual({
         input: 300,
         output: 130,
-        // Never summed across messages — see #38.
-        cacheRead: 0,
+        // Summed, unlike the display total (#38): pi counts the parent's own
+        // messages this way, and the prefix is re-billed on every call.
+        cacheRead: 2700,
         cacheWrite: 30,
-        totalTokens: 460,
+        totalTokens: 3160,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.03 },
       });
     });
@@ -164,6 +166,18 @@ describe("usage", () => {
 
       expect(pool.drain()?.totalTokens).toBe(160);
       expect(pool.drain()).toBeUndefined();
+    });
+
+    it("handles an accumulator that never saw a cacheRead or a cost", () => {
+      // Both fields are optional and written lazily, so an agent on a provider
+      // that reports neither leaves them absent rather than zero.
+      const pool = new PendingUsagePool();
+      pool.add({ input: 100, output: 50, cacheWrite: 10 });
+
+      expect(pool.drain()).toEqual({
+        input: 100, output: 50, cacheRead: 0, cacheWrite: 10, totalTokens: 160,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      });
     });
 
     it("returns undefined when nothing has been added", () => {

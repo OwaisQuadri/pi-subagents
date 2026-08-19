@@ -119,6 +119,59 @@ describe("cost display", () => {
     });
   });
 
+  describe("the background completion notification the model reads", () => {
+    /**
+     * The <task-notification> text sent into the parent conversation. Held
+     * behind a 200ms nudge debounce (plus batch finalization), so this polls
+     * rather than waiting a fixed beat.
+     */
+    async function notificationText(pi: any): Promise<string> {
+      for (let i = 0; i < 60 && pi.sendMessage.mock.calls.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return pi.sendMessage.mock.calls.at(-1)?.[0]?.content ?? "";
+    }
+
+    const spawnBackground = (tools: Map<string, any>) =>
+      tools.get("Agent").execute(
+        "tc-1",
+        { prompt: "go", description: "spend", subagent_type: "general-purpose", run_in_background: true },
+        undefined, undefined, ctx(),
+      );
+
+    it("includes the cost in the usage block when enabled", async () => {
+      const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
+      runSpending(COST);
+
+      await spawnBackground(tools);
+
+      expect(await notificationText(pi)).toContain("<estimated_cost_usd>0.0123</estimated_cost_usd>");
+    });
+
+    it("omits it when disabled — this is LLM context, not a display", async () => {
+      // A figure the orchestrator was not asked to track is one it may start
+      // reporting unprompted, so the setting gates the context too, not just
+      // what a human sees.
+      const { pi, tools } = boot({ showCost: false, defaultJoinMode: "async" });
+      runSpending(COST);
+
+      await spawnBackground(tools);
+
+      const text = await notificationText(pi);
+      expect(text).toContain("<total_tokens>");
+      expect(text).not.toContain("estimated_cost_usd");
+    });
+
+    it("omits it for a model with no pricing data", async () => {
+      const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
+      runSpending(0);
+
+      await spawnBackground(tools);
+
+      expect(await notificationText(pi)).not.toContain("estimated_cost_usd");
+    });
+  });
+
   describe("the completion notification", () => {
     /** Render a notification through the extension's registered renderer. */
     function render(pi: any, details: any): string {

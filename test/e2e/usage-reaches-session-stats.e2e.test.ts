@@ -12,9 +12,9 @@
  * a green suite.
  *
  * So this drives a real `AgentSession` and reads its real `getSessionStats()`,
- * with the exact object `PendingUsagePool.drain()` produces — including its
- * deliberate `cacheRead: 0` and its cost breakdown, whose `total` pi reads with
- * no guard at all.
+ * with the exact object `PendingUsagePool.drain()` produces — including the
+ * `cacheRead` our own display total drops but this report must carry, and the
+ * cost breakdown whose `total` pi reads with no guard at all.
  *
  * No network/LLM and no model turn: the message is appended through pi's own
  * `sessionManager.appendMessage`, because what is under test is the accounting,
@@ -80,19 +80,20 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
       const before = session.getSessionStats();
 
       const pool = new PendingUsagePool();
-      pool.add({ input: 1000, output: 400, cacheWrite: 100, cost: 0.0123 });
-      pool.add({ input: 2000, output: 600, cacheWrite: 200, cost: 0.0077 });
+      pool.add({ input: 1000, output: 400, cacheWrite: 100, cacheRead: 9000, cost: 0.0123 });
+      pool.add({ input: 2000, output: 600, cacheWrite: 200, cacheRead: 18_000, cost: 0.0077 });
       const usage = pool.drain();
 
       session.sessionManager.appendMessage(toolResultCarrying(usage) as any);
       const after = session.getSessionStats();
 
-      // The tokens: exactly what we reported, no more (nothing invented for the
-      // cacheRead we deliberately withhold).
+      // Exactly what we reported, on every component pi tracks — cacheRead
+      // included, which is the one pi counts for its own messages and our own
+      // display total leaves out.
       expect(after.tokens.input - before.tokens.input).toBe(3000);
       expect(after.tokens.output - before.tokens.output).toBe(1000);
       expect(after.tokens.cacheWrite - before.tokens.cacheWrite).toBe(300);
-      expect(after.tokens.cacheRead - before.tokens.cacheRead).toBe(0);
+      expect(after.tokens.cacheRead - before.tokens.cacheRead).toBe(27_000);
 
       // The cost: the whole point of the feature for anyone watching a
       // statusline. `addUsageToTotals` reads `usage.cost.total` with no guard,

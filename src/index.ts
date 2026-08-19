@@ -59,7 +59,7 @@ import {
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
-import { addUsage, getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool } from "./usage.js";
+import { addUsage, getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 
 // ---- Shared helpers ----
@@ -479,12 +479,18 @@ export default function (pi: ExtensionAPI) {
     const tokens = total > 0
       ? { input: u.input, output: u.output, total }
       : undefined;
-    // Estimated spend for the whole run, from pi's per-message `usage.cost.total`
-    // (0 for a model with no pricing data). Omitted when unpriced so a listener
-    // can tell "cost nothing" from "cost unknown". Ungated by `showCost` — that
-    // setting governs what a human is shown, not what the event carries; an
-    // analytics listener asked for the event, not for the display.
-    const cost = getLifetimeCost(u);
+    // The whole run's spend as a pi `Usage` — pi's convention for handing spend
+    // to a consumer, so `usage.cost.total` and `usage.cacheRead` are where a
+    // listener already expects them and anything pi adds to `Usage` arrives
+    // without a change here. Omitted when nothing was spent, so "spent nothing"
+    // and "never ran" stay distinguishable. Ungated by `showCost`: that setting
+    // governs what a human is shown, not what the event carries.
+    //
+    // `tokens` above is the other convention, kept as it shipped: a flat view
+    // model like pi's own `SessionStats`, carrying the DISPLAY total, which
+    // excludes cacheRead (#38). The two answer different questions and neither
+    // derives from the other.
+    const usage = toReportedUsage(u);
     return {
       id: record.id,
       type: record.type,
@@ -495,7 +501,7 @@ export default function (pi: ExtensionAPI) {
       toolUses: record.toolUses,
       durationMs,
       tokens,
-      cost: cost > 0 ? cost : undefined,
+      usage,
     };
   }
 

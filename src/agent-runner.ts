@@ -1003,6 +1003,7 @@ export async function runAgent(
         input: u.input ?? 0,
         output: u.output ?? 0,
         cacheWrite: u.cacheWrite ?? 0,
+        cacheRead: u.cacheRead ?? 0,
         cost: u.cost?.total ?? 0,
       });
     }
@@ -1068,6 +1069,7 @@ export async function resumeAgent(
             input: u.input ?? 0,
             output: u.output ?? 0,
             cacheWrite: u.cacheWrite ?? 0,
+            cacheRead: u.cacheRead ?? 0,
             cost: u.cost?.total ?? 0,
           });
         }
