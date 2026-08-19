@@ -19,6 +19,14 @@
  * No network/LLM and no model turn: the message is appended through pi's own
  * `sessionManager.appendMessage`, because what is under test is the accounting,
  * not the streaming that would normally produce the message.
+ *
+ * This test is also what set the peer floor. Pi began folding `toolResult.usage`
+ * into `getSessionStats()` in 0.81.0, when the computation moved to walking
+ * session entries through `addUsageToTotals`; every 0.80.x sums assistant
+ * messages alone and drops the field. Running unconditionally is the point —
+ * against a Pi that does not aggregate, this fails rather than skipping, which
+ * is how the range stays honest. `peerDependencies` moved to `>=0.81.0` for
+ * exactly this reason, so the CI floor job runs it too.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
