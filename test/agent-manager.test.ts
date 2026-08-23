@@ -2124,6 +2124,19 @@ describe("AgentManager — effective model and thinking write-back", () => {
     });
   });
 
+  it("keeps the requested level when the session reports no level of its own", async () => {
+    // An older pi or a stubbed session degrades to "nothing to say about the
+    // level", which must not read as "no level" on every surface.
+    const record = await spawnWithSession(
+      { thinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" } },
+    );
+
+    expect(record.invocation!.thinking).toBe("max");
+    expect(record.invocation!.requestedThinking).toBeUndefined();
+    expect(record.invocation!.modelName).toBe("claude-haiku-4-5");
+  });
+
   it("leaves the invocation alone when the session reports no model", async () => {
     const record = await spawnWithSession({ thinking: "max" }, {});
 

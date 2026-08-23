@@ -479,9 +479,15 @@ export class AgentManager {
           // AND, one line later, being replaced by the effective one.
           const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
           Object.assign(record.invocation, describeModel(session.model));
-          record.invocation.thinking = session.thinkingLevel;
-          if (requested && requested !== session.thinkingLevel) {
-            record.invocation.requestedThinking = requested;
+          // Guarded for the reason above: a session that reports no level keeps
+          // the request rather than losing it. Overwriting unconditionally would
+          // turn an older or stubbed session into a blank `thinking:` tag, which
+          // is worse than the stale-but-true value it replaced.
+          if (session.thinkingLevel) {
+            record.invocation.thinking = session.thinkingLevel;
+            if (requested && requested !== session.thinkingLevel) {
+              record.invocation.requestedThinking = requested;
+            }
           }
         }
         // Flush any steers that arrived before the session was ready
