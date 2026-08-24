@@ -234,6 +234,18 @@ export interface SubagentsSettings {
    * what the parent session counts.
    */
   showCost?: boolean;
+
+  /**
+   * Whether the widget's running rows name the model driving each agent and the
+   * thinking level it is running at.
+   *
+   * Off by default, unlike the tool result and the conversation viewer, which
+   * show the pair unconditionally: those have a line to themselves, while the
+   * widget row already carries the description, turns, tool uses, tokens and
+   * elapsed time, and every character it gains is one the description loses on a
+   * narrow terminal.
+   */
+  showModel?: boolean;
   /**
    * How much of the conversation viewer's transcript renders as Markdown.
    * Defaults to `assistant`. Applied live — the viewer's `m` key cycles this
@@ -273,6 +285,7 @@ export interface SettingsAppliers {
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
+  setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
 }
 
@@ -375,6 +388,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.showCost === "boolean") {
     out.showCost = r.showCost;
   }
+  if (typeof r.showModel === "boolean") {
+    out.showModel = r.showModel;
+  }
   if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
     out.viewerMarkdown = r.viewerMarkdown as ViewerMarkdownMode;
   }
@@ -458,6 +474,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation(s.worktreeIsolation);
   if (typeof s.reportUsage === "boolean") appliers.setReportUsage(s.reportUsage);
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
+  if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
 }
 

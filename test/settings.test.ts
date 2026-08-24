@@ -212,6 +212,15 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
+  it("round-trips showModel; drops non-boolean", () => {
+    saveSettings({ showModel: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ showModel: true });
+    saveSettings({ showModel: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ showModel: false });
+    writeProject({ showModel: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("sanitize drops non-boolean schedulingEnabled silently", async () => {
     writeProject({ schedulingEnabled: "yes" } as any);
     expect(loadSettings(projectDir)).toEqual({});
@@ -520,6 +529,7 @@ describe("settings persistence", () => {
         setFallbackSubagent: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
+        setShowModel: vi.fn(),
       };
     });
 
@@ -531,6 +541,14 @@ describe("settings persistence", () => {
       applySettings({ reportUsage: false, showCost: false }, appliers);
       expect(appliers.setReportUsage).toHaveBeenCalledWith(false);
       expect(appliers.setShowCost).toHaveBeenCalledWith(false);
+    });
+
+    it("applies showModel", () => {
+      applySettings({ showModel: true }, appliers);
+      expect(appliers.setShowModel).toHaveBeenCalledWith(true);
+
+      applySettings({ showModel: false }, appliers);
+      expect(appliers.setShowModel).toHaveBeenCalledWith(false);
     });
 
     it("is a no-op on an empty settings object", () => {
@@ -748,6 +766,7 @@ describe("settings persistence", () => {
         setFallbackSubagent: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
+        setShowModel: vi.fn(),
       };
     });
 
