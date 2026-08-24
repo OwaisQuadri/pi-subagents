@@ -10,6 +10,8 @@ import type { AgentRecord } from "../src/types.js";
 let wrapOverride: ((text: string, width: number) => string[]) | null = null;
 /** Bumped per `new Markdown(...)`, so a test can assert the per-message cache holds. */
 let markdownConstructions = 0;
+/** Forces the Markdown component to throw, for the viewer's fallback path. */
+let markdownThrows = false;
 
 vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
   const original = await importOriginal<typeof import("@earendil-works/pi-tui")>();
@@ -19,6 +21,14 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
       constructor(...args: ConstructorParameters<typeof original.Markdown>) {
         markdownConstructions++;
         super(...args);
+      }
+      render(width: number): string[] {
+        // Real trigger is ~54 nested blockquotes overflowing pi-tui's recursive
+        // renderer. Forced rather than reproduced: a real overflow costs ~2.4s
+        // and its depth depends on the platform's stack limit, so reproducing it
+        // makes the test both slow and liable to stop triggering silently.
+        if (markdownThrows) throw new RangeError("Maximum call stack size exceeded");
+        return super.render(width);
       }
     },
     wrapTextWithAnsi: (...args: [string, number]) => {
@@ -82,6 +92,7 @@ function assertAllLinesFit(lines: string[], width: number) {
 beforeEach(() => {
   wrapOverride = null;
   markdownConstructions = 0;
+  markdownThrows = false;
 });
 
 describe("ConversationViewer invocation line", () => {
@@ -504,13 +515,18 @@ describe("ConversationViewer", () => {
     });
 
     it("falls back to literal wrapping when the Markdown parser throws", () => {
-      // ~54 nested blockquotes overflow pi-tui's recursive renderer. render() is
-      // on the TUI's critical path, so this must degrade, not throw.
-      const sentinel = "STILL_VISIBLE";
-      const viewer = viewerFor(result(`${">".repeat(200)} ${sentinel}`), "all");
+      // render() is on the TUI's critical path, so a parser throw must degrade
+      // rather than take the overlay down with it.
+      const viewer = viewerFor(result("# heading"), "all");
+      markdownThrows = true;
 
       expect(() => viewer.render(80)).not.toThrow();
-      expect(strip(viewer.render(80).join("\n"))).toContain(sentinel);
+      expect(strip(viewer.render(80).join("\n"))).toContain("# heading");
+
+      // And the failure is remembered — otherwise the throw repeats on every
+      // render and every scroll key. Still literal once the parser would work.
+      markdownThrows = false;
+      expect(strip(viewer.render(80).join("\n"))).toContain("# heading");
     });
 
     it("tracks a tool result that keeps growing past the cap", () => {
