@@ -806,9 +806,13 @@ export class AgentManager {
       this.onComplete?.(record);
     }
 
-    // Only when a slot actually came free. Foreground runs with the pool off
-    // hold nothing, so this stays the no-drain path it has always been.
-    if (pool !== undefined) this.drainQueue();
+    // `options.isBackground` reproduces the pre-pool condition exactly — a
+    // background settle has always drained, even for a nested child that held
+    // no slot — so that path is unchanged whether or not the foreground pool is
+    // on. The `pool` half only adds the drain a freed FOREGROUND slot needs.
+    // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
+    // about reachability, and matching the old condition needs no such claim.
+    if (options.isBackground || pool !== undefined) this.drainQueue();
   }
 
   /**

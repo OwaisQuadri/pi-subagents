@@ -259,6 +259,24 @@ describe("maxConcurrentForeground", () => {
       expect(runAgent).toHaveBeenCalledTimes(1);
     });
 
+    // The one behaviour change that is NOT gated on the setting. Before the
+    // pool, an already-aborted signal was still wired with addEventListener —
+    // which never fires — so the agent ran to completion beyond the reach of
+    // Esc or /agents. A queued spawn made that reachable often enough to fix;
+    // this pins it for the UNQUEUED path too, with the pool off.
+    it("stops an immediate spawn whose signal is already aborted, pool off", async () => {
+      controllableRuns();
+      manager = new AgentManager();
+      expect(manager.getMaxConcurrentForeground()).toBe(0);
+
+      const controller = new AbortController();
+      controller.abort();
+      void fg(manager, "doomed", { signal: controller.signal });
+
+      expect(recordFor(manager, "doomed").status).toBe("stopped");
+      expect(recordFor(manager, "doomed").abortController?.signal.aborted).toBe(true);
+    });
+
     it("releases queued waiters on abortAll()", async () => {
       controllableRuns();
       manager = new AgentManager();
