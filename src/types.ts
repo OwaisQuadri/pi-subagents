@@ -180,6 +180,14 @@ export interface AgentRecord {
   session?: AgentSession;
   abortController?: AbortController;
   promise?: Promise<string>;
+  /**
+   * Present only while the record is "queued": resolves when it leaves the
+   * queue, started or aborted. `spawnAndWait` waits on this because a queued
+   * record has no `promise` yet. Always resolves, never rejects — a rejection
+   * would escape into the caller's tool `execute` and take down pi's whole
+   * Promise.all tool batch.
+   */
+  startGate?: Promise<void>;
   groupId?: string;
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
