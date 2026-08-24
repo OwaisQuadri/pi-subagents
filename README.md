@@ -486,7 +486,7 @@ There are two independent pools.
 
 The two are deliberately **not** one limit. A foreground agent blocks the parent anyway — the parent could have done that work itself without paying a slot — so charging it to the background pool would let a saturated pool starve the main session.
 
-Neither pool bounds `resume`: a foreground resume reuses an existing session and never reaches the spawn path, so several blocking resumes in one message can still run at once.
+The foreground pool does not cover `resume`: a foreground resume reopens an existing session and never reaches the spawn path, so several blocking resumes in one message can still run at once. A *background* resume does take a background slot and queues behind them like any other background agent.
 
 ## Join Strategies
 
