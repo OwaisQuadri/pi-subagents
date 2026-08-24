@@ -503,6 +503,35 @@ describe("ConversationViewer", () => {
       expect(note).toMatch(/^\.\.\. \(truncated, \d+ more lines\)$/);
     });
 
+    it("falls back to literal wrapping when the Markdown parser throws", () => {
+      // ~54 nested blockquotes overflow pi-tui's recursive renderer. render() is
+      // on the TUI's critical path, so this must degrade, not throw.
+      const sentinel = "STILL_VISIBLE";
+      const viewer = viewerFor(result(`${">".repeat(200)} ${sentinel}`), "all");
+
+      expect(() => viewer.render(80)).not.toThrow();
+      expect(strip(viewer.render(80).join("\n"))).toContain(sentinel);
+    });
+
+    it("tracks a tool result that keeps growing past the cap", () => {
+      // The live case: the capped prefix never changes, so the parse is reused,
+      // but the count of what is being held back has to keep moving.
+      const msg = { role: "toolResult", toolUseId: "t", content: [{ type: "text", text: `${"row\n".repeat(4500)}` }] };
+      const viewer = viewerFor([msg]);
+      const elided = () => Number(
+        strip(((viewer as any).buildContentLines(76) as string[]).join("\n"))
+          .match(/truncated, (\d+) more/)?.[1],
+      );
+
+      const before = elided();
+      msg.content[0].text += "row\n".repeat(1000);
+      const after = elided();
+
+      expect(before).toBeGreaterThan(0);
+      expect(after).toBeGreaterThan(before);
+      expect(markdownConstructions).toBe(0); // default mode: results take the literal path
+    });
+
     it("leaves a result under the cap untouched", () => {
       // Deliberately between the old 500-char cap and the new one, so the test
       // discriminates the cap's value and not merely its existence.
@@ -526,6 +555,14 @@ describe("ConversationViewer", () => {
       // Reads the content line directly: every bordered row carries the theme's
       // escape on its `│`, so asserting on rendered output would pass either way.
       const viewer = viewerFor(result("plain result text"), "all");
+      const line = (viewer as any).buildContentLines(76)
+        .find((l: string) => strip(l).includes("plain result text"));
+
+      expect(line).toContain("\x1b[38;5;240m");
+    });
+
+    it("keeps tool results dim on the literal path too", () => {
+      const viewer = viewerFor(result("plain result text"));
       const line = (viewer as any).buildContentLines(76)
         .find((l: string) => strip(l).includes("plain result text"));
 

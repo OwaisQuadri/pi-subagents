@@ -2508,7 +2508,7 @@ Terse command-style prompts produce shallow, generic work.
           }
         }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => {
           setViewerMarkdown(mode);
-          persistSettings();
+          persistSettings(ctx, `Viewer markdown set to ${mode}`);
         });
       },
       {
@@ -3311,12 +3311,21 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // to warning so users aren't silently reverted on restart. Event fires regardless
   // of outcome so listeners see the in-memory change.
   /**
-   * Persist + broadcast the settings with no toast, for a change whose feedback
-   * is the UI it just changed — the viewer's `m` key, where a notification per
-   * press would talk over the overlay it is describing.
+   * Persist + broadcast the settings, silent on success — for a change whose
+   * feedback is the UI it just changed: the viewer's `m` key, where a
+   * notification per press would talk over the overlay it is describing.
+   *
+   * A *failed* write still speaks. Every other settings path warns when the
+   * value is session-only, and swallowing it here would leave a preference
+   * looking persisted when the next session will not have it.
    */
-  function persistSettings(): void {
-    saveAndEmitChanged(snapshotSettings(), "", (event, payload) => pi.events.emit(event, payload));
+  function persistSettings(ctx: ExtensionCommandContext, changeMsg: string): void {
+    const { message, level } = saveAndEmitChanged(
+      snapshotSettings(),
+      changeMsg,
+      (event, payload) => pi.events.emit(event, payload),
+    );
+    if (level === "warning") ctx.ui.notify(message, level);
   }
 
   function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {

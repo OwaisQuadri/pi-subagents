@@ -145,7 +145,7 @@ export class ConversationViewer implements Component {
    * keystroke — the component caches, but only across calls to the same object.
    * Weak so a compacted-away message doesn't pin its render.
    */
-  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string }>();
+  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
 
   constructor(
     private tui: TUI,
@@ -384,6 +384,12 @@ export class ConversationViewer implements Component {
     return this.markdownModeOverride ?? this.viewerMarkdown?.() ?? "assistant";
   }
 
+  /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
+  private rawLines(text: string, width: number, dim: boolean): string[] {
+    const lines = wrapTextWithAnsi(text, width);
+    return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
+  }
+
   /** Render `text` as Markdown, reusing this message's component instance. */
   private markdownLines(msg: object, text: string, width: number, dim: boolean): string[] {
     let entry = this.markdownCache.get(msg);
@@ -408,8 +414,22 @@ export class ConversationViewer implements Component {
       // Streaming: the message object is stable, its text grows.
       entry.md.setText(text);
       entry.text = text;
+      entry.failed = false;
     }
-    return entry.md.render(width);
+    if (entry.failed) return this.rawLines(text, width, dim);
+
+    try {
+      return entry.md.render(width);
+    } catch {
+      // The parser is recursive and this is arbitrary tool output: ~54 nested
+      // blockquotes overflow the stack, and no amount of fuzzing proves that is
+      // the only such input. `render()` is on the TUI's critical path, so a
+      // throw here takes the overlay down for content the literal path shows
+      // fine — degrade to that instead, and remember, since the throw would
+      // otherwise repeat on every render and every scroll key.
+      entry.failed = true;
+      return this.rawLines(text, width, dim);
+    }
   }
 
   /** Steerable only when a steer handler exists and the agent is still active. */
@@ -508,11 +528,9 @@ export class ConversationViewer implements Component {
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
           const text = textParts.join("\n").trim();
-          if (mode === "off") {
-            for (const line of wrapTextWithAnsi(text, width)) lines.push(line);
-          } else {
-            lines.push(...this.markdownLines(msg, text, width, false));
-          }
+          lines.push(...(mode === "off"
+            ? this.rawLines(text, width, false)
+            : this.markdownLines(msg, text, width, false)));
         }
         for (const name of toolCalls) {
           lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
@@ -522,13 +540,9 @@ export class ConversationViewer implements Component {
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
-        if (mode === "all") {
-          lines.push(...this.markdownLines(msg, text, width, true));
-        } else {
-          for (const line of wrapTextWithAnsi(text, width)) {
-            lines.push(th.fg("dim", line));
-          }
-        }
+        lines.push(...(mode === "all"
+          ? this.markdownLines(msg, text, width, true)
+          : this.rawLines(text, width, true)));
         if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
@@ -538,9 +552,7 @@ export class ConversationViewer implements Component {
           // Same cap as a tool result, never Markdown: command output is the one
           // thing here that is definitionally not authored as Markdown.
           const { text, elided } = capResult(bash.output.trim());
-          for (const line of wrapTextWithAnsi(text, width)) {
-            lines.push(th.fg("dim", line));
-          }
+          lines.push(...this.rawLines(text, width, true));
           if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
         }
       } else {
