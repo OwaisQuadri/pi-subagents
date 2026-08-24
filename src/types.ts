@@ -107,8 +107,10 @@ export type WidgetMode = 'all' | 'background' | 'off';
  * - `assistant`: assistant text renders as Markdown; tool results stay verbatim
  *   and dim. The default, because assistant text *is* Markdown by contract
  *   while a tool result is arbitrary bytes — a Markdown pass over a log or a
- *   diff eats `#` from shell comments, renumbers `3) 7) 9)` to `3. 4. 5.`,
- *   swallows a `---` line into a setext heading and re-fences indented output.
+ *   diff eats `#` from shell comments, swallows a `---` line into a setext
+ *   heading, re-fences indented output and redraws `| a | b |` as a table.
+ *   (Ordered-list renumbering is the one such rewrite actively suppressed —
+ *   see `MARKDOWN_OPTIONS` — because it silently changes data, not layout.)
  * - `all`: tool results render as Markdown too, for tools that genuinely emit
  *   it (#210's `ctx_execute`), accepting the rewrites above on ones that don't.
  */
