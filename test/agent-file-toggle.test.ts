@@ -13,7 +13,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseAgentFrontmatter } from "../src/custom-agents.js";
 import {
   buildNewAgentFile,
   disableInContent,
@@ -23,6 +22,7 @@ import {
   isEmptyStub,
   locateAgentFile,
 } from "../src/agent-file-toggle.js";
+import { parseAgentFrontmatter } from "../src/custom-agents.js";
 
 /** What the loader concludes about a file, via the same parser it really uses. */
 function loaderSeesDisabled(content: string): boolean {
