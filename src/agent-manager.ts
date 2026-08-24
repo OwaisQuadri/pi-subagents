@@ -125,11 +125,8 @@ function occupiesPoolSlot(record: Pick<AgentRecord, "isBackground" | "parentAgen
  * Like the background pool this bounds width at the top level only — a parent's
  * own fan-out is limited by nothing but its turn budget.
  */
-function occupiesForegroundSlot(
-  record: Pick<AgentRecord, "parentAgentId">,
-  blocking: boolean | undefined,
-): boolean {
-  return blocking === true && record.parentAgentId === undefined;
+function occupiesForegroundSlot(record: Pick<AgentRecord, "blocking" | "parentAgentId">): boolean {
+  return !!record.blocking && record.parentAgentId === undefined;
 }
 
 /** Which concurrency pool a spawn is charged to, if any. */
@@ -396,11 +393,9 @@ export class AgentManager {
    * pins them; the observable half — that the default start stays synchronous —
    * is pinned in `test/foreground-concurrency.test.ts`.
    */
-  private poolFor(record: AgentRecord, options: Pick<SpawnOptions, "blocking">): Pool | undefined {
+  private poolFor(record: AgentRecord): Pool | undefined {
     if (occupiesPoolSlot(record)) return "background";
-    if (this.maxConcurrentForeground > 0 && occupiesForegroundSlot(record, options.blocking)) {
-      return "foreground";
-    }
+    if (this.maxConcurrentForeground > 0 && occupiesForegroundSlot(record)) return "foreground";
     return undefined;
   }
 
@@ -459,6 +454,10 @@ export class AgentManager {
       // only filter excludes only explicit `false`, so undefined agents — which
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
+      // Whether anyone is awaiting this agent is a property of the agent, not
+      // of the call that made it — and both settle paths need it long after
+      // `options` has stopped being the interesting object.
+      blocking: options.blocking,
       invocation: options.invocation,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
@@ -475,7 +474,7 @@ export class AgentManager {
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
-    const pool = this.poolFor(record, options);
+    const pool = this.poolFor(record);
     if (pool !== undefined && !options.bypassQueue && !this.poolHasRoom(pool)) {
       // Queue it — started when a running agent in the same pool completes.
       // Idempotent for background (already "queued"); the flip that matters is
@@ -483,14 +482,13 @@ export class AgentManager {
       record.status = "queued";
       // A queued record never reaches startAgent's signal wiring, so arm the
       // parent abort here or Esc could not release the position.
-      const armed = this.armQueuedAbort(id, options.signal);
-      if (armed === undefined) return id; // already aborted — never enqueued
+      if (!this.armQueuedAbort(id, options.signal)) return id;
       let release!: () => void;
       record.startGate = new Promise<void>(resolve => { release = resolve; });
       this.queue.push({
         id,
         pool,
-        start: () => { armed(); this.startAgent(id, record, args); },
+        start: () => this.startAgent(id, record, args),
         release: () => release(),
       });
       options.onQueued?.(id, this.queue.filter(e => e.pool === pool).length - 1);
@@ -513,25 +511,28 @@ export class AgentManager {
    * `startAgent` does this for running agents, and a queued record never gets
    * there, so without this Esc could not release a queue position.
    *
-   * Returns a detach closure the queue entry calls before `startAgent` installs
-   * its own listener, so the two never coexist — or `undefined` when the signal
-   * is already aborted, in which case the record is stopped here and MUST NOT
-   * be enqueued: `addEventListener` would never fire and a `spawnAndWait` on it
-   * would wait forever, pi having no tool-execution timeout to bail it out.
+   * Returns false when the signal is ALREADY aborted, in which case the record
+   * is stopped here and must not be enqueued: `addEventListener` never fires on
+   * an aborted signal, so a `spawnAndWait` on it would wait forever — pi has no
+   * tool-execution timeout to bail it out.
+   *
+   * The listener is left in place when the agent starts. `startAgent` adds its
+   * own, so both fire on a later abort, but `abort()` on an already-stopped
+   * record is a no-op — so detaching would only be tidiness, and tidiness the
+   * `abortAll`/`dispose` paths could not offer anyway.
    */
-  private armQueuedAbort(id: string, signal?: AbortSignal): (() => void) | undefined {
-    if (signal === undefined) return () => {};
+  private armQueuedAbort(id: string, signal?: AbortSignal): boolean {
+    if (signal === undefined) return true;
     if (signal.aborted) {
       const record = this.agents.get(id);
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
       }
-      return undefined;
+      return false;
     }
-    const onAbort = () => this.abort(id);
-    signal.addEventListener("abort", onAbort, { once: true });
-    return () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", () => this.abort(id), { once: true });
+    return true;
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
@@ -576,12 +577,12 @@ export class AgentManager {
     record.startGate = undefined;
     // After the worktree throw point above, so a strict-isolation failure can
     // never leak a slot the run does not hold. Resolved ONCE, here, and carried
-    // to `settlePools` below: `poolFor` reads `maxConcurrentForeground`, which
+    // to `settleRun` below: `poolFor` reads `maxConcurrentForeground`, which
     // the user can change from `/agents → Settings` mid-run, so recomputing it
     // at settle time would decrement a pool this run never charged (counter
     // underflow, limit silently lifted) or skip the decrement for one it did
     // (leaked slot — every later blocking spawn queues forever).
-    const pool = this.poolFor(record, options);
+    const pool = this.poolFor(record);
     if (pool === "background") this.runningBackground++;
     else if (pool === "foreground") this.runningForeground++;
     this.onStart?.(record);
@@ -729,7 +730,7 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settlePools(record, options, true, pool);
+        this.settleRun(record, true, pool);
         return responseText;
       })
       .catch((err) => {
@@ -758,7 +759,7 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settlePools(record, options, false, pool);
+        this.settleRun(record, false, pool);
         return "";
       });
 
@@ -790,13 +791,8 @@ export class AgentManager {
    *   recomputed, so a mid-run change to `maxConcurrentForeground` can't make
    *   the release disagree with the acquire.
    */
-  private settlePools(
-    record: AgentRecord,
-    options: SpawnOptions,
-    guardCallback: boolean,
-    pool: Pool | undefined,
-  ): void {
-    if (!options.isBackground) record.resultConsumed = true;
+  private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
+    if (!record.isBackground) record.resultConsumed = true;
     if (pool === "background") this.runningBackground--;
     else if (pool === "foreground") this.runningForeground--;
 
@@ -806,13 +802,13 @@ export class AgentManager {
       this.onComplete?.(record);
     }
 
-    // `options.isBackground` reproduces the pre-pool condition exactly — a
+    // The isBackground half reproduces the pre-pool condition exactly — a
     // background settle has always drained, even for a nested child that held
     // no slot — so that path is unchanged whether or not the foreground pool is
     // on. The `pool` half only adds the drain a freed FOREGROUND slot needs.
     // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
     // about reachability, and matching the old condition needs no such claim.
-    if (options.isBackground || pool !== undefined) this.drainQueue();
+    if (record.isBackground || pool !== undefined) this.drainQueue();
   }
 
   /**
@@ -849,7 +845,7 @@ export class AgentManager {
         // Late failure (e.g. strict worktree-isolation) — surface on the record
         // so the user/agent can see it via /agents, then keep draining.
         if (record) {
-          // Mirrors settlePools: an inline caller gets this failure as a throw
+          // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
           if (next.pool === "foreground") record.resultConsumed = true;
