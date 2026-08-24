@@ -4207,10 +4207,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
   /**
    * Open the inspector for a workflow run.
    *
-   * Only `onKill` is wired: stopping is just aborting the run's controller,
-   * whereas pause/resume and per-agent skip/retry need runtime support that
-   * does not exist yet. The dialog derives its key hints from the actions it
-   * is handed, so the footer advertises exactly what works — see
+   * All five controls are wired: `onKill` aborts the run's controller, while
+   * pause/resume and per-agent skip/retry go through `task.control`, the handle
+   * `runWorkflow` hands back. The dialog derives its key hints from the actions
+   * it is handed, so the footer advertises exactly what works — see
    * `WorkflowDialogActions`.
    */
   async function showWorkflowDialog(ctx: ExtensionCommandContext, task: WorkflowTask): Promise<void> {
