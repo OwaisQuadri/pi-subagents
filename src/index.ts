@@ -36,7 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -383,6 +383,14 @@ export default function (pi: ExtensionAPI) {
   let showCost = false;
   function isShowCostEnabled(): boolean { return showCost; }
   function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
+  /**
+   * How much of the conversation viewer renders as Markdown. Read through a
+   * getter by the viewer rather than captured like `showCost`, because the
+   * viewer's `m` key writes back here while the overlay is on screen.
+   */
+  let viewerMarkdown: ViewerMarkdownMode = "assistant";
+  function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
+  function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
   const pendingUsage = new PendingUsagePool();
 
   // ---- Cancellable pending notifications ----
@@ -1309,6 +1317,7 @@ export default function (pi: ExtensionAPI) {
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
       setShowCost,
+      setViewerMarkdown,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -2447,7 +2456,10 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost);
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => {
+          setViewerMarkdown(mode);
+          persistSettings();
+        });
       },
       {
         overlay: true,
@@ -2832,6 +2844,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       fallbackSubagent: getFallbackSubagent(),
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
+      viewerMarkdown: getViewerMarkdown(),
     } satisfies SubagentsSettings;
   }
 
@@ -2970,6 +2983,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
             "Show an estimated `~$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. Priced by pi from the model's rates — omitted entirely for a model it has no rates for.",
           currentValue: isShowCostEnabled() ? "on" : "off",
           values: ["on", "off"],
+        },
+        {
+          id: "viewerMarkdown",
+          label: "Viewer markdown",
+          description:
+            "How much of the conversation viewer renders as Markdown. assistant = assistant text only (default); all = tool results too, for tools that emit Markdown — accepting that a Markdown pass over a diff or a log eats `#` comments, renumbers `3) 7) 9)` and re-fences indented output; off = everything verbatim. `m` in the viewer cycles the same setting (footer: raw / md / md+).",
+          currentValue: getViewerMarkdown(),
+          values: ["off", "assistant", "all"],
         },
         {
           id: "fleetView",
@@ -3115,6 +3136,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setShowCost(enabled);
         notifyApplied(ctx, `Cost display ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "viewerMarkdown") {
+        setViewerMarkdown(value as ViewerMarkdownMode);
+        notifyApplied(ctx, `Viewer markdown set to ${value}`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
@@ -3223,6 +3247,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // the right toast. Successful saves show info; persistence failures downgrade
   // to warning so users aren't silently reverted on restart. Event fires regardless
   // of outcome so listeners see the in-memory change.
+  /**
+   * Persist + broadcast the settings with no toast, for a change whose feedback
+   * is the UI it just changed — the viewer's `m` key, where a notification per
+   * press would talk over the overlay it is describing.
+   */
+  function persistSettings(): void {
+    saveAndEmitChanged(snapshotSettings(), "", (event, payload) => pi.events.emit(event, payload));
+  }
+
   function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
     const { message, level } = saveAndEmitChanged(
       snapshotSettings(),

@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
-import type { AgentMentionMode, JoinMode, WidgetMode } from "./types.js";
+import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
@@ -234,6 +234,19 @@ export interface SubagentsSettings {
    * what the parent session counts.
    */
   showCost?: boolean;
+  /**
+   * How much of the conversation viewer's transcript renders as Markdown.
+   * Defaults to `assistant`. Applied live — the viewer's `m` key cycles this
+   * same setting, so a choice made in the overlay persists like one made in
+   * `/agents → Settings`.
+   *
+   * Scoped rather than all-or-nothing because the two kinds of content have
+   * different contracts: assistant text is authored as Markdown, while a tool
+   * result is whatever bytes the tool produced. Rendering the latter as
+   * Markdown is lossy in ways that look like the tool misbehaved — see
+   * `ViewerMarkdownMode` for the specific rewrites — so `all` is opt-in.
+   */
+  viewerMarkdown?: ViewerMarkdownMode;
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -260,6 +273,7 @@ export interface SettingsAppliers {
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
+  setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -268,6 +282,7 @@ export type SettingsEmit = (event: string, payload: unknown) => void;
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
+const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
@@ -360,6 +375,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.showCost === "boolean") {
     out.showCost = r.showCost;
   }
+  if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
+    out.viewerMarkdown = r.viewerMarkdown as ViewerMarkdownMode;
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -440,6 +458,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation(s.worktreeIsolation);
   if (typeof s.reportUsage === "boolean") appliers.setReportUsage(s.reportUsage);
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
+  if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
 }
 
 /**
