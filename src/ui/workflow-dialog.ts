@@ -10,7 +10,7 @@
  *  │   2 Verify   1/2 │                                                │
  *  │   3 Report       │                                                │
  *  ╰──────────────────┴────────────────────────────────────────────────╯
- *  ↑↓ select · ⏎ open · f filter · x stop · esc close
+ *  ↑↓ select · ⏎ open · f filter · x stop · esc close · c convo
  * ```
  *
  * Opening an agent swaps the panes: that phase's agents move left and the
@@ -319,6 +319,15 @@ export interface WorkflowDialogActions {
   /** `index` is the entry's stable `index`, not its row position. */
   onSkipAgent?(index: number): void;
   onRetryAgent?(index: number): void;
+  /**
+   * Open the selected agent's conversation.
+   *
+   * `recordId` is the manager's id for the child, which the entry carries once
+   * the host has reported one — the dialog knows nothing about sessions, so
+   * what happens to an id whose record has since been swept is the caller's to
+   * say. The only key here that shows something rather than changing the run.
+   */
+  onOpenAgent?(recordId: string): void;
 }
 
 export type WorkflowDialogAction =
@@ -327,7 +336,8 @@ export type WorkflowDialogAction =
   | { kind: "pause" }
   | { kind: "resume" }
   | { kind: "skip"; index: number }
-  | { kind: "retry"; index: number };
+  | { kind: "retry"; index: number }
+  | { kind: "open"; recordId: string };
 
 export interface ResolvedWorkflowDialog {
   groups: PhaseGroup[];
@@ -880,6 +890,19 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   else if (view.workflowActive && can("onPause")) hints.push("p pause");
   if (view.workflowActive && can("onKill")) hints.push("x stop");
   hints.push(inPhases ? "esc close" : "esc back");
+  // Advertised at BOTH levels, because the key works at both: the selected row
+  // is the one marked in the agents pane either way. Gated on the entry having
+  // a record id, so a row whose child has not been issued one — a queued agent,
+  // a replayed one — does not promise a conversation that does not exist.
+  //
+  // Last, and abbreviated, for one reason: the footer is clamped rather than
+  // wrapped, so whatever sits at the end is what an 80-column terminal drops.
+  // This is the only hint here that can be dropped without stranding the
+  // reader — every other key either moves the cursor, changes the run, or is
+  // the way out — so it is the one that goes over the edge first.
+  if (view.selectedEntry?.recordId !== undefined && can("onOpenAgent")) {
+    hints.push("c convo");
+  }
   lines.push(clampLine([{ text: ` ${hints.join(" · ")}`, color: "dim" }], width));
 
   return lines;
@@ -948,6 +971,15 @@ export function handleWorkflowDialogKey(
   }
   if (matchesKey(data, "e")) {
     return { state: { ...state, promptExpanded: !state.promptExpanded } };
+  }
+
+  // The one key that opens something instead of changing the run, so unlike
+  // skip/retry it works at both levels and on a settled agent: reading what a
+  // finished child did is most of why anyone opens this dialog. A row with no
+  // record id has no conversation to open, and falls through as unbound.
+  if (matchesKey(data, "c")) {
+    const recordId = view.selectedEntry?.recordId;
+    return recordId === undefined ? undefined : { state, action: { kind: "open", recordId } };
   }
 
   // The filter re-points the agent list, so it belongs to the level that shows
@@ -1034,6 +1066,7 @@ export class WorkflowDialog implements Component {
         onResume: this.actions.onResume !== undefined,
         onSkipAgent: this.actions.onSkipAgent !== undefined,
         onRetryAgent: this.actions.onRetryAgent !== undefined,
+        onOpenAgent: this.actions.onOpenAgent !== undefined,
       },
       width,
       spinnerFrame: this.spinnerFrame,
@@ -1073,6 +1106,9 @@ export class WorkflowDialog implements Component {
         return;
       case "retry":
         this.actions.onRetryAgent?.(action.index);
+        return;
+      case "open":
+        this.actions.onOpenAgent?.(action.recordId);
         return;
     }
   }

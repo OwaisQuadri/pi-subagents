@@ -82,6 +82,15 @@ export interface WorkflowSpawnRequest {
    * requested values it started with.
    */
   onResolved?(info: {
+    /**
+     * The host's own id for the child — the manager's `AgentRecord` id here.
+     *
+     * Reported as soon as the host has one, which is earlier than the rest of
+     * this: the model is knowable only once a session exists, but the id is
+     * what lets a reader open that child's conversation, and a child that
+     * never got a model is exactly the one worth opening.
+     */
+    recordId?: string;
     modelName?: string;
     modelId?: string;
     thinking?: string;
@@ -979,12 +988,14 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           // same `index` is what the append-only, last-write-wins progress log
           // is for — the row updates in place while the agent is still running.
           const onResolved = (info: {
+            recordId?: string;
             modelName?: string;
             modelId?: string;
             thinking?: string;
             requestedThinking?: string;
             requestedModel?: string;
           }) => {
+            if (info.recordId !== undefined) base.recordId = info.recordId;
             if (info.modelName !== undefined) base.model = info.modelName;
             if (info.modelId !== undefined) base.modelId = info.modelId;
             if (info.thinking !== undefined) base.thinking = info.thinking;

@@ -4221,11 +4221,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
   /**
    * Open the inspector for a workflow run.
    *
-   * All five controls are wired: `onKill` aborts the run's controller, while
+   * All six controls are wired: `onKill` aborts the run's controller, while
    * pause/resume and per-agent skip/retry go through `task.control`, the handle
-   * `runWorkflow` hands back. The dialog derives its key hints from the actions
-   * it is handed, so the footer advertises exactly what works — see
-   * `WorkflowDialogActions`.
+   * `runWorkflow` hands back. `onOpenAgent` is the odd one out — it opens the
+   * child's conversation rather than changing the run. The dialog derives its
+   * key hints from the actions it is handed, so the footer advertises exactly
+   * what works — see `WorkflowDialogActions`.
    */
   async function showWorkflowDialog(ctx: ExtensionCommandContext, task: WorkflowTask): Promise<void> {
     // Overlaid on the same terms as the conversation viewer, because they are
@@ -4233,6 +4234,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
     // must not behave unlike opening the other. Inline, the frame would render
     // into the conversation and stay in the scrollback after it closed.
     const { VIEWPORT_HEIGHT_PCT } = await import("./ui/conversation-viewer.js");
+    /**
+     * This dialog's own overlay, so `c` can hide it while the conversation is
+     * up. Overlays stack, so the viewer would render *over* it either way —
+     * but the two frames size themselves to different content, and the taller
+     * one's edges show around the shorter. Hidden, there is nothing to peek
+     * out, and un-hiding puts the focus back on the dialog when the viewer
+     * closes.
+     */
+    let overlay: { setHidden(hidden: boolean): void } | undefined;
     await ctx.ui.custom<undefined>(
       (tui, theme, _keybindings, done) =>
         new WorkflowDialog(
@@ -4281,11 +4291,33 @@ Write the file using the write tool. Only write the file, nothing else.`;
                 ctx.ui.notify("Only a running agent can be retried.", "info");
               }
             },
+            onOpenAgent: recordId => {
+              const record = manager.getRecord(recordId);
+              // A run's children are records like any other, so they are swept
+              // ten minutes after they finish — the row outlives the
+              // conversation it points at, and saying why beats an overlay that
+              // opens empty.
+              if (record === undefined) {
+                ctx.ui.notify("No conversation left — agent records are dropped ten minutes after they finish.", "info");
+                return;
+              }
+              overlay?.setHidden(true);
+              // Caught before the `finally`, so a viewer that fails to open
+              // still un-hides the dialog and cannot surface as an unhandled
+              // rejection out of a detached promise.
+              void viewAgentConversation(ctx, record)
+                .catch(err => ctx.ui.notify(
+                  `Could not open the conversation: ${err instanceof Error ? err.message : String(err)}`,
+                  "warning",
+                ))
+                .finally(() => overlay?.setHidden(false));
+            },
           },
         ),
       {
         overlay: true,
         overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
+        onHandle: handle => { overlay = handle; },
       },
     );
   }

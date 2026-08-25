@@ -62,6 +62,16 @@ export interface WorkflowAgentEntry {
   phaseTitle?: string;
   state: WorkflowEntryState;
   agentId?: string;
+  /**
+   * The manager's `AgentRecord` id, once the child has one.
+   *
+   * Distinct from {@link agentId}, which is the run's own `wf-agent-N` handle
+   * and means nothing outside the runtime. This is what the inspector's `c`
+   * key opens a conversation viewer on, so it is reported the moment the
+   * manager issues it rather than with the effective model — a child that dies
+   * before its session resolves still has a conversation worth reading.
+   */
+  recordId?: string;
   agentType?: string;
   /**
    * Short model label for tight rows, e.g. `haiku 4.5`.

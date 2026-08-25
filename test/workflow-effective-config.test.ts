@@ -46,6 +46,24 @@ const spawnRequest = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSp
 });
 
 /**
+ * Collect only the reports that say something about the child's EFFECTIVE
+ * configuration.
+ *
+ * The host fires `onResolved` once more than these tests are about: the moment
+ * the manager issues a record id it reports that id and nothing else, ahead of
+ * any session, so a child that dies before one exists is still openable in the
+ * inspector. Every test below is about the configuration half, so the id is
+ * stripped and an id-only report is dropped; that it fires at all has its own
+ * test at the bottom.
+ */
+function configCollector(into: Record<string, unknown>[]) {
+  return (info: Record<string, unknown>) => {
+    const { recordId: _recordId, ...rest } = info;
+    if (Object.keys(rest).length > 0) into.push(rest);
+  };
+}
+
+/**
  * Stand in for pi resolving the child's session.
  *
  * The real `runAgent` invokes the `onSessionCreated` the manager hands it, and
@@ -84,7 +102,7 @@ describe("the workflow host reports a child's effective configuration", () => {
     const reported: unknown[] = [];
 
     // The script asked fuzzily; the row must not keep saying "haiku".
-    await host.spawnAgent(spawnRequest({ model: "haiku", onResolved: info => reported.push(info) }));
+    await host.spawnAgent(spawnRequest({ model: "haiku", onResolved: configCollector(reported) }));
 
     expect(reported).toHaveLength(1);
     expect(reported[0]).toMatchObject({ modelId: "anthropic/claude-haiku-4-5" });
@@ -96,7 +114,7 @@ describe("the workflow host reports a child's effective configuration", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
     const reported: { modelId?: string }[] = [];
 
-    await host.spawnAgent(spawnRequest({ onResolved: info => reported.push(info) }));
+    await host.spawnAgent(spawnRequest({ onResolved: configCollector(reported) }));
 
     // This is the one #168 was filed about: nothing was requested, so without
     // the read-back there is nothing at all to render.
@@ -108,7 +126,7 @@ describe("the workflow host reports a child's effective configuration", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
     const reported: { thinking?: string; requestedThinking?: string }[] = [];
 
-    await host.spawnAgent(spawnRequest({ effort: "max", onResolved: info => reported.push(info) }));
+    await host.spawnAgent(spawnRequest({ effort: "max", onResolved: configCollector(reported) }));
 
     // Both halves, or the row cannot say "low (asked max)" — and without the
     // seeded request there would be nothing for the manager to compare against.
@@ -143,7 +161,7 @@ describe("the workflow host reports a child's effective configuration", () => {
     const reported: { requestedModel?: string }[] = [];
 
     await host.spawnAgent(
-      spawnRequest({ agentType: "pinned", model: "haiku", onResolved: info => reported.push(info) }),
+      spawnRequest({ agentType: "pinned", model: "haiku", onResolved: configCollector(reported) }),
     );
 
     // The script's "haiku" won over the file's pinned opus...
@@ -157,7 +175,7 @@ describe("the workflow host reports a child's effective configuration", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
     const reported: { requestedThinking?: string }[] = [];
 
-    await host.spawnAgent(spawnRequest({ effort: "low", onResolved: info => reported.push(info) }));
+    await host.spawnAgent(spawnRequest({ effort: "low", onResolved: configCollector(reported) }));
 
     expect(reported[0]?.requestedThinking).toBeUndefined();
   });
@@ -169,10 +187,30 @@ describe("the workflow host reports a child's effective configuration", () => {
     // the spawn outright and this would pass without reaching a session at all.
     childSessionReports({});
     const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
-    const reported: unknown[] = [];
+    const reported: Record<string, unknown>[] = [];
+
+    await host.spawnAgent(spawnRequest({ onResolved: configCollector(reported) }));
+
+    expect(reported).toEqual([]);
+  });
+
+  it("reports the record id ahead of any session, so the row is openable either way", async () => {
+    // The inspector's `c` key opens the manager's record for this child. The
+    // id is knowable as soon as the manager issues it, and gating it on the
+    // session — as the configuration half is — would leave exactly the
+    // children worth reading, the ones that died in startup, unopenable.
+    childSessionReports({});
+    const host = createWorkflowHost({ pi, ctx: ctx({}), manager });
+    const reported: { recordId?: string }[] = [];
 
     await host.spawnAgent(spawnRequest({ onResolved: info => reported.push(info) }));
 
-    expect(reported).toEqual([]);
+    expect(reported).toHaveLength(1);
+    // The id the manager issued, and not the run's own `wf-agent-0` handle,
+    // which means nothing outside the runtime.
+    const recordId = reported[0]?.recordId;
+    expect(recordId).toBeTruthy();
+    expect(recordId).not.toBe("wf-agent-0");
+    expect(manager.getRecord(recordId!)).toBeDefined();
   });
 });

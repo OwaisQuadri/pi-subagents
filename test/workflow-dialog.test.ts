@@ -670,6 +670,60 @@ describe("keys", () => {
     expect(handleWorkflowDialogKey("r", settled.state, view)).toBeUndefined();
   });
 
+  /** The same three agents, each carrying the manager record id `c` opens. */
+  const withRecords: WorkflowEntry[] = [
+    { type: "workflow_phase", index: 0, title: "Review" },
+    agentEntry({ index: 0, label: "queued", phaseIndex: 0, state: "start", queuedAt: START }),
+    agentEntry({
+      index: 1, label: "running", phaseIndex: 0, state: "progress",
+      queuedAt: START, startedAt: START, recordId: "rec-1",
+    }),
+    agentEntry({ index: 2, label: "done", phaseIndex: 0, state: "done", recordId: "rec-2" }),
+  ];
+  const pressRecords = (data: string, state: Partial<WorkflowDialogState>) => {
+    const full = input({ progress: withRecords, state });
+    return handleWorkflowDialogKey(data, full.state, resolveWorkflowDialog(full));
+  };
+
+  it("opens the selected agent's conversation on c, at either level", () => {
+    // Both levels, because the selected row is the one marked in the agents
+    // pane either way — unlike skip/retry, which change the run and so belong
+    // to the level that shows one agent.
+    expect(pressRecords("c", { level: "agent", selectedAgent: 1 })?.action).toEqual({
+      kind: "open", recordId: "rec-1",
+    });
+    expect(pressRecords("c", { level: "phases", selectedAgent: 1 })?.action).toEqual({
+      kind: "open", recordId: "rec-1",
+    });
+  });
+
+  it("opens a settled agent's conversation, unlike skip and retry", () => {
+    // Reading what a finished child actually did is most of the reason to open
+    // this dialog at all; the keys that refuse a settled agent refuse it
+    // because there is nothing left to change, which does not apply here.
+    expect(pressRecords("c", { level: "agent", selectedAgent: 2 })?.action).toEqual({
+      kind: "open", recordId: "rec-2",
+    });
+  });
+
+  it("opens nothing for a row whose child has no record yet", () => {
+    // A queued agent has been scheduled, not spawned, so there is no
+    // conversation behind the row — the key falls through as unbound rather
+    // than raising an action the caller can only refuse.
+    expect(pressRecords("c", { level: "agent", selectedAgent: 0 })).toBeUndefined();
+  });
+
+  it("still opens a conversation once the run itself has stopped", () => {
+    const settled = input({
+      progress: withRecords,
+      task: { status: "killed", startTime: START, endTime: START + 10 },
+      state: { level: "agent", selectedAgent: 2 },
+    });
+    expect(handleWorkflowDialogKey("c", settled.state, resolveWorkflowDialog(settled))?.action).toEqual({
+      kind: "open", recordId: "rec-2",
+    });
+  });
+
   it("leaves an unbound key alone", () => {
     expect(press("z")).toBeUndefined();
   });
@@ -876,6 +930,7 @@ describe("WorkflowDialog component", () => {
         onPause: () => calls.push("pause"),
         onSkipAgent: (index: number) => calls.push(`skip:${index}`),
         onRetryAgent: (index: number) => calls.push(`retry:${index}`),
+        onOpenAgent: (recordId: string) => calls.push(`open:${recordId}`),
       },
     );
     return { dialog: instance, calls, closed };
@@ -902,6 +957,20 @@ describe("WorkflowDialog component", () => {
     expect(closed).toHaveLength(0);
     instance.handleInput("\x1b");
     expect(closed).toEqual([true]);
+    instance.dispose();
+  });
+
+  it("hands the record id to the injected opener", () => {
+    const openable = () => ({
+      progress: [agentEntry({ index: 7, label: "only", state: "done", recordId: "rec-7" })],
+      task: { status: "running" as const, workflowName: "wf", startTime: START },
+    });
+    const { dialog: instance, calls, closed } = harness(openable);
+    instance.handleInput("c");
+    expect(calls.filter(c => c !== "render")).toEqual(["open:rec-7"]);
+    // Opening a conversation is not closing the dialog: the reader comes back
+    // to the run they were looking at.
+    expect(closed).toHaveLength(0);
     instance.dispose();
   });
 
@@ -975,6 +1044,53 @@ describe("key hints reflect the wired actions", () => {
     expect(hints).not.toContain("r retry");
   });
 
+  it("advertises the conversation key on a row that has a record", () => {
+    const openable: WorkflowEntry[] = [
+      { type: "workflow_agent", index: 0, label: "a", phaseIndex: 0, state: "progress", startedAt: START, recordId: "rec-1" },
+    ];
+    // Both levels, matching where the key works.
+    expect(agentHints({ progress: openable })).toContain("c convo");
+    expect(hintLine({ progress: openable })).toContain("c convo");
+  });
+
+  it("says nothing about the conversation key without a record to open", () => {
+    // `live` is a running agent the host has not reported a record id for.
+    expect(agentHints({ progress: live })).not.toContain("c convo");
+  });
+
+  it("hides the conversation key when the caller did not wire it", () => {
+    const openable: WorkflowEntry[] = [
+      { type: "workflow_agent", index: 0, label: "a", phaseIndex: 0, state: "done", recordId: "rec-1" },
+    ];
+    expect(agentHints({ progress: openable, available: { onOpenAgent: false } })).not.toContain("c convo");
+  });
+
+  /** Every per-agent key live at once: running, openable, long enough prompt. */
+  const everyKey: WorkflowEntry[] = [
+    {
+      type: "workflow_agent", index: 0, label: "a", phaseIndex: 0, state: "progress",
+      startedAt: START, recordId: "rec-1",
+      promptPreview: Array.from({ length: PROMPT_COLLAPSED_LINES + 2 }, (_, i) => `line ${i}`).join("\n"),
+    },
+  ];
+
+  it("drops the conversation hint before the way out on a narrow terminal", () => {
+    // The footer is clamped, not wrapped, so a hint added at the end costs
+    // whatever was already there. `c convo` is last precisely so that an
+    // 80-column terminal loses it rather than `esc back` — every other key
+    // either moves the cursor, changes the run, or is the escape hatch.
+    const narrow = dialog({ progress: everyKey, width: 80, state: { level: "agent" } }).at(-1) ?? "";
+    expect(narrow).toContain("esc back");
+  });
+
+  it("shows every hint once the terminal has room", () => {
+    const wide = dialog({ progress: everyKey, width: 100, state: { level: "agent" } }).at(-1) ?? "";
+    for (const key of ["↑↓ agent", "⏎ prompt", "s skip", "r retry", "p pause", "x stop", "esc back", "c convo"]) {
+      expect(wide).toContain(key);
+    }
+    expect(wide).not.toContain("…");
+  });
+
   it("hides stop when kill is not wired", () => {
     expect(hintLine({ progress: live, available: { onKill: false } })).not.toContain("x stop");
   });
@@ -1017,7 +1133,7 @@ describe("component availability", () => {
   it("advertises the full set when every action is wired", () => {
     const instance = new WorkflowDialog(tui, liveSource, theme, () => {}, {
       onKill: () => {}, onPause: () => {}, onResume: () => {},
-      onSkipAgent: () => {}, onRetryAgent: () => {},
+      onSkipAgent: () => {}, onRetryAgent: () => {}, onOpenAgent: () => {},
     });
     const hints = footer(instance);
     for (const key of ["s skip", "r retry", "p pause", "x stop"]) expect(hints).toContain(key);

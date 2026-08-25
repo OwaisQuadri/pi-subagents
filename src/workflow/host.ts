@@ -336,6 +336,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           id => {
             spawnedId = id;
             records.set(request.agentId, id);
+            // Ahead of `reportResolved`, and not folded into it: that one waits
+            // for the child's session so it can name the effective model, while
+            // the record id is known here and is what the inspector opens a
+            // conversation on. A child that fails before its session resolves
+            // would otherwise never be openable at all.
+            request.onResolved?.({ recordId: id });
             reportResolved();
           },
         );
@@ -369,7 +375,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       }
       // The resumed row is built from scratch, so it has to be told the same
       // thing the first one was — the child's session already exists, so this is
-      // simply read back rather than waited for.
+      // simply read back rather than waited for. The id goes first for the same
+      // reason it does on the spawn path: it is knowable even when the rest is
+      // not.
+      onResolved?.({ recordId: id });
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
       return toSpawnResult(record);
