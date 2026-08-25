@@ -14,7 +14,7 @@
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
-import type { AgentRecord } from "../types.js";
+import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
@@ -132,6 +132,18 @@ export class FleetList {
      * `showCost` setting.
      */
     private showCost: () => boolean = () => false,
+    /**
+     * The user's `viewerMarkdown` setting, for a conversation overlay opened
+     * from here. Read live rather than captured, because the viewer's `m` key
+     * changes it while the overlay is up. Omitted → the viewer's own default.
+     */
+    private viewerMarkdown?: () => ViewerMarkdownMode,
+    /**
+     * Persist a mode chosen with `m` in that overlay, so the key means the same
+     * thing here as it does from `/agents` — one setting, not one per entry
+     * point. Omitted → `m` still cycles, viewer-locally.
+     */
+    private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
   ) {}
 
   // ---- Lifecycle ----
@@ -411,6 +423,8 @@ export class FleetList {
           keybindings,
           (message: string) => this.manager.steer(record.id, message),
           this.showCost(),
+          this.viewerMarkdown,
+          this.onViewerMarkdown,
         );
       },
       {

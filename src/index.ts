@@ -1186,7 +1186,15 @@ export default function (pi: ExtensionAPI) {
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled);
+  // The last two arguments keep a conversation overlay opened from the fleet
+  // list identical to one opened from `/agents`: same setting on the way in,
+  // same persist on the way out. `currentCtx` only carries the warning a failed
+  // write notifies with, and is cleared between sessions, so a persist without
+  // one still writes the file.
+  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown, (mode) => {
+    setViewerMarkdown(mode);
+    persistSettings(currentCtx as unknown as ExtensionCommandContext | undefined, `Viewer markdown set to ${mode}`);
+  });
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -4182,13 +4190,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
    * value is session-only, and swallowing it here would leave a preference
    * looking persisted when the next session will not have it.
    */
-  function persistSettings(ctx: ExtensionCommandContext, changeMsg: string): void {
+  function persistSettings(ctx: ExtensionCommandContext | undefined, changeMsg: string): void {
     const { message, level } = saveAndEmitChanged(
       snapshotSettings(),
       changeMsg,
       (event, payload) => pi.events.emit(event, payload),
     );
-    if (level === "warning") ctx.ui.notify(message, level);
+    // `ctx` is absent only on the fleet path before the first `session_start`,
+    // where there is no UI to carry the warning: the write still happens.
+    if (level === "warning") ctx?.ui.notify(message, level);
   }
 
   function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
