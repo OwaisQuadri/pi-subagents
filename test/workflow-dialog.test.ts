@@ -401,6 +401,29 @@ describe("sub-status annotations", () => {
 describe("per-agent detail", () => {
   const long = Array.from({ length: 9 }, (_, i) => `prompt line ${i}`).join("\n");
 
+  // The detail pane is where per-agent configuration belongs: it has the width
+  // the card row does not, and it is what someone investigating one agent opens.
+  it("names the canonical model id, which the tight card row has no room for", () => {
+    const rows = detail({
+      progress: [agentEntry({
+        index: 0,
+        state: "done",
+        model: "haiku 4.5",
+        modelId: "anthropic/claude-haiku-4-5",
+      })],
+    });
+    // Two providers can serve models whose short names read alike, so this pane
+    // disambiguates where the row cannot.
+    expect(rightRows(rows).map(bare).join("\n")).toContain("anthropic/claude-haiku-4-5");
+  });
+
+  it("shows the thinking level and discloses one that was clamped", () => {
+    const rows = detail({
+      progress: [agentEntry({ index: 0, state: "done", thinking: "low", requestedThinking: "max" })],
+    });
+    expect(rightRows(rows).map(bare).join("\n")).toContain("thinking: low (asked max)");
+  });
+
   it("collapses a long prompt behind an `expand` affordance and counts its lines", () => {
     const collapsed = detail({
       progress: [agentEntry({ index: 0, state: "done", promptPreview: long })],
@@ -567,6 +590,15 @@ describe("keys", () => {
 
   it("cancels on escape from the overview", () => {
     expect(press("\x1b")?.action).toEqual({ kind: "cancel" });
+  });
+
+  it("closes on ctrl+c from either level", () => {
+    expect(press("\x03")?.action).toEqual({ kind: "cancel" });
+    // The case that separates it from `esc`, which only steps back a level: the
+    // reflex key must get the overlay off the screen from the subview too.
+    const opened = press("\x03", { level: "agent" });
+    expect(opened?.action).toEqual({ kind: "cancel" });
+    expect(opened?.state.level).toBe("agent");
   });
 
   it("raises the run-level actions, and pause flips to resume once paused", () => {

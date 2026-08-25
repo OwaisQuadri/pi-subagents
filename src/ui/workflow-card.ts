@@ -194,10 +194,39 @@ export function formatCompactTokens(count: number): string {
  * would just be noise, so it only shows when the run actually has two models in
  * play.
  */
-export function formatModel(entry: WorkflowAgentEntry): string | undefined {
-  const { model, fallbackModel } = entry;
-  if (model && fallbackModel && model !== fallbackModel) return `${model}→${fallbackModel}`;
-  return model ?? fallbackModel;
+export function formatModel(
+  entry: WorkflowAgentEntry,
+  opts?: { canonical?: boolean },
+): string | undefined {
+  const { fallbackModel, requestedModel } = entry;
+  // `canonical` is for surfaces with the width for `provider/model-id`; the
+  // tight rows take the short label. Chosen here rather than by the caller
+  // swapping fields, which would leave `fallbackModel` in the other spelling.
+  const model = opts?.canonical ? entry.modelId ?? entry.model : entry.model;
+  const primary = model && fallbackModel && model !== fallbackModel ? `${model}→${fallbackModel}` : model ?? fallbackModel;
+  if (primary === undefined) return undefined;
+  // Disclosed rather than substituted: a model an agent file pinned over the
+  // script's is still a model the script did not get (#182). Same rule as
+  // `buildInvocationTags`' `asked()` — only when the two actually differ, so a
+  // request that was honoured says nothing.
+  return requestedModel !== undefined && requestedModel !== primary
+    ? `${primary} (asked ${requestedModel})`
+    : primary;
+}
+
+/**
+ * The thinking level, and what was asked for when it was not honoured.
+ *
+ * Separate from {@link formatModel} because a row can have one without the
+ * other: an `agent()` that named no model still runs at some level, and a level
+ * pi clamped is worth saying so about even when the model is unremarkable.
+ */
+export function formatThinking(entry: WorkflowAgentEntry): string | undefined {
+  const { thinking, requestedThinking } = entry;
+  if (!thinking) return undefined;
+  return requestedThinking !== undefined && requestedThinking !== thinking
+    ? `thinking: ${thinking} (asked ${requestedThinking})`
+    : `thinking: ${thinking}`;
 }
 
 /**

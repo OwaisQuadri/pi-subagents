@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   ASCII_GLYPHS,
   agentStatSegments,
+  formatModel,
+  formatThinking,
   layoutWorkflowCard,
   plainWorkflowCardLines,
   renderWorkflowCard,
@@ -184,6 +186,52 @@ describe("tree branches", () => {
     expect(rows[0]).toBe("╰─ Agents");
     expect(rows[1]).toMatch(/^ {2}├─ ⟳ solo/);
     expect(rows[2]).toMatch(/^ {2}└─ ⟳ solo2/);
+  });
+});
+
+// #182 reaches the workflow surfaces: a model or level the call asked for and
+// did not get is disclosed beside the effective one, never silently replaced by
+// it. Same `asked()` rule `buildInvocationTags` applies everywhere else.
+describe("effective-vs-requested disclosure", () => {
+  it("names the model alone when the request was honoured", () => {
+    expect(formatModel(agentEntry({ index: 0, model: "haiku 4.5" }))).toBe("haiku 4.5");
+  });
+
+  it("discloses a model an agent file pinned over the call's", () => {
+    expect(
+      formatModel(agentEntry({ index: 0, model: "haiku 4.5", requestedModel: "opus" })),
+    ).toBe("haiku 4.5 (asked opus)");
+  });
+
+  it("says nothing when the requested model is the one that ran", () => {
+    // Disclosing a request that WAS honoured would be noise on every row.
+    expect(
+      formatModel(agentEntry({ index: 0, model: "haiku 4.5", requestedModel: "haiku 4.5" })),
+    ).toBe("haiku 4.5");
+  });
+
+  it("discloses a thinking level pi clamped", () => {
+    expect(
+      formatThinking(agentEntry({ index: 0, thinking: "low", requestedThinking: "max" })),
+    ).toBe("thinking: low (asked max)");
+  });
+
+  it("renders the level alone when it was honoured", () => {
+    expect(
+      formatThinking(agentEntry({ index: 0, thinking: "high", requestedThinking: "high" })),
+    ).toBe("thinking: high");
+  });
+
+  it("has nothing to say when no level is known", () => {
+    expect(formatThinking(agentEntry({ index: 0 }))).toBeUndefined();
+  });
+
+  it("keeps the thinking level off the tight card row", () => {
+    // It lives in the dialog's detail pane instead: `thinking: medium` on every
+    // row of a fan-out is width the description needs more.
+    expect(
+      agentStatSegments(agentEntry({ index: 0, agentType: "Explore", model: "haiku", thinking: "low" })),
+    ).toEqual(["Explore", "haiku"]);
   });
 });
 

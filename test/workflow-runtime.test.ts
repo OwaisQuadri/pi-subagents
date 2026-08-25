@@ -530,6 +530,142 @@ describe("abort", () => {
     expect(aborted).toEqual(["wf-agent-0"]);
   });
 
+  // #168 in a workflow: a row must name the model the child ACTUALLY ran on, not
+  // the string the script asked for. The correction has to land while the agent
+  // is still running — waiting for the spawn to resolve would leave an
+  // inherited-model row blank for the whole run, which is the complaint itself.
+  describe("effective configuration reported mid-run", () => {
+    const rowsFor = (seen: WorkflowEntry[][], index: number): WorkflowAgentEntry[] =>
+      seen.flat().filter((e): e is WorkflowAgentEntry => e.type === "workflow_agent" && e.index === index);
+
+    it("replaces the requested model with the effective one, before the agent settles", async () => {
+      const seen: WorkflowEntry[][] = [];
+      const host = {
+        async spawnAgent(request: any) {
+          // Exactly where the real host fires it: the child's session now exists.
+          request.onResolved?.({ modelName: "haiku 4.5", modelId: "anthropic/claude-haiku-4-5" });
+          return { ok: true, text: "done", outputTokens: 1 };
+        },
+        abortAgent() {},
+      };
+
+      const result = await run('return await agent("go", { model: "haiku" });', {
+        host,
+        onProgress(entries) { seen.push([...entries]); },
+      });
+      expect(result.status).toBe("completed");
+
+      const rows = rowsFor(seen, 0);
+      // The fuzzy request is what the row starts with...
+      expect(rows[0]?.model).toBe("haiku");
+      // ...and the resolved id is what it ends with, on a row still running.
+      const corrected = rows.find(r => r.model === "haiku 4.5");
+      expect(corrected).toBeDefined();
+      expect(corrected?.state).not.toBe("done");
+      expect(corrected?.modelId).toBe("anthropic/claude-haiku-4-5");
+      // The settle path spreads the same object, so it carries them too.
+      expect(rows.at(-1)?.model).toBe("haiku 4.5");
+    });
+
+    it("fills in a row for an agent that named no model at all", async () => {
+      const seen: WorkflowEntry[][] = [];
+      const host = {
+        async spawnAgent(request: any) {
+          request.onResolved?.({ modelName: "sonnet 4.6", thinking: "high" });
+          return { ok: true, text: "done", outputTokens: 1 };
+        },
+        abortAgent() {},
+      };
+
+      await run('return await agent("go");', { host, onProgress(e) { seen.push([...e]); } });
+
+      const rows = rowsFor(seen, 0);
+      // The inherited case: blank before, named after. This is the one #168 was
+      // filed about, and the one a settle-time-only fix would never reach.
+      expect(rows[0]?.model).toBeUndefined();
+      expect(rows.at(-1)?.model).toBe("sonnet 4.6");
+      expect(rows.at(-1)?.thinking).toBe("high");
+    });
+
+    it("carries the request forward when it was not honoured (#182)", async () => {
+      const seen: WorkflowEntry[][] = [];
+      const host = {
+        async spawnAgent(request: any) {
+          request.onResolved?.({ modelName: "haiku 4.5", thinking: "low", requestedThinking: "max" });
+          return { ok: true, text: "done", outputTokens: 1 };
+        },
+        abortAgent() {},
+      };
+
+      await run('return await agent("go", { effort: "max" });', { host, onProgress(e) { seen.push([...e]); } });
+
+      const last = rowsFor(seen, 0).at(-1);
+      expect(last?.thinking).toBe("low");
+      expect(last?.requestedThinking).toBe("max");
+    });
+
+    it("keeps a resumed row saying what the row it continues said", async () => {
+      // CompletedChild's own contract: "the progress entry has to show the same
+      // thing the first entry showed". A resumed call never goes through
+      // spawnAgent, so without reporting on the resume path too the continuation
+      // of a child would fall back to the model the script asked for.
+      const seen: WorkflowEntry[][] = [];
+      const host = {
+        async spawnAgent(request: any) {
+          request.onResolved?.({ modelName: "haiku 4.5" });
+          return { ok: true, text: "first", outputTokens: 1 };
+        },
+        async resumeAgent(_id: string, _prompt: string, onResolved?: (i: any) => void) {
+          onResolved?.({ modelName: "haiku 4.5" });
+          return { ok: true, text: "second", outputTokens: 1 };
+        },
+        abortAgent() {},
+      };
+
+      const result = await run(
+        'await agent("go", { label: "impl", model: "haiku" });\nreturn await agent("again", { resume: "impl" });',
+        { host, onProgress(e) { seen.push([...e]); } },
+      );
+      expect(result.status).toBe("completed");
+
+      // Index 1 is the resumed call — the same child, so the same label.
+      expect(rowsFor(seen, 1).at(-1)?.model).toBe("haiku 4.5");
+    });
+
+    it("ignores a report that arrives after the agent settled", async () => {
+      // The emit carries `base.state`, which is still "start" — so a late report
+      // would revert a finished row to running under last-write-wins.
+      const seen: WorkflowEntry[][] = [];
+      let late: (() => void) | undefined;
+      const host = {
+        async spawnAgent(request: any) {
+          late = () => request.onResolved?.({ modelName: "too late" });
+          return { ok: true, text: "done", outputTokens: 1 };
+        },
+        abortAgent() {},
+      };
+
+      const result = await run('return await agent("go");', { host, onProgress(e) { seen.push([...e]); } });
+      late?.();
+
+      expect(result.status).toBe("completed");
+      const rows = rowsFor(seen, 0);
+      expect(rows.at(-1)?.state).toBe("done");
+      expect(rows.some(r => r.model === "too late")).toBe(false);
+    });
+
+    it("leaves the row alone when the host reports nothing", async () => {
+      // `onResolved` is optional; a host that never calls it must not blank the
+      // requested values the row already had.
+      const seen: WorkflowEntry[][] = [];
+      const { host } = stubHost();
+
+      await run('return await agent("go", { model: "haiku" });', { host, onProgress(e) { seen.push([...e]); } });
+
+      expect(rowsFor(seen, 0).at(-1)?.model).toBe("haiku");
+    });
+  });
+
   it("settles a script that never yields", async () => {
     const controller = new AbortController();
     const { host } = stubHost();

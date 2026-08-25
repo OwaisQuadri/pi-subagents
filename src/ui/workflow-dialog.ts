@@ -67,6 +67,7 @@ import {
   clampLine,
   formatCompactTokens,
   formatModel,
+  formatThinking,
   REPLAYED_ANNOTATION,
   styleWorkflowCardLines,
   UNICODE_GLYPHS,
@@ -756,7 +757,9 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
   const detailRows: WorkflowCardLine[] = [];
   if (!inPhases && entry) {
     const display = displayState(entry, view.workflowActive);
-    const model = formatModel(entry);
+    // Prefers the canonical `provider/model-id` here — two providers can serve
+    // models whose short names read alike, and this pane has the width for it.
+    const model = formatModel(entry, { canonical: true });
     detailRows.push(
       clampLine(
         [
@@ -772,6 +775,11 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
     // agent type are already on the line above, and the token count wants its
     // unit here exactly as it has one in the row.
     const stats: string[] = [];
+    // The thinking level lives here rather than on the tight card row: it is
+    // per-agent configuration, which is what someone opening this pane came to
+    // see, and `thinking: medium` on every row of a fan-out would be noise.
+    const thinking = formatThinking(entry);
+    if (thinking) stats.push(thinking);
     if (entry.tokens) stats.push(`${formatCompactTokens(entry.tokens)} tok`);
     if (entry.toolCalls) stats.push(`${entry.toolCalls} tool call${entry.toolCalls === 1 ? "" : "s"}`);
     if (entry.durationMs) stats.push(formatDuration(entry.durationMs));
@@ -896,6 +904,13 @@ export function handleWorkflowDialogKey(
   state: WorkflowDialogState,
   view: ResolvedWorkflowDialog,
 ): { state: WorkflowDialogState; action?: WorkflowDialogAction } | undefined {
+  // Ctrl+C is the reflex for backing out of a full-screen overlay, so it closes
+  // outright from EITHER level — the conversation viewer's #255 fix, which this
+  // dialog is reached the same way as. Deliberately not folded into the `esc`
+  // branch below: stepping back a level on the reflex key still leaves the
+  // overlay on screen, which is the stuck feeling the key exists to avoid.
+  if (matchesKey(data, "ctrl+c")) return { state, action: { kind: "cancel" } };
+
   // Back one level before out of the dialog: `esc` in the subview returns to
   // the overview, and only closes from there. Anything else would make a wrong
   // turn cost the whole dialog.

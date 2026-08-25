@@ -60,17 +60,19 @@ A **card in the transcript**, updating as the run goes:
 ▸ SubagentWorkflow  auth-audit                       3/7 agents · 1m12s
   Find routes missing auth checks, then verify each finding
   ╭─ Scan
-  │ └─ ✔ discover        · Explore · haiku · 26.4k · 8 tool calls · 25s
+  │ └─ ✔ discover        · Explore · haiku 4.5 · 26.4k · 8 tool calls · 25s
   ╰─ Audit
-    ├─ ✔ audit:src/a.ts  · Explore · haiku · 18.4k · 12 tool calls · 42s
-    ├─ ⟳ audit:src/b.ts  · Explore · 8 tool calls · 21s
+    ├─ ✔ audit:src/a.ts  · Explore · haiku 4.5 · 18.4k · 12 tool calls · 42s
+    ├─ ⟳ audit:src/b.ts  · Explore · haiku 4.5 · 8 tool calls · 21s
     └─ ⟳ audit:src/c.ts
   ⎿  auditing 6 route files
 ```
 
 A **`workflow` row in FleetView**, above the agents, carrying its agent counts where a description would go. `⏎` on it opens the inspector rather than a conversation overlay.
 
-The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
+Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
+
+The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
 | Key | |
 |---|---|

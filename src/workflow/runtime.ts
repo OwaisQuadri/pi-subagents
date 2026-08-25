@@ -68,6 +68,27 @@ export interface WorkflowSpawnRequest {
   effort?: string;
   isolation?: "worktree";
   /**
+   * Called by the host once the child's EFFECTIVE configuration is known —
+   * which is when its session exists, not when the spawn resolves.
+   *
+   * Without it a row could only ever show what the script asked for: a fuzzy
+   * `model: "haiku"` stays `haiku` instead of the id it resolved to, an
+   * `agent()` that named no model shows nothing at all, and a level pi clamped
+   * is presented as the level that was requested (#168, #182).
+   *
+   * Plain strings, like `effort` above: this interface is the host boundary and
+   * deliberately knows nothing about pi's `AgentInvocation`. Optional, so a host
+   * that cannot report any of this simply does not, and the row keeps the
+   * requested values it started with.
+   */
+  onResolved?(info: {
+    modelName?: string;
+    modelId?: string;
+    thinking?: string;
+    requestedThinking?: string;
+    requestedModel?: string;
+  }): void;
+  /**
    * Compiled from the script's `agent({ schema })`.
    *
    * The host must give the child a `StructuredOutput` tool built from it and
@@ -165,7 +186,17 @@ export interface WorkflowHost {
    * Optional: a host without it rejects `resume` rather than quietly starting a
    * fresh child that has none of the context the script is counting on.
    */
-  resumeAgent?(agentId: string, prompt: string): Promise<WorkflowSpawnResult>;
+  resumeAgent?(
+    agentId: string,
+    prompt: string,
+    /**
+     * Same reporter {@link WorkflowSpawnRequest.onResolved} carries, for the
+     * same reason: a resumed row is rebuilt from scratch, so without it the
+     * continuation of a child would show the model the script *asked* for while
+     * the row above it shows the one that ran.
+     */
+    onResolved?: WorkflowSpawnRequest["onResolved"],
+  ): Promise<WorkflowSpawnResult>;
   /**
    * Run a `gate` command and report whether it passed.
    *
@@ -941,6 +972,32 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
 
           const startedAt = Date.now();
           emit([{ ...base, queuedAt, startedAt, ...attemptMark }]);
+
+          // Mutates `base` rather than emitting a standalone patch: every later
+          // emit spreads it, so the settle path carries the effective values
+          // without knowing they were ever corrected. Re-emitting under the
+          // same `index` is what the append-only, last-write-wins progress log
+          // is for — the row updates in place while the agent is still running.
+          const onResolved = (info: {
+            modelName?: string;
+            modelId?: string;
+            thinking?: string;
+            requestedThinking?: string;
+            requestedModel?: string;
+          }) => {
+            if (info.modelName !== undefined) base.model = info.modelName;
+            if (info.modelId !== undefined) base.modelId = info.modelId;
+            if (info.thinking !== undefined) base.thinking = info.thinking;
+            if (info.requestedThinking !== undefined) base.requestedThinking = info.requestedThinking;
+            if (info.requestedModel !== undefined) base.requestedModel = info.requestedModel;
+            // `base.state` is still "start", so emitting after the row reached a
+            // terminal state would revert it to running under last-write-wins.
+            // Not reachable from this repo's host, which reports during startup
+            // — but this is the host boundary, and every other promise it makes
+            // is checked rather than trusted.
+            if (!inflight.has(agentId)) return;
+            emit([{ ...base, queuedAt, startedAt, ...attemptMark, lastProgressAt: Date.now() }]);
+          };
           live.started = true;
           inflight.add(agentId);
 
@@ -948,7 +1005,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           try {
             result =
               resumed !== undefined && resumeAgent !== undefined
-                ? await resumeAgent(resumed.agentId, payload.prompt)
+                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved)
                 : await host.spawnAgent({
                     agentId,
                     index,
@@ -964,6 +1021,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     // Offered, not delegated: a host that can run it inside the
                     // child's worktree does, and hands back `result.gate`.
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
+                    onResolved,
                   });
             if (result.ok) {
               // Recorded before the gate runs: the child itself finished, so it is

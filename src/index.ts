@@ -856,10 +856,11 @@ export default function (pi: ExtensionAPI) {
         manager: {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
-          abort: (id) => {
-            const record = manager.getRecord(id);
-            return record !== undefined && isTopLevelAgent(record) && manager.abort(id);
-          },
+          getRecord: (id) => manager.getRecord(id),
+          // Unguarded on purpose: the stop handler now runs the top-level check
+          // itself off `getRecord`, and reports the refusal instead of the
+          // "Agent not found" a false from here used to be read as.
+          abort: (id) => manager.abort(id),
           consumeResult: (id) => {
             const record = resolveAgentRef(id);
             // Same guard as get_subagent_result: a running agent has no result

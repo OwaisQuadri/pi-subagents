@@ -23,6 +23,7 @@ import type { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension, { WORKFLOW_ENTRY_TYPE, WORKFLOW_FILE_FLAG } from "../src/index.js";
+import { isScopeModelsEnabled, setScopeModelsEnabled } from "../src/model-scope.js";
 import type { AgentRecord } from "../src/types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
@@ -298,6 +299,164 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(failed).toMatchObject({ ok: false, error: "boom" });
     expect(failed.skipped).toBeUndefined();
     expect(skipped).toMatchObject({ ok: false, skipped: true });
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * scopeModels on the workflow spawn path
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A workflow script is written by the model, so `agent({ model })` is a runtime
+ * LLM choice — exactly what `scopeModels` guards. These pin the split the policy
+ * turns on: what the SCRIPT named is refused, what the user authored (an agent
+ * file's `model:`, the parent's own model) warns and proceeds.
+ */
+describe("createWorkflowHost — scopeModels", () => {
+  const ALLOWED = { id: "allowed-model", name: "Allowed", provider: "anthropic" };
+  const BLOCKED = { id: "blocked-model", name: "Blocked", provider: "anthropic" };
+  const MODELS = [ALLOWED, BLOCKED];
+  const modelRegistry = {
+    find: (provider: string, id: string) => MODELS.find(m => m.provider === provider && m.id === id) ?? null,
+    getAll: () => MODELS,
+    getAvailable: () => MODELS,
+  };
+
+  let projectDir: string;
+  let agentDir: string;
+  let prevAgentDir: string | undefined;
+  let prevEnabled: boolean;
+  let notify: ReturnType<typeof vi.fn>;
+
+  /** A session ctx whose cwd is where the allowlist was written. */
+  const scopedCtx = (overrides: Record<string, unknown> = {}) =>
+    ctx({
+      cwd: projectDir,
+      modelRegistry,
+      ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify, addAutocompleteProvider: vi.fn() },
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    // `resolveEnabledModels` memoizes on the patterns plus the mtime/size of
+    // both settings files, so one case's allowlist would otherwise be served to
+    // the next — a fresh project dir per test is what invalidates it. Same
+    // harness as test/cross-extension-rpc.test.ts.
+    projectDir = mkdtempSync(join(tmpdir(), "wf-scope-project-"));
+    agentDir = mkdtempSync(join(tmpdir(), "wf-scope-global-"));
+    prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    prevEnabled = isScopeModelsEnabled();
+    mkdirSync(join(projectDir, ".pi"), { recursive: true });
+    writeFileSync(
+      join(projectDir, ".pi", "settings.json"),
+      JSON.stringify({ enabledModels: ["anthropic/allowed-model"] }),
+    );
+    notify = vi.fn();
+    // "pinned" stands in for a user-authored agent file with `model:` in its
+    // frontmatter; the defaults come along, so "general-purpose" still resolves.
+    registerAgents(new Map([["pinned", {
+      name: "pinned",
+      displayName: "Pinned",
+      description: "an agent whose file pins a model",
+      extensions: false,
+      skills: false,
+      model: "anthropic/blocked-model",
+      systemPrompt: "pinned",
+      promptMode: "replace",
+    } as any]]));
+  });
+
+  afterEach(() => {
+    setScopeModelsEnabled(prevEnabled); // module-global — restore for other suites
+    if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    rmSync(projectDir, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+    registerAgents(new Map());
+  });
+
+  it("refuses a model the script named that is out of scope, and fails only that agent", async () => {
+    setScopeModelsEnabled(true);
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+
+    const blocked = await host.spawnAgent(request({ model: "anthropic/blocked-model" }));
+
+    // `{ok: false}` rather than a throw: the runtime turns this into `null` for
+    // the script, so one refused model does not take the run's siblings down.
+    expect(blocked.ok).toBe(false);
+    expect(blocked.error).toMatch(/Model not in scope/);
+    expect(blocked.error).toContain("  anthropic/allowed-model");
+    expect(stub.spawnAndWait).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+
+    const inScope = await host.spawnAgent(request({ model: "anthropic/allowed-model" }));
+    expect(inScope.ok).toBe(true);
+    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(ALLOWED);
+  });
+
+  it("warns but still spawns when the agent file pinned the out-of-scope model", async () => {
+    // User-authored config, not a choice the script made — the model folds into
+    // `modelInput`, so keying `callerSupplied` off it would wrongly hard-error.
+    setScopeModelsEnabled(true);
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ agentType: "pinned" }));
+
+    expect(result.ok).toBe(true);
+    expect(stub.spawnAndWait).toHaveBeenCalledTimes(1);
+    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(BLOCKED);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("out-of-scope model"), "warning");
+  });
+
+  it("warns but still spawns on an inherited parent model", async () => {
+    setScopeModelsEnabled(true);
+    const stub = stubManager();
+    const host = createWorkflowHost({
+      pi: {} as any,
+      ctx: scopedCtx({ model: BLOCKED }),
+      manager: stub.manager,
+    });
+
+    const result = await host.spawnAgent(request());
+
+    expect(result.ok).toBe(true);
+    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(BLOCKED);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("anthropic/blocked-model"),
+      "warning",
+    );
+  });
+
+  it("toasts a repeated warning once, not once per child of a fan-out", async () => {
+    setScopeModelsEnabled(true);
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+
+    for (let i = 0; i < 3; i++) {
+      const spawned = await host.spawnAgent(request({ agentId: `wf-agent-${i}`, agentType: "pinned" }));
+      expect(spawned.ok).toBe(true);
+    }
+
+    expect(stub.spawnAndWait).toHaveBeenCalledTimes(3);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves every spawn alone when scopeModels is off — the default", async () => {
+    setScopeModelsEnabled(false);
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+
+    const named = await host.spawnAgent(request({ model: "anthropic/blocked-model" }));
+    const pinnedAgent = await host.spawnAgent(request({ agentId: "wf-agent-1", agentType: "pinned" }));
+
+    expect(named.ok).toBe(true);
+    expect(pinnedAgent.ok).toBe(true);
+    expect(stub.spawnAndWait).toHaveBeenCalledTimes(2);
+    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(BLOCKED);
+    expect(notify).not.toHaveBeenCalled();
   });
 });
 

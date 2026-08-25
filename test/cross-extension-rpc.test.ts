@@ -32,6 +32,7 @@ describe("cross-extension RPC", () => {
       spawn: vi.fn().mockReturnValue("agent-42"),
       awaitStartup: vi.fn().mockResolvedValue(undefined),
       abort: vi.fn().mockReturnValue(true),
+      getRecord: vi.fn().mockReturnValue({}),
       consumeResult: vi.fn().mockReturnValue(true),
     };
     ctx = { session: true };
@@ -192,6 +193,8 @@ describe("cross-extension RPC", () => {
   // --- stop ---
 
   describe("stop RPC", () => {
+    // The default double reports a record with neither owner field, i.e. one of
+    // the session's own agents — the case the ownership guard must let through.
     it("returns success when agent is aborted", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();
@@ -203,15 +206,63 @@ describe("cross-extension RPC", () => {
       expect(manager.abort).toHaveBeenCalledWith("agent-42");
     });
 
-    it("returns error when agent not found", async () => {
+    // `abort` returning false no longer means "no such agent" — the handler's
+    // own lookup covers that, and the only case left is a record that is neither
+    // running nor queued, i.e. one that has already finished.
+    it("says so when the agent exists but has already finished", async () => {
       (manager.abort as ReturnType<typeof vi.fn>).mockReturnValue(false);
       registerRpcHandlers(deps);
       const reply = vi.fn();
       events.on("subagents:rpc:stop:reply:req-st2", reply);
-      events.emit("subagents:rpc:stop", { requestId: "req-st2", agentId: "nonexistent" });
+      events.emit("subagents:rpc:stop", { requestId: "req-st2", agentId: "settled" });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({ success: false, error: "Agent is not running" });
+    });
+
+    it("returns error when the agent is unknown to the manager", async () => {
+      (manager.getRecord as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:stop:reply:req-st5", reply);
+      events.emit("subagents:rpc:stop", { requestId: "req-st5", agentId: "nonexistent" });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({ success: false, error: "Agent not found" });
+      expect(manager.abort).not.toHaveBeenCalled();
+    });
+
+    // A nested child and a workflow's agent both have an owner that is waiting
+    // on them, so an id that leaked to another extension must not let it abort
+    // one out from under that owner.
+    it("refuses to stop another agent's nested child", async () => {
+      (manager.getRecord as ReturnType<typeof vi.fn>).mockReturnValue({ parentAgentId: "agent-1" });
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:stop:reply:req-st6", reply);
+      events.emit("subagents:rpc:stop", { requestId: "req-st6", agentId: "agent-child" });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: "Agent is owned by another agent or workflow",
+      });
+      expect(manager.abort).not.toHaveBeenCalled();
+    });
+
+    it("refuses to stop a workflow's agent", async () => {
+      (manager.getRecord as ReturnType<typeof vi.fn>).mockReturnValue({ workflowId: "wf-1" });
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:stop:reply:req-st7", reply);
+      events.emit("subagents:rpc:stop", { requestId: "req-st7", agentId: "agent-wf" });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: "Agent is owned by another agent or workflow",
+      });
+      expect(manager.abort).not.toHaveBeenCalled();
     });
 
     it("scopes replies — other requestIds do not receive it", async () => {

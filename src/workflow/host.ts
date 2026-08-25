@@ -37,6 +37,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
+import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
@@ -97,6 +98,25 @@ function succeeded(record: AgentRecord | undefined): boolean {
 }
 
 /** Translate a settled record into what the script sees. */
+/**
+ * The effective-configuration half of a record, in the runtime's pi-free shape.
+ *
+ * `AgentRecord.invocation` is the one authoritative place for it (#168); this
+ * only renames the fields across the boundary. Returns undefined until the
+ * child's session has reported a model, which is when any of it is knowable.
+ */
+function resolvedInfo(record: AgentRecord | undefined) {
+  const invocation = record?.invocation;
+  if (invocation?.modelName === undefined) return undefined;
+  return {
+    modelName: invocation.modelName,
+    modelId: invocation.modelId,
+    thinking: invocation.thinking,
+    requestedThinking: invocation.requestedThinking,
+    requestedModel: invocation.requestedModel,
+  };
+}
+
 function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   const tokens = getLifetimeTotal(record.lifetimeUsage);
   // Reported separately from `tokens`, which is the lifetime total. The script's
@@ -141,6 +161,13 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   const { pi, ctx, manager } = deps;
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
+  /**
+   * scopeModels warnings already toasted, so a fan-out that pins one
+   * out-of-scope agent file raises one notification rather than one per child.
+   * Kept for the whole run: the same message is the same warning at agent 200
+   * as it was at agent 1.
+   */
+  const warnedScopeMessages = new Set<string>();
 
   /**
    * Run a gate command in `cwd`. The only place a gate is executed — `runGate`
@@ -175,7 +202,8 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // named and we cannot resolve is an error; one the definition named falls
       // back to the parent silently, because the script never asked for it.
       let model = ctx.model;
-      const modelInput = request.model ?? getAgentConfig(dispatch.type)?.model;
+      const config = getAgentConfig(dispatch.type);
+      const modelInput = request.model ?? config?.model;
       if (modelInput !== undefined) {
         const resolved = resolveModel(modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
@@ -183,6 +211,30 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         } else {
           model = resolved;
         }
+      }
+
+      // Same scopeModels policy as the Agent tool and the nested delegation
+      // tools: a script's `agent({ model })` is a runtime LLM choice, and the
+      // script is written by the model, so it must not reach a model the user's
+      // enabledModels list excludes. `callerSupplied` keys off `request.model`
+      // and NOT `modelInput` — the latter has already absorbed the agent file's
+      // own `model:`, which is user-authored config and so earns the
+      // warn-and-proceed branch rather than a refusal.
+      const scopeVerdict = checkModelScope({
+        model,
+        cwd: ctx.cwd,
+        modelRegistry: ctx.modelRegistry,
+        callerSupplied: request.model !== undefined,
+        agentLabel: config?.displayName ?? dispatch.type,
+        modelInput,
+      });
+      // This agent's failure, not the run's — the same shape a bad agent type
+      // takes above. The script sees `null` and its siblings carry on, which is
+      // the difference between one refused model and a discarded fan-out.
+      if (scopeVerdict.kind === "error") return { ok: false, error: scopeVerdict.message };
+      if (scopeVerdict.kind === "warn" && !warnedScopeMessages.has(scopeVerdict.message)) {
+        warnedScopeMessages.add(scopeVerdict.message);
+        ctx.ui.notify(scopeVerdict.message, "warning");
       }
 
       /**
@@ -194,6 +246,28 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
        */
       let gate: WorkflowGateResult | undefined;
       let spawnedId: string | undefined;
+
+      /**
+       * Hand the child's EFFECTIVE configuration back to the run.
+       *
+       * `AgentRecord.invocation` is the one authoritative place for it (#168),
+       * filled by the manager the moment the child's session exists — which is
+       * before this fires, so it is populated by the time we read it. Reading it
+       * rather than re-deriving "the session, else the request" is the whole
+       * point of that field existing.
+       */
+      let sessionReady = false;
+      const reportResolved = () => {
+        // Called from BOTH the session hook and the spawn hook, because their
+        // order is not guaranteed: the manager fires `onSpawned` after
+        // `runAgent` returns, but `runAgent` decides when its own
+        // `onSessionCreated` fires — synchronously, for a stub. Each fires once,
+        // so the first call finds a half missing and returns, and the second is
+        // the one that reports.
+        if (!sessionReady || spawnedId === undefined) return;
+        const info = resolvedInfo(manager.getRecord(spawnedId));
+        if (info !== undefined) request.onResolved?.(info);
+      };
       const command = request.gate;
       /**
        * Verify the child's work while its worktree still exists.
@@ -237,6 +311,22 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // the agent definition's `thinking` (then the parent's) still wins —
             // same precedence as `model` above.
             ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
+            // Seeded with the REQUEST, not the outcome. The manager overwrites
+            // the effective half at session creation; without a seed there is
+            // nothing for it to compare against, so a level pi clamped would be
+            // indistinguishable from one that was honoured.
+            //
+            // Only the level. #182's other half — a caller parameter an agent
+            // file outranked — cannot arise here: this path resolves
+            // `request.model ?? config?.model`, so the script always wins and
+            // therefore always got what it asked for. Seeding a `requestedModel`
+            // would describe a precedence this path does not have.
+            invocation: {
+              ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
+            },
+            // Fires once the child's session exists, which is where the model
+            // and the clamped thinking level first become knowable.
+            onSessionCreated: () => { sessionReady = true; reportResolved(); },
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
@@ -246,6 +336,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           id => {
             spawnedId = id;
             records.set(request.agentId, id);
+            reportResolved();
           },
         );
         return { ...toSpawnResult(record), ...(gate !== undefined ? { gate } : {}) };
@@ -264,7 +355,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id !== undefined) manager.abort(id);
     },
 
-    async resumeAgent(agentId, prompt) {
+    async resumeAgent(agentId, prompt, onResolved) {
       const id = records.get(agentId);
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
@@ -276,6 +367,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           error: `Agent ${id} has no session left to resume — records are dropped ten minutes after they finish.`,
         };
       }
+      // The resumed row is built from scratch, so it has to be told the same
+      // thing the first one was — the child's session already exists, so this is
+      // simply read back rather than waited for.
+      const info = resolvedInfo(record);
+      if (info !== undefined) onResolved?.(info);
       return toSpawnResult(record);
     },
 

@@ -63,7 +63,27 @@ export interface WorkflowAgentEntry {
   state: WorkflowEntryState;
   agentId?: string;
   agentType?: string;
+  /**
+   * Short model label for tight rows, e.g. `haiku 4.5`.
+   *
+   * Seeded from what the script asked for and then REPLACED by what the child
+   * actually ran on, once its session exists to report one — the same
+   * effective-not-requested rule every other subagent surface follows (#168).
+   * An `agent()` that named no model therefore starts blank and fills in.
+   */
   model?: string;
+  /** Canonical `provider/model-id`, for the dialog, which has room for it. */
+  modelId?: string;
+  /** The level actually in effect, once the child's session reports one. */
+  thinking?: string;
+  /**
+   * What the call asked for, kept only when it did not get it — pi clamped the
+   * level, or an agent file's frontmatter outranked the option (#182). Rendered
+   * as `(asked max)` beside the effective value rather than silently replacing
+   * it.
+   */
+  requestedThinking?: string;
+  requestedModel?: string;
   fallbackModel?: string;
   isolation?: "worktree";
   error?: string;
