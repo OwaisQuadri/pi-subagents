@@ -496,6 +496,16 @@ export default function (pi: ExtensionAPI) {
   let viewerMarkdown: ViewerMarkdownMode = "assistant";
   function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
   function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
+  /**
+   * The viewer's `m` key, from either entry point: set the mode and persist it,
+   * so the key and `/agents → Settings` stay one setting rather than one per
+   * entry point. `ctx` carries only the warning a failed write notifies with,
+   * and the fleet list may be acting without one.
+   */
+  function chooseViewerMarkdown(mode: ViewerMarkdownMode, ctx?: ExtensionCommandContext): void {
+    setViewerMarkdown(mode);
+    persistSettings(ctx, `Viewer markdown set to ${mode}`);
+  }
   const pendingUsage = new PendingUsagePool();
 
   // ---- Cancellable pending notifications ----
@@ -1186,15 +1196,10 @@ export default function (pi: ExtensionAPI) {
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  // The last two arguments keep a conversation overlay opened from the fleet
-  // list identical to one opened from `/agents`: same setting on the way in,
-  // same persist on the way out. `currentCtx` only carries the warning a failed
-  // write notifies with, and is cleared between sessions, so a persist without
-  // one still writes the file.
-  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown, (mode) => {
-    setViewerMarkdown(mode);
-    persistSettings(currentCtx as unknown as ExtensionCommandContext | undefined, `Viewer markdown set to ${mode}`);
-  });
+  // The last two arguments keep a conversation overlay opened here identical to
+  // one opened from `/agents`: same setting on the way in, same persist out.
+  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -3315,10 +3320,7 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => {
-          setViewerMarkdown(mode);
-          persistSettings(ctx, `Viewer markdown set to ${mode}`);
-        });
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
       },
       {
         overlay: true,
@@ -4196,8 +4198,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       changeMsg,
       (event, payload) => pi.events.emit(event, payload),
     );
-    // `ctx` is absent only on the fleet path before the first `session_start`,
-    // where there is no UI to carry the warning: the write still happens.
+    // `ctx` is absent only on the fleet path between sessions, where
+    // `currentCtx` has been cleared and there is no UI to carry the warning to.
+    // The write still happens.
     if (level === "warning") ctx?.ui.notify(message, level);
   }
 
