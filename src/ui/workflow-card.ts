@@ -32,6 +32,7 @@
  */
 
 import { stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { WorkflowEntryData } from "../workflow/entry.js";
 import type { WorkflowMeta } from "../workflow/meta.js";
 import {
   buildPhaseGroups,
@@ -438,4 +439,32 @@ export function styleWorkflowCardLines(lines: readonly WorkflowCardLine[], theme
 /** The card as a component, for a tool result or a session entry renderer. */
 export function renderWorkflowCard(input: WorkflowCardInput, theme: Theme): Text {
   return new Text(styleWorkflowCardLines(layoutWorkflowCard(input), theme).join("\n"), 0, 0);
+}
+
+/**
+ * The card for a session entry, from the JSON a flag-launched run persisted.
+ *
+ * The same layout the tool result uses, not a second one — the only difference
+ * is `showToolTitle`, because a session entry stands alone and nothing above it
+ * says what it is. Returns undefined for an entry with no data, which is what
+ * pi's renderer contract wants for "nothing to draw".
+ */
+export function renderWorkflowEntryCard(data: WorkflowEntryData | undefined, theme: Theme): Text | undefined {
+  if (!data) return undefined;
+  return renderWorkflowCard(
+    {
+      progress: data.progress,
+      task: {
+        status: data.status,
+        workflowName: data.name,
+        startTime: data.startTime,
+        endTime: data.endTime,
+      },
+      meta: data.meta,
+      agentCount: data.agentCount,
+      totalTokens: data.totalTokens,
+      showToolTitle: true,
+    },
+    theme,
+  );
 }

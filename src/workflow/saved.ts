@@ -173,3 +173,45 @@ function isWorkflowFile(path: string): boolean {
   const source = safeReadFile(path);
   return source !== undefined && hasMetaDeclaration(source);
 }
+
+/**
+ * Resolve which source a `SubagentWorkflow` call runs.
+ *
+ * `scriptPath` wins over `script`, which wins over `name` — Claude Code's
+ * order — and at least one is required: a call with none is a mistake worth
+ * naming rather than an empty run. Lives beside {@link resolveWorkflowSource}
+ * because that is the function it defers to once precedence is settled, so the
+ * two cannot disagree about what a reference means.
+ */
+export function resolveWorkflowScript(
+  params: { script?: string; scriptPath?: string; name?: string },
+  cwd: string,
+): { ok: true; script: string; scriptPath?: string } | { ok: false; message: string } {
+  const path = params.scriptPath?.trim();
+  if (path !== undefined && path !== "") {
+    const resolved = resolveWorkflowSource({ scriptPath: path }, cwd);
+    return resolved.ok ? { ok: true, script: resolved.script, scriptPath: resolved.path } : resolved;
+  }
+  const script = params.script;
+  if (script !== undefined && script.trim() !== "") return { ok: true, script };
+
+  // A saved workflow is the same source by another route, so it reports its
+  // file as `scriptPath`: the "edit the file and re-run" loop then works on a
+  // named workflow without the author having to find where it lives. Shared
+  // with a script's nested `workflow()`, so one definition decides what a
+  // reference means.
+  const name = params.name?.trim();
+  if (name !== undefined && name !== "") {
+    const saved = resolveWorkflowSource({ name }, cwd);
+    return saved.ok ? { ok: true, script: saved.script, scriptPath: saved.path } : saved;
+  }
+
+  const known = listSavedWorkflows(cwd);
+  return {
+    ok: false,
+    message:
+      "Provide `script` (inline source), `scriptPath` (a file to read), or `name` (a saved workflow). " +
+      "`scriptPath` takes precedence, then `script`, then `name`." +
+      (known.length > 0 ? ` Saved workflows: ${known.join(", ")}.` : ""),
+  };
+}

@@ -291,3 +291,35 @@ export function extractMeta(source: string): MetaExtraction {
 
   return { meta, body };
 }
+
+/**
+ * `meta.name` for a call line, without re-parsing on every frame.
+ *
+ * `renderCall` runs on every repaint, and extraction evaluates a literal in a
+ * vm — cheap, but not free at that cadence. Keyed by the exact source, so an
+ * edit-and-rerun cycle re-reads it and a hit is always the answer a fresh parse
+ * would give.
+ */
+const workflowNames = new Map<string, string>();
+
+/** The label a `SubagentWorkflow` call renders under, from whichever field it carries. */
+export function workflowCallName(args: { script?: string; scriptPath?: string; name?: string }): string {
+  const source = args.script;
+  if (source === undefined || source === "") {
+    // A path-only call would need a synchronous file read per repaint to do
+    // better than this, and the file name is what the author will recognize.
+    if (args.scriptPath !== undefined) return args.scriptPath.split(/[/\\]/).pop() ?? "workflow";
+    // A saved workflow is already named by the caller; no read needed at all.
+    return args.name !== undefined && args.name !== "" ? args.name : "workflow";
+  }
+  const cached = workflowNames.get(source);
+  if (cached !== undefined) return cached;
+  let name = "workflow";
+  try {
+    name = extractMeta(source).meta.name;
+  } catch {
+    // An invalid script still gets a call line; `execute` reports why.
+  }
+  workflowNames.set(source, name);
+  return name;
+}

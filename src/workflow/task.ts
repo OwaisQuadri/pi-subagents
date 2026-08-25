@@ -15,9 +15,10 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { collapse, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import { collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -225,4 +226,77 @@ export function workflowResultText(task: WorkflowTask): string {
   if (task.value === undefined) return "No output.";
   if (typeof task.value === "string") return task.value;
   return JSON.stringify(task.value, null, 2);
+}
+
+/**
+ * Resolve a `resumeFromRunId` against the runs this session has seen.
+ *
+ * Same-session only, and deliberately so: the journal lives beside the
+ * session's task files, and a run id from another session would silently find
+ * nothing to replay — reporting that as "resumed" would be a lie the caller
+ * could not see through. An unknown id is an error rather than a cold start,
+ * because a caller that asked to resume is expecting not to pay.
+ */
+export function resolveResumeTarget(
+  runId: string | undefined,
+  tasks: ReadonlyMap<string, WorkflowTask>,
+):
+  | undefined
+  | { ok: true; runId: string; journalPath: string; scriptPath: string }
+  | { ok: false; message: string } {
+  const id = runId?.trim();
+  if (id === undefined || id === "") return undefined;
+
+  const prior = tasks.get(id);
+  if (prior === undefined) {
+    const known = [...tasks.keys()];
+    return {
+      ok: false,
+      message:
+        `No workflow run "${id}" in this session. ` +
+        (known.length > 0
+          ? `Runs this session: ${known.join(", ")}.`
+          : "Nothing has run yet — call this without `resumeFromRunId`."),
+    };
+  }
+  if (prior.status === "running") {
+    return {
+      ok: false,
+      message: `Workflow "${id}" is still running. Stop it from /agents → Workflows before resuming it.`,
+    };
+  }
+  if (prior.journalPath === undefined) {
+    return { ok: false, message: `Workflow "${id}" has no journal to resume from.` };
+  }
+  return {
+    ok: true,
+    runId: id,
+    journalPath: prior.journalPath,
+    // The persisted copy, which is what `scriptPath` holds when the call had
+    // no file of its own.
+    scriptPath: prior.scriptPath ?? "",
+  };
+}
+
+/** `<task-notification>`, in the same shape a finished background agent sends. */
+export function formatWorkflowNotification(task: WorkflowTask, now = Date.now()): string {
+  const totals = stats(task.workflowProgress, task.agentCount);
+  const status =
+    task.status === "completed" ? "Done"
+    : task.status === "killed" ? "Stopped"
+    : `Error: ${task.error ?? "unknown"}`;
+  const result = workflowResultText(task);
+  return [
+    `<task-notification>`,
+    `<task-id>${task.id}</task-id>`,
+    task.toolCallId ? `<tool-use-id>${escapeXml(task.toolCallId)}</tool-use-id>` : null,
+    task.scriptPath ? `<script>${escapeXml(task.scriptPath)}</script>` : null,
+    `<status>${escapeXml(status)}</status>`,
+    `<summary>Workflow "${escapeXml(task.workflowName ?? task.id)}" ${task.status} — ${totals.done}/${totals.total} agents${
+      task.replayedCount > 0 ? `, ${task.replayedCount} replayed from ${escapeXml(task.resumedFrom ?? "an earlier run")}` : ""
+    }</summary>`,
+    `<result>${escapeXml(result.length > 4000 ? `${result.slice(0, 4000)}\n...(truncated)` : result)}</result>`,
+    `<usage><total_tokens>${task.totalTokens}</total_tokens><tool_uses>${task.totalToolCalls}</tool_uses><duration_ms>${elapsedMs(task, now)}</duration_ms></usage>`,
+    `</task-notification>`,
+  ].filter(Boolean).join("\n");
 }
