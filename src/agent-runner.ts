@@ -422,6 +422,14 @@ export interface RunOptions {
    * frontmatter asks otherwise.
    */
   nested?: boolean;
+  /**
+   * True when a workflow run spawned this agent. Its final text is the value
+   * `agent()` resolves to rather than a report a person reads, and the prompt
+   * says so — but only when `structuredOutput` is unset, since that child
+   * already has a `StructuredOutput` tool to answer through and two competing
+   * "this is how you return your answer" instructions is worse than one.
+   */
+  workflow?: boolean;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
   /**
@@ -622,6 +630,7 @@ export async function runAgent(
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
+  if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;

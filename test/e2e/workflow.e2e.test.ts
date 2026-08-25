@@ -89,6 +89,8 @@ describe("Workflow end to end", () => {
 
     /** Prompts the faux backend saw on non-parent (i.e. subagent) calls. */
     const childPrompts: string[] = [];
+    /** System prompts those same subagent calls were given. */
+    const childSystemPrompts: string[] = [];
 
     const cwd = workflowProject();
     const run = await runPrintMode({
@@ -99,6 +101,7 @@ describe("Workflow end to end", () => {
         const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
+          childSystemPrompts.push(context.systemPrompt ?? "");
           return fauxText("SUBAGENT-DONE");
         }
         return asText(context).includes("Task ID")
@@ -130,6 +133,15 @@ describe("Workflow end to end", () => {
       expect(recorded).toHaveLength(2);
       expect(recorded.every(entry => entry.ok && entry.key.length > 0)).toBe(true);
       expect(recorded.map(entry => entry.index)).toEqual([0, 1]);
+
+      // A workflow child's text is the value `agent()` resolves to, not a
+      // report a person reads, and its prompt has to say so — otherwise the
+      // next pipeline stage is fed a preamble. Asserted here rather than only
+      // at the unit level because the flag crosses manager -> runner -> prompt
+      // builder, and every link has to be wired for it to land.
+      expect(childSystemPrompts).toHaveLength(childPrompts.length);
+      expect(childSystemPrompts.every(p => p.includes("<workflow_child>"))).toBe(true);
+      expect(childSystemPrompts[0]).toContain("Your final message IS the return value");
     } finally {
       await run.dispose?.();
     }

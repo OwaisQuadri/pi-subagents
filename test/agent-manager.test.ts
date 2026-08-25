@@ -1227,6 +1227,23 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     expect(vi.mocked(runAgent).mock.lastCall![3].worktreeBase).toBeUndefined();
   });
 
+  it("passes `workflow` to the runner exactly when the spawn carries a workflowId", async () => {
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const owned = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      workflowId: "wf_abc123",
+    });
+    await manager.getRecord(owned)!.promise;
+    expect(vi.mocked(runAgent).mock.lastCall![3].workflow).toBe(true);
+
+    const plain = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test" });
+    await manager.getRecord(plain)!.promise;
+    expect(vi.mocked(runAgent).mock.lastCall![3].workflow).toBe(false);
+  });
+
   it("relative cwd throws immediately; no orphan record", () => {
     vi.mocked(runAgent).mockClear();
     manager = new AgentManager();

@@ -276,6 +276,31 @@ describe("agent-runner final output capture", () => {
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("worktreeBase");
   });
 
+  it("marks a workflow child so its prompt says the final text is the return value", async () => {
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    const { session } = createSession("RAW");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "List the files", { pi, workflow: true });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).toMatchObject({ workflowChild: true });
+
+    await runAgent(ctx, "Explore", "List the files", { pi });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("workflowChild");
+  });
+
+  it("leaves the block off a schema-bearing child, which answers through StructuredOutput", async () => {
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    const { session } = createSession("RAW");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "List the files", {
+      pi,
+      workflow: true,
+      structuredOutput: { schema: { type: "object" }, check: () => true },
+    });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("workflowChild");
+  });
+
   it("passes the parent model runtime while retaining the legacy model registry", async () => {
     const { session } = createSession("AUTHENTICATED");
     createAgentSession.mockResolvedValue({ session });

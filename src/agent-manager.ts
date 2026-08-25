@@ -769,6 +769,7 @@ export class AgentManager {
       structuredOutput: options.structuredOutput,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,
+      workflow: options.workflowId !== undefined,
       // Worktree wins for the working dir (the agent must run in the copy —
       // which, with a custom cwd, was created from that target). Config stays
       // with the parent project when a caller-supplied cwd is in play; it must
