@@ -486,8 +486,13 @@ export class AgentWidget {
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
-      const prefix = theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  `;
+      const namePrefix = theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} `;
+      const nameSuffix = `${modeTag}  `;
       const separator = ` ${theme.fg("dim", "·")} `;
+      const fullConfig = formatEffectiveInvocation(a.invocation);
+      const nameWidth = Math.max(0, w - visibleWidth(namePrefix) - visibleWidth(nameSuffix) - visibleWidth(separator) - visibleWidth(fullConfig));
+      const name = truncateToWidth(renderAgentName(a.type, theme, { bold: true }), nameWidth);
+      const prefix = namePrefix + name + nameSuffix;
       let configWidth = Math.max(0, w - visibleWidth(prefix) - visibleWidth(separator));
       let config = compactEffectiveInvocation(a.invocation, configWidth);
       while (configWidth > 0 && visibleWidth(prefix + separator + config) > w) {

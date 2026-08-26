@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { registerAgents } from "../src/agent-types.js";
 import { renderRunningAgentStatus } from "../src/index.js";
-import type { WidgetMode } from "../src/types.js";
+import type { AgentConfig, WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
@@ -193,17 +194,37 @@ describe("AgentWidget", () => {
   });
 
   it("keeps provider, model, and thinking visible at 50 columns", () => {
-    const record = makeRecord("bg", { isBackground: true });
-    record.description = "a description that cannot fit";
-    const manager = { listAgents: () => [record] };
-    const widget = new AgentWidget(manager as any, new Map([["bg", makeActivity()]]), () => "background");
-    let factory: any;
-    widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });
-    widget.update();
+    const longName = "A Very Long Custom Agent Display Name";
+    const config: AgentConfig = {
+      name: "long-name",
+      displayName: longName,
+      description: "does work",
+      extensions: false,
+      skills: false,
+      systemPrompt: "Do work.",
+      promptMode: "replace",
+    };
+    registerAgents(new Map([[config.name, config]]));
+    try {
+      const record = makeRecord("bg", { isBackground: true });
+      record.type = config.name;
+      record.description = "a description that cannot fit";
+      const manager = { listAgents: () => [record] };
+      const widget = new AgentWidget(manager as any, new Map([["bg", makeActivity()]]), () => "background");
+      let factory: any;
+      widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });
+      widget.update();
 
-    const row = factory({ terminal: { columns: 50 }, requestRender: () => {} }, theme).render()[1];
-    expect(row).not.toContain(record.description);
-    expect(row).toMatch(/anthropic\/[^ ]+ \(high\)/);
+      const fullRow = factory({ terminal: { columns: 120 }, requestRender: () => {} }, theme).render()[1];
+      expect(fullRow).toContain(longName);
+
+      const row = factory({ terminal: { columns: 50 }, requestRender: () => {} }, theme).render()[1];
+      expect(row).not.toContain(longName);
+      expect(row).not.toContain(record.description);
+      expect(row).toMatch(/anthropic\/[^ ]+ \(high\)/);
+    } finally {
+      registerAgents(new Map());
+    }
   });
 
   // Queued agents stay a one-line count. A fan-out of ten would otherwise eat
