@@ -370,11 +370,14 @@ export class FleetList {
     if (focused == null) return true;
     if (typeof focused !== "object") return false;
     const editor = focused as {
-      constructor?: { name?: unknown };
       actionHandlers?: unknown;
       onAction?: unknown;
     };
-    return editor.constructor?.name === "CustomEditor"
+    let prototype = Object.getPrototypeOf(focused);
+    while (prototype != null && prototype.constructor?.name !== "CustomEditor") {
+      prototype = Object.getPrototypeOf(prototype);
+    }
+    return prototype != null
       && editor.actionHandlers instanceof Map
       && typeof editor.onAction === "function";
   }

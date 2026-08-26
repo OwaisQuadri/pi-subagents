@@ -410,14 +410,15 @@ describe("FleetList vs other focused components (#123)", () => {
     expect(h.press(DOWN)).toEqual({ consume: true });
   });
 
-  it("navigates from a host Editor with a different class identity", () => {
+  it("navigates from a foreign CustomEditor subclass", () => {
     class CustomEditor {
       actionHandlers = new Map();
       onAction() {}
     }
+    class DictationEditor extends CustomEditor {}
 
     const h = harness([makeRecord({ id: "a1", description: "one" })]);
-    const foreignEditor = new CustomEditor();
+    const foreignEditor = new DictationEditor();
     expect(foreignEditor).not.toBeInstanceOf(Editor);
     focusInHarness(h, foreignEditor);
     expect(h.press(LEFT)).toEqual({ consume: true });
@@ -429,11 +430,8 @@ describe("FleetList vs other focused components (#123)", () => {
 
   it("does not steal keys from an editor-like dialog", () => {
     class EditorDialog {
-      getText() { return ""; }
-      setText() {}
-      getLines() { return [""]; }
-      getCursor() { return { line: 0, col: 0 }; }
-      handleInput() {}
+      actionHandlers = new Map();
+      onAction() {}
     }
 
     const h = harness([makeRecord()]);
