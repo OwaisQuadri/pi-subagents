@@ -361,26 +361,22 @@ export class FleetList {
   }
 
   /**
-   * `focusedComponent` is TUI-private, so use the editor's public method shape
-   * rather than `instanceof`: the host can load pi-tui from a different package
-   * copy. An unknown focus still counts as the editor before the widget renders.
+   * `focusedComponent` is TUI-private. The prompt is pi's `CustomEditor`, which
+   * has an action-handler map that ordinary editor-like dialog components lack.
+   * Its name and public shape survive a second pi-tui package copy.
    */
   private editorHasFocus(): boolean {
     const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
     if (focused == null) return true;
     if (typeof focused !== "object") return false;
     const editor = focused as {
-      getText?: unknown;
-      setText?: unknown;
-      getLines?: unknown;
-      getCursor?: unknown;
-      handleInput?: unknown;
+      constructor?: { name?: unknown };
+      actionHandlers?: unknown;
+      onAction?: unknown;
     };
-    return typeof editor.getText === "function"
-      && typeof editor.setText === "function"
-      && typeof editor.getLines === "function"
-      && typeof editor.getCursor === "function"
-      && typeof editor.handleInput === "function";
+    return editor.constructor?.name === "CustomEditor"
+      && editor.actionHandlers instanceof Map
+      && typeof editor.onAction === "function";
   }
 
   private deactivate(): void {

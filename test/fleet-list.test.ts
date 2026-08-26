@@ -369,11 +369,15 @@ describe("FleetList vs other focused components (#123)", () => {
   // keyboard — another extension's selector (rpiv-ask-user-question), pi's own
   // menus, our /agents settings — the list must not consume its keys.
 
-  /** A minimal real Editor — what pi focuses at the prompt (CustomEditor extends it). */
+  /** A minimal prompt editor — pi focuses CustomEditor, not its base Editor. */
   function realEditor(): Editor {
+    class CustomEditor extends Editor {
+      actionHandlers = new Map();
+      onAction() {}
+    }
     const fakeTui = { requestRender: () => {} };
     const theme = { borderColor: (s: string) => s, selectList: {} };
-    return new Editor(fakeTui as any, theme as any);
+    return new CustomEditor(fakeTui as any, theme as any);
   }
 
   /** Hand the fleet list its `tui` (happens on first widget render in pi) with the given focus. */
@@ -407,17 +411,13 @@ describe("FleetList vs other focused components (#123)", () => {
   });
 
   it("navigates from a host Editor with a different class identity", () => {
-    class ForeignEditor {
-      focused = true;
-      getText() { return ""; }
-      setText() {}
-      getLines() { return [""]; }
-      getCursor() { return { line: 0, col: 0 }; }
-      handleInput() {}
+    class CustomEditor {
+      actionHandlers = new Map();
+      onAction() {}
     }
 
     const h = harness([makeRecord({ id: "a1", description: "one" })]);
-    const foreignEditor = new ForeignEditor();
+    const foreignEditor = new CustomEditor();
     expect(foreignEditor).not.toBeInstanceOf(Editor);
     focusInHarness(h, foreignEditor);
     expect(h.press(LEFT)).toEqual({ consume: true });
@@ -425,6 +425,21 @@ describe("FleetList vs other focused components (#123)", () => {
     expect(h.render().find(l => l.includes("one"))).toContain("●");
     expect(h.press(ENTER)).toEqual({ consume: true });
     expect(h.overlayOpened()).toBe(true);
+  });
+
+  it("does not steal keys from an editor-like dialog", () => {
+    class EditorDialog {
+      getText() { return ""; }
+      setText() {}
+      getLines() { return [""]; }
+      getCursor() { return { line: 0, col: 0 }; }
+      handleInput() {}
+    }
+
+    const h = harness([makeRecord()]);
+    focusInHarness(h, new EditorDialog());
+    expect(h.press(DOWN)).toBeUndefined();
+    expect(h.press(ENTER)).toBeUndefined();
   });
 
   it("assumes the editor when focus is unknowable (no tui yet / nothing focused)", () => {

@@ -791,6 +791,11 @@ export class AgentManager {
       },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
+      onResolvedConfig: (resolved) => {
+        record.invocation ??= {};
+        if (resolved.model) Object.assign(record.invocation, describeModel(resolved.model));
+        record.invocation.thinking = resolved.thinking;
+      },
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);

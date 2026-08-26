@@ -192,6 +192,20 @@ describe("AgentWidget", () => {
     expect(row).toContain("↻1");
   });
 
+  it("keeps provider, model, and thinking visible at 50 columns", () => {
+    const record = makeRecord("bg", { isBackground: true });
+    record.description = "a description that cannot fit";
+    const manager = { listAgents: () => [record] };
+    const widget = new AgentWidget(manager as any, new Map([["bg", makeActivity()]]), () => "background");
+    let factory: any;
+    widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });
+    widget.update();
+
+    const row = factory({ terminal: { columns: 50 }, requestRender: () => {} }, theme).render()[1];
+    expect(row).not.toContain(record.description);
+    expect(row).toMatch(/anthropic\/[^ ]+ \(high\)/);
+  });
+
   // Queued agents stay a one-line count. A fan-out of ten would otherwise eat
   // the whole widget and push every finished agent out of it.
   it("keeps queued agents on one summary line and finished agents visible", () => {
@@ -209,7 +223,6 @@ describe("AgentWidget", () => {
       new Map(),
       () => "background",
       () => false,
-      () => true,
     );
     let factory: any;
     widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });

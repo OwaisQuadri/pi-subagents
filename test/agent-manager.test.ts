@@ -2426,6 +2426,26 @@ describe("AgentManager — effective model and thinking write-back", () => {
     return manager.getRecord(id)!;
   }
 
+  it("writes the runner's resolved configuration before a session exists", () => {
+    vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onResolvedConfig?.({
+        model: { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+        thinking: "low",
+      });
+      return new Promise(() => {}) as any;
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "Explore", "go", {
+      description: "go",
+      isBackground: true,
+    });
+
+    expect(manager.getRecord(id)!.invocation).toMatchObject({
+      modelId: "anthropic/claude-haiku-4-5",
+      thinking: "low",
+    });
+  });
+
   it("relabels the record with the model the session actually runs", async () => {
     const record = await spawnWithSession(
       { modelName: "pre-session", modelId: "pre/session", thinking: "high" },

@@ -460,6 +460,26 @@ describe("mentioning an agent that has never run", () => {
 
   });
 
+  it("reports the runner's effective configuration before the mention session exists", async () => {
+    const { lifecycle } = bootDirect();
+    vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onResolvedConfig?.({
+        model: { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+        thinking: "low",
+      });
+      return new Promise(() => {}) as any;
+    });
+
+    await send(lifecycle, "@explore go");
+
+    const id = vi.mocked(runAgent).mock.calls[0][3].agentId;
+    const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    expect(manager.getRecord(id).invocation).toMatchObject({
+      modelId: "anthropic/claude-haiku-4-5",
+      thinking: "low",
+    });
+  });
+
   it("shows the turn limit it will actually be held to (#181)", async () => {
     // The spawn passes no maxTurns on purpose (see the test above), so the
     // tracker has to resolve the same limit runAgent will enforce — otherwise

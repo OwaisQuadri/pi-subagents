@@ -219,6 +219,25 @@ export function formatEffectiveInvocation(invocation: AgentInvocation | undefine
   return `${model} (${invocation?.thinking ?? "inherit"})`;
 }
 
+function compactEffectiveInvocation(invocation: AgentInvocation | undefined, width: number): string {
+  const full = formatEffectiveInvocation(invocation);
+  if (visibleWidth(full) <= width) return full;
+
+  const model = invocation?.modelId ?? invocation?.modelName ?? "inherit";
+  const thinking = `(${invocation?.thinking ?? "inherit"})`;
+  const modelWidth = Math.max(0, width - visibleWidth(thinking) - 1);
+  const slash = model.indexOf("/");
+  if (modelWidth === 0) return truncateToWidth(thinking, width);
+  if (modelWidth < 3 || slash === -1) return `${truncateToWidth(model, modelWidth)} ${thinking}`;
+
+  const provider = model.slice(0, slash);
+  const modelId = model.slice(slash + 1);
+  const providerWidth = Math.min(visibleWidth(provider), Math.max(1, modelWidth - 2));
+  const modelIdWidth = Math.max(1, modelWidth - providerWidth - 1);
+  const compactModel = `${truncateToWidth(provider, providerWidth)}/${truncateToWidth(modelId, modelIdWidth)}`;
+  return `${compactModel} ${thinking}`;
+}
+
 /** Truncate text to a single line, max `len` chars. */
 function truncateLine(text: string, len = 60): string {
   const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
@@ -457,23 +476,33 @@ export class AgentWidget {
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
       const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 
-      const parts: string[] = [formatEffectiveInvocation(a.invocation)];
-      if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
-      if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
-      if (tokenText) parts.push(tokenText);
-      if (costText) parts.push(costText);
-      parts.push(elapsed);
-      const statsText = parts.join(" · ");
+      const stats: string[] = [];
+      if (bg) stats.push(formatTurns(bg.turnCount, bg.maxTurns));
+      if (toolUses > 0) stats.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
+      if (tokenText) stats.push(tokenText);
+      if (costText) stats.push(costText);
+      stats.push(elapsed);
+      const statsText = stats.join(" · ");
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       const prefix = theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  `;
-      const suffix = ` ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`;
-      const descriptionWidth = Math.max(0, w - visibleWidth(prefix) - visibleWidth(suffix));
+      const separator = ` ${theme.fg("dim", "·")} `;
+      let configWidth = Math.max(0, w - visibleWidth(prefix) - visibleWidth(separator));
+      let config = compactEffectiveInvocation(a.invocation, configWidth);
+      while (configWidth > 0 && visibleWidth(prefix + separator + config) > w) {
+        configWidth--;
+        config = compactEffectiveInvocation(a.invocation, configWidth);
+      }
+      const configSuffix = separator + theme.fg("dim", config);
+      const statsSuffix = `${separator}${fgPreservingNestedStyles(theme, "dim", statsText)}`;
+      const descriptionWidth = Math.max(0, w - visibleWidth(prefix) - visibleWidth(configSuffix) - visibleWidth(statsSuffix));
       const description = truncateToWidth(theme.fg("muted", a.description), descriptionWidth);
+      const header = prefix + description + configSuffix;
+      const headerWithStats = visibleWidth(header + statsSuffix) <= w ? header + statsSuffix : header;
 
       runningLines.push([
-        truncate(prefix + description + suffix),
+        truncate(headerWithStats),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
