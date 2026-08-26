@@ -5,7 +5,7 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
@@ -214,6 +214,11 @@ export function buildInvocationTags(
   };
 }
 
+export function formatEffectiveInvocation(invocation: AgentInvocation | undefined): string {
+  const model = invocation?.modelId ?? invocation?.modelName ?? "inherit";
+  return `${model} (${invocation?.thinking ?? "inherit"})`;
+}
+
 /** Truncate text to a single line, max `len` chars. */
 function truncateLine(text: string, len = 60): string {
   const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
@@ -282,14 +287,6 @@ export class AgentWidget {
      * supplies the user's `showCost` setting.
      */
     private showCost: () => boolean = () => false,
-    /**
-     * Read live at render time, like `mode`. Whether running agents name the
-     * model driving them and the thinking level it is running at. Defaults to
-     * off — the extension supplies the user's `showModel` setting — because the
-     * row is already dense and the same pair is on the tool result and in the
-     * conversation viewer unconditionally.
-     */
-    private showModel: () => boolean = () => false,
   ) {}
 
   /**
@@ -460,16 +457,7 @@ export class AgentWidget {
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
       const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 
-      const parts: string[] = [];
-      if (this.showModel()) {
-        // Leading, and paired: a thinking level means nothing without the model
-        // it applies to. The tag is taken from buildInvocationTags rather than
-        // rebuilt so the "(asked X)" annotation survives.
-        const { modelName, tags } = buildInvocationTags(a.invocation);
-        if (modelName) parts.push(modelName);
-        const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
-        if (thinkingTag) parts.push(thinkingTag);
-      }
+      const parts: string[] = [formatEffectiveInvocation(a.invocation)];
       if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
@@ -479,8 +467,13 @@ export class AgentWidget {
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
+      const prefix = theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  `;
+      const suffix = ` ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`;
+      const descriptionWidth = Math.max(0, w - visibleWidth(prefix) - visibleWidth(suffix));
+      const description = truncateToWidth(theme.fg("muted", a.description), descriptionWidth);
+
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(prefix + description + suffix),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }

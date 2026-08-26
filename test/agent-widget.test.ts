@@ -87,14 +87,8 @@ describe("AgentWidget", () => {
   }
 
   /** Render the widget for a manager and return the produced lines ("" if nothing rendered). */
-  function renderLines(manager: unknown, activityId: string, mode?: () => WidgetMode, showModel = false): string {
-    const widget = new AgentWidget(
-      manager as any,
-      new Map([[activityId, makeActivity()]]),
-      mode,
-      () => false,
-      () => showModel,
-    );
+  function renderLines(manager: unknown, activityId: string, mode?: () => WidgetMode): string {
+    const widget = new AgentWidget(manager as any, new Map([[activityId, makeActivity()]]), mode, () => false);
     let factory: any;
     widget.setUICtx({
       setStatus: () => {},
@@ -154,38 +148,48 @@ describe("AgentWidget", () => {
     expect(renderLines(manager, "unflagged", () => "background")).toContain("unflagged description");
   });
 
-  // The model is opt-in: the row is already dense, and the same pair is on the
-  // tool result and in the conversation viewer either way.
-  it("names the model and thinking on a running row under showModel", () => {
+  it("shows inherited provider, model, and thinking on the live row", () => {
     const manager = { listAgents: () => [makeRecord("bg", { isBackground: true })] };
 
-    expect(renderLines(manager, "bg", () => "background", true))
-      .toContain("sonnet 4.6 · thinking: high");
+    expect(renderLines(manager, "bg", () => "background"))
+      .toContain("anthropic/claude-sonnet-4-6 (high)");
   });
 
-  it("renders the row exactly as before when showModel is off", () => {
-    const manager = { listAgents: () => [makeRecord("bg", { isBackground: true })] };
-
-    const off = renderLines(manager, "bg", () => "background");
-    expect(off).toContain("bg description");
-    expect(off).not.toContain("sonnet 4.6");
-    expect(off).not.toContain("thinking:");
-  });
-
-  it("carries the short label, never the canonical id, onto the row", () => {
-    const manager = { listAgents: () => [makeRecord("bg", { isBackground: true })] };
-
-    expect(renderLines(manager, "bg", () => "background", true))
-      .not.toContain("anthropic/claude-sonnet-4-6");
-  });
-
-  it("discloses a level the run did not honor", () => {
+  it("shows an explicit provider, model, and thinking on the live row", () => {
     const record = makeRecord("bg", { isBackground: true });
-    record.invocation = { modelName: "haiku 4.5", thinking: "high", requestedThinking: "max" };
+    record.invocation = {
+      modelName: "haiku 4.5",
+      modelId: "anthropic/claude-haiku-4-5",
+      thinking: "low",
+    };
     const manager = { listAgents: () => [record] };
 
-    expect(renderLines(manager, "bg", () => "background", true))
-      .toContain("haiku 4.5 · thinking: high (asked max)");
+    expect(renderLines(manager, "bg", () => "background"))
+      .toContain("anthropic/claude-haiku-4-5 (low)");
+  });
+
+  it("uses inherit only when Pi supplied no model or thinking level", () => {
+    const record = makeRecord("bg", { isBackground: true });
+    record.invocation = undefined;
+    const manager = { listAgents: () => [record] };
+
+    expect(renderLines(manager, "bg", () => "background"))
+      .toContain("inherit (inherit)");
+  });
+
+  it("truncates the description before the effective configuration", () => {
+    const record = makeRecord("bg", { isBackground: true });
+    record.description = "a description that is too long to fit before the configuration";
+    const manager = { listAgents: () => [record] };
+    const widget = new AgentWidget(manager as any, new Map([["bg", makeActivity()]]), () => "background");
+    let factory: any;
+    widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });
+    widget.update();
+
+    const row = factory({ terminal: { columns: 100 }, requestRender: () => {} }, theme).render()[1];
+    expect(row).not.toContain(record.description);
+    expect(row).toContain("anthropic/claude-sonnet-4-6 (high)");
+    expect(row).toContain("↻1");
   });
 
   // Queued agents stay a one-line count. A fan-out of ten would otherwise eat

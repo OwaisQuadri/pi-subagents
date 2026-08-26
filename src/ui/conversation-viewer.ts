@@ -12,7 +12,7 @@ import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatEffectiveInvocation, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -479,15 +479,10 @@ export class ConversationViewer implements Component {
     return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
   }
 
-  private invocationLine(): string | undefined {
-    // Canonical id here, short label everywhere else: this overlay is opened to
-    // inspect one agent and has the width for it, and two providers can serve
-    // models whose short names read alike.
-    const { modelName, modelId, tags } = buildInvocationTags(this.record.invocation);
-    const model = modelId ?? modelName;
-    const parts = model ? [model, ...tags] : tags;
-    if (parts.length === 0) return undefined;
-    return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
+  private invocationLine(): string {
+    const { tags } = buildInvocationTags(this.record.invocation);
+    const configTags = tags.filter(tag => !tag.startsWith("thinking: "));
+    return this.theme.fg("dim", `  ↳ ${[formatEffectiveInvocation(this.record.invocation), ...configTags].join(" · ")}`);
   }
 
   private buildContentLines(width: number): string[] {

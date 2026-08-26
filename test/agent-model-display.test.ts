@@ -162,11 +162,12 @@ describe("Agent tool result — effective model", () => {
       { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false },
       undefined,
       onUpdate,
-      ctx(),
+      { ...ctx(), thinkingLevel: "high" },
     );
 
     const streamed = onUpdate.mock.calls[0][0];
     expect(streamed.details.modelName).toBe("opus 4.6");
+    expect(streamed.details.tags).toContain("thinking: high");
     expect(tool.renderResult(streamed, { expanded: false, isPartial: true }, theme, { isError: false })
       .render(200).join("\n")).toContain("opus 4.6");
   });

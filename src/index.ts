@@ -420,10 +420,6 @@ export default function (pi: ExtensionAPI) {
   let showCost = false;
   function isShowCostEnabled(): boolean { return showCost; }
   function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
-  /** Name the model and thinking level on the widget's running rows. */
-  let showModel = false;
-  function isShowModelEnabled(): boolean { return showModel; }
-  function setShowModel(b: boolean): void { showModel = b; widget.update(); }
   /**
    * How much of the conversation viewer renders as Markdown. Read through a
    * getter by the viewer rather than captured like `showCost`, because the
@@ -1129,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
@@ -1424,7 +1420,6 @@ export default function (pi: ExtensionAPI) {
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
       setShowCost,
-      setShowModel,
       setViewerMarkdown,
     },
     (event, payload) => pi.events.emit(event, payload),
@@ -1834,6 +1829,7 @@ Terse command-style prompts produce shallow, generic work.
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
       const thinking = resolvedConfig.thinking;
+      const effectiveThinking = thinking ?? ctx.thinkingLevel;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
@@ -1871,7 +1867,7 @@ Terse command-style prompts produce shallow, generic work.
       const agentInvocation: AgentInvocation = {
         modelName,
         modelId,
-        thinking,
+        thinking: effectiveThinking,
         // Only set where the agent file outranked the caller, so the surfaces can
         // disclose a parameter that was accepted but could not take effect (#182).
         requestedThinking: resolvedConfig.overridden?.thinking,
@@ -3473,7 +3469,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
       fallbackSubagent: getFallbackSubagent(),
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
-      showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
     } satisfies SubagentsSettings;
   }
@@ -3631,14 +3626,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description:
             "Show an estimated `~$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. Priced by pi from the model's rates — omitted entirely for a model it has no rates for.",
           currentValue: isShowCostEnabled() ? "on" : "off",
-          values: ["on", "off"],
-        },
-        {
-          id: "showModel",
-          label: "Show model",
-          description:
-            "Name the model driving each agent, and the thinking level it is running at, on the widget's running rows. The Agent tool result and the conversation viewer show the pair either way — this adds it to the widget, where the row is already dense.",
-          currentValue: isShowModelEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -3816,10 +3803,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setShowCost(enabled);
         notifyApplied(ctx, `Cost display ${enabled ? "enabled" : "disabled"}`);
-      } else if (id === "showModel") {
-        const enabled = value === "on";
-        setShowModel(enabled);
-        notifyApplied(ctx, `Model display ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "viewerMarkdown") {
         setViewerMarkdown(value as ViewerMarkdownMode);
         notifyApplied(ctx, `Viewer markdown set to ${value}`);

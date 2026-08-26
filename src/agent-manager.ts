@@ -500,6 +500,10 @@ export class AgentManager {
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
+    const model = options.model ?? ctx.model;
+    const invocation = options.invocation ? { ...options.invocation } : {};
+    if (model && invocation.modelId === undefined) Object.assign(invocation, describeModel(model));
+    if (invocation.thinking === undefined) invocation.thinking = options.thinkingLevel ?? ctx.thinkingLevel;
     const record: AgentRecord = {
       id,
       type,
@@ -535,7 +539,7 @@ export class AgentManager {
       // of the call that made it — and both settle paths need it long after
       // `options` has stopped being the interesting object.
       blocking: options.blocking,
-      invocation: options.invocation,
+      invocation,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
@@ -821,19 +825,14 @@ export class AgentManager {
         // re-deriving "session, else the request" for itself.
         if (session.model) {
           record.invocation ??= {};
-          // Read the kept request first: a caller's level survives being clamped
-          // AND, one line later, being replaced by the effective one.
-          const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
           Object.assign(record.invocation, describeModel(session.model));
-          // Guarded for the reason above: a session that reports no level keeps
-          // the request rather than losing it. Overwriting unconditionally would
-          // turn an older or stubbed session into a blank `thinking:` tag, which
-          // is worse than the stale-but-true value it replaced.
-          if (session.thinkingLevel) {
-            record.invocation.thinking = session.thinkingLevel;
-            if (requested && requested !== session.thinkingLevel) {
-              record.invocation.requestedThinking = requested;
-            }
+        }
+        if (session.thinkingLevel) {
+          record.invocation ??= {};
+          const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
+          record.invocation.thinking = session.thinkingLevel;
+          if (requested && requested !== session.thinkingLevel) {
+            record.invocation.requestedThinking = requested;
           }
         }
         // Flush any steers that arrived before the session was ready

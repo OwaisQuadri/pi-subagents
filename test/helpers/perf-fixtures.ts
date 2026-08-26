@@ -201,14 +201,13 @@ export function makeSession(n: number) {
 export function mountWidget(
   Widget: any,
   records: unknown[],
-  opts: { mode?: string; showCost?: boolean; showModel?: boolean } = {},
+  opts: { mode?: string; showCost?: boolean } = {},
 ) {
   const widget = new Widget(
     makeManager(records),
     makeActivity(records as { id: string; toolUses: number }[]),
     () => opts.mode ?? "all",
     () => opts.showCost ?? false,
-    () => opts.showModel ?? false,
   );
   let factory: any;
   widget.setUICtx({

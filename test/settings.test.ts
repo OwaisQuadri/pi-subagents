@@ -212,15 +212,6 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
-  it("round-trips showModel; drops non-boolean", () => {
-    saveSettings({ showModel: true }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ showModel: true });
-    saveSettings({ showModel: false }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ showModel: false });
-    writeProject({ showModel: "on" } as any);
-    expect(loadSettings(projectDir)).toEqual({});
-  });
-
   it("round-trips workflowsEnabled; drops non-boolean", () => {
     saveSettings({ workflowsEnabled: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: true });
@@ -579,14 +570,6 @@ describe("settings persistence", () => {
       applySettings({ reportUsage: false, showCost: false }, appliers);
       expect(appliers.setReportUsage).toHaveBeenCalledWith(false);
       expect(appliers.setShowCost).toHaveBeenCalledWith(false);
-    });
-
-    it("applies showModel", () => {
-      applySettings({ showModel: true }, appliers);
-      expect(appliers.setShowModel).toHaveBeenCalledWith(true);
-
-      applySettings({ showModel: false }, appliers);
-      expect(appliers.setShowModel).toHaveBeenCalledWith(false);
     });
 
     it("is a no-op on an empty settings object", () => {

@@ -60,14 +60,9 @@ describe("AgentWidget.render — the widget's real mix", () => {
   // overflow logic has to resolve, which the flat "n running" cases never reach.
   const mix = () => makeFleet({ running: 3, queued: 7, finished: 3 });
 
-  const off = track(mountWidget(AgentWidget, mix(), { mode: "background" }));
-  bench("3 running / 7 queued / 3 finished — showModel off", () => {
-    off.render();
-  });
-
-  const on = track(mountWidget(AgentWidget, mix(), { mode: "background", showModel: true }));
-  bench("3 running / 7 queued / 3 finished — showModel on", () => {
-    on.render();
+  const base = track(mountWidget(AgentWidget, mix(), { mode: "background" }));
+  bench("3 running / 7 queued / 3 finished", () => {
+    base.render();
   });
 
   const cost = track(mountWidget(AgentWidget, mix(), { mode: "background", showCost: true }));

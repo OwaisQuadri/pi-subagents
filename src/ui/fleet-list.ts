@@ -11,7 +11,7 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
@@ -361,16 +361,26 @@ export class FleetList {
   }
 
   /**
-   * True when pi's prompt editor owns the keyboard. pi's editor is an `Editor`
-   * subclass (CustomEditor) while every dialog/selector is not, and the loader
-   * aliases pi-tui to pi's own copy, so `instanceof` is a reliable identity
-   * check. `focusedComponent` is TUI-private (no public accessor), hence the
-   * best-effort peek: unknowable focus (no tui seen yet, nothing focused)
-   * counts as the editor so activation keeps working.
+   * `focusedComponent` is TUI-private, so use the editor's public method shape
+   * rather than `instanceof`: the host can load pi-tui from a different package
+   * copy. An unknown focus still counts as the editor before the widget renders.
    */
   private editorHasFocus(): boolean {
     const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    if (focused == null) return true;
+    if (typeof focused !== "object") return false;
+    const editor = focused as {
+      getText?: unknown;
+      setText?: unknown;
+      getLines?: unknown;
+      getCursor?: unknown;
+      handleInput?: unknown;
+    };
+    return typeof editor.getText === "function"
+      && typeof editor.setText === "function"
+      && typeof editor.getLines === "function"
+      && typeof editor.getCursor === "function"
+      && typeof editor.handleInput === "function";
   }
 
   private deactivate(): void {

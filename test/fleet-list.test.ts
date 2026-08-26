@@ -406,6 +406,27 @@ describe("FleetList vs other focused components (#123)", () => {
     expect(h.press(DOWN)).toEqual({ consume: true });
   });
 
+  it("navigates from a host Editor with a different class identity", () => {
+    class ForeignEditor {
+      focused = true;
+      getText() { return ""; }
+      setText() {}
+      getLines() { return [""]; }
+      getCursor() { return { line: 0, col: 0 }; }
+      handleInput() {}
+    }
+
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    const foreignEditor = new ForeignEditor();
+    expect(foreignEditor).not.toBeInstanceOf(Editor);
+    focusInHarness(h, foreignEditor);
+    expect(h.press(LEFT)).toEqual({ consume: true });
+    expect(h.press(DOWN)).toEqual({ consume: true });
+    expect(h.render().find(l => l.includes("one"))).toContain("●");
+    expect(h.press(ENTER)).toEqual({ consume: true });
+    expect(h.overlayOpened()).toBe(true);
+  });
+
   it("assumes the editor when focus is unknowable (no tui yet / nothing focused)", () => {
     const h = harness([makeRecord()]);
     // No render yet → the list has never seen a tui: activation must still work.
