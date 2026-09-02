@@ -518,10 +518,19 @@ function readPiSettingsFile(path: string): SubagentsSettings {
 
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
+  const global = readSettingsFile(globalPath());
+  const piSettings = readPiSettingsFile(piSettingsPath());
+  const project = readSettingsFile(projectPath(cwd));
+  const agentOverrides = {
+    ...global.agentOverrides,
+    ...piSettings.agentOverrides,
+    ...project.agentOverrides,
+  };
   return {
-    ...readSettingsFile(globalPath()),
-    ...readPiSettingsFile(piSettingsPath()),
-    ...readSettingsFile(projectPath(cwd)),
+    ...global,
+    ...piSettings,
+    ...project,
+    ...(Object.keys(agentOverrides).length > 0 ? { agentOverrides } : {}),
   };
 }
 
