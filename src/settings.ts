@@ -9,6 +9,7 @@ import { NO_FALLBACK } from "./agent-types.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
+  agentOverrides?: Record<string, { model?: string }>;
   maxConcurrent?: number;
   /**
    * Max concurrent FOREGROUND (blocking) agents — `0` = unlimited, the default,
@@ -308,6 +309,7 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
+  setAgentOverrides: (overrides: Record<string, { model?: string }>) => void;
   setMaxConcurrent: (n: number) => void;
   setMaxConcurrentForeground: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
@@ -356,6 +358,16 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
   const r = raw as Record<string, unknown>;
   const out: SubagentsSettings = {};
+  if (r.agentOverrides && typeof r.agentOverrides === "object") {
+    const overrides = Object.entries(r.agentOverrides as Record<string, unknown>)
+      .filter((entry): entry is [string, { model: string }] =>
+        typeof entry[1] === "object"
+        && entry[1] !== null
+        && typeof (entry[1] as { model?: unknown }).model === "string",
+      )
+      .map(([name, override]) => [name, { model: override.model }] as const);
+    if (overrides.length > 0) out.agentOverrides = Object.fromEntries(overrides);
+  }
   if (
     Number.isInteger(r.maxConcurrent) &&
     (r.maxConcurrent as number) >= 1 &&
@@ -468,6 +480,10 @@ function globalPath(): string {
   return join(getAgentDir(), "subagents.json");
 }
 
+function piSettingsPath(): string {
+  return join(getAgentDir(), "settings.json");
+}
+
 function projectPath(cwd: string): string {
   return join(cwd, ".pi", "subagents.json");
 }
@@ -488,9 +504,34 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
+function readPiSettingsFile(path: string): SubagentsSettings {
+  if (!existsSync(path)) return {};
+  try {
+    const root = JSON.parse(readFileSync(path, "utf-8")) as { subagents?: unknown };
+    return sanitize(root.subagents);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`[pi-subagents] Ignoring malformed Pi settings at ${path}: ${reason}`);
+    return {};
+  }
+}
+
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  const global = readSettingsFile(globalPath());
+  const piSettings = readPiSettingsFile(piSettingsPath());
+  const project = readSettingsFile(projectPath(cwd));
+  const agentOverrides = {
+    ...global.agentOverrides,
+    ...piSettings.agentOverrides,
+    ...project.agentOverrides,
+  };
+  return {
+    ...global,
+    ...piSettings,
+    ...project,
+    ...(Object.keys(agentOverrides).length > 0 ? { agentOverrides } : {}),
+  };
 }
 
 /**
@@ -511,6 +552,7 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
 
 /** Apply persisted settings to the in-memory state via caller-supplied setters. */
 export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers): void {
+  if (s.agentOverrides) appliers.setAgentOverrides(s.agentOverrides);
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
   if (typeof s.maxConcurrentForeground === "number") {
     appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
