@@ -26,12 +26,19 @@ const agents = new Map<string, AgentConfig>();
 
 /** When true, DEFAULT_AGENTS are skipped during registration. */
 let disableDefaults = false;
+let agentOverrides = new Map<string, { model?: string }>();
 
 /** Check whether default agents are disabled. */
 export function isDefaultsDisabled(): boolean { return disableDefaults; }
 
 /** Set whether default agents are disabled. */
 export function setDefaultsDisabled(b: boolean): void { disableDefaults = b; }
+
+export function setAgentOverrides(overrides: Record<string, { model?: string }>): void {
+  agentOverrides = new Map(
+    Object.entries(overrides).map(([name, override]) => [name.toLowerCase(), override]),
+  );
+}
 
 /** `fallbackSubagent` value that disables the fallback entirely (strict dispatch). */
 export const NO_FALLBACK = "none";
@@ -65,7 +72,12 @@ export function buildAgentRegistry(userAgents: Map<string, AgentConfig>): Map<st
     for (const [name, config] of DEFAULT_AGENTS) registry.set(name, config);
   }
   for (const [name, config] of userAgents) registry.set(name, config);
-  return registry;
+  return new Map(
+    [...registry.entries()].map(([name, config]) => {
+      const override = agentOverrides.get(name.toLowerCase());
+      return [name, override?.model ? { ...config, model: override.model } : config];
+    }),
+  );
 }
 
 /**

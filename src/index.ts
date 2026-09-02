@@ -21,7 +21,7 @@ import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findAgentRecordEntry, reopenTarget } from "./agent-record-entry.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setAgentOverrides, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -427,6 +427,7 @@ export default function (pi: ExtensionAPI) {
   reloadCustomAgents(strictAgentFiles);
 
   // ---- Agent activity tracking + widget ----
+  let configuredAgentOverrides: Record<string, { model?: string }> | undefined;
   const agentActivity = new Map<string, AgentActivity>();
 
   // ---- Usage reporting (both off by default; see SubagentsSettings) ----
@@ -1576,6 +1577,11 @@ export default function (pi: ExtensionAPI) {
   // to stderr and falls back to defaults.
   // Also how Del on the Settings page applies the value a row falls back to.
   const settingsAppliers: SettingsAppliers = {
+    setAgentOverrides: (overrides) => {
+      configuredAgentOverrides = overrides;
+      setAgentOverrides(overrides);
+      reloadCustomAgents(strictAgentFiles);
+    },
     setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
     setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
     setMaxConcurrentNested: (n) => manager.setMaxConcurrentNested(n),
@@ -3239,6 +3245,7 @@ Terse command-style prompts produce shallow, generic work.
    */
   function snapshotSettings() {
     return {
+      agentOverrides: configuredAgentOverrides,
       maxConcurrent: manager.getMaxConcurrent(),
       // 0 = unlimited, and the default — see SubagentsSettings.
       maxConcurrentForeground: manager.getMaxConcurrentForeground(),
