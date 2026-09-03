@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The extension now loads from a single-file bundle (`dist/index.js`, built by
+  `npm run bundle`, never committed) instead of the 48-file `src/` graph. pi imports extensions through jiti with its module cache
+  off, so the src graph cost ~380ms of every warm startup; the bundle imports in ~15-30ms.
+  `build` chains typecheck + bundle, `prepublishOnly` builds it for npm consumers,
+  installers run it at sync time, and CI proves the bundle builds from src. typebox and `@sinclair/typebox` stay
+  external and resolve to the pi-provided copies through the loader virtual modules;
+  croner and nanoid are bundled in and moved to devDependencies.
+- **Path-derived extension name changed from `[src]` to `[dist]`** (the package-name
+  selector `[pi-subagents]` is unaffected and remains the documented way to select it).
+  A config that selected this extension as `extensions: ["src"]` or `tools: ext:src`
+  must switch to the package name.
+
 ### Fixed
+
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 
 ## [0.19.0] - 2026-08-25
