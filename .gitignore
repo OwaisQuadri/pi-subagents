@@ -1,8 +1,9 @@
 # Dependencies
 node_modules/
 
-# Build outputs
-dist/
+# Build outputs (dist/index.js ships: pi loads the bundle, not src)
+dist/*
+!dist/index.js
 build/
 *.tsbuildinfo
 plan/
