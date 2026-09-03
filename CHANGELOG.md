@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The extension now loads from a committed single-file bundle (`dist/index.js`) instead
-  of the 48-file `src/` graph. pi imports extensions through jiti with its module cache
+- The extension now loads from a single-file bundle (`dist/index.js`, built by
+  `npm run bundle`, never committed) instead of the 48-file `src/` graph. pi imports extensions through jiti with its module cache
   off, so the src graph cost ~380ms of every warm startup; the bundle imports in ~15-30ms.
-  `npm run bundle` (bun) regenerates it, `build` chains typecheck + bundle, and CI fails
-  when a src change lands without a rebuilt bundle. typebox and `@sinclair/typebox` stay
+  `build` chains typecheck + bundle, `prepublishOnly` builds it for npm consumers,
+  installers run it at sync time, and CI proves the bundle builds from src. typebox and `@sinclair/typebox` stay
   external and resolve to the pi-provided copies through the loader virtual modules;
   croner and nanoid are bundled in and moved to devDependencies.
 - **Path-derived extension name changed from `[src]` to `[dist]`** (the package-name

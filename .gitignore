@@ -1,10 +1,9 @@
 # Dependencies
 node_modules/
 
-# Build outputs (dist/index.js ships: pi loads the bundle, not src)
-dist/*
-!dist/index.js
-!dist/index.js.map
+# Build outputs (pi loads dist/index.js; npm run bundle builds it, installers and
+# prepublishOnly regenerate it, so it never lands in git)
+dist/
 build/
 *.tsbuildinfo
 plan/

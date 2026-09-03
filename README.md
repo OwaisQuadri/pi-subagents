@@ -46,7 +46,8 @@ pi install npm:@tintinweb/pi-subagents
 Or load directly for development:
 
 ```bash
-pi -e .        # loads the bundled dist/index.js via package.json pi.extensions
+npm ci && npm run bundle   # builds dist/index.js, the entry pi loads
+pi -e .
 ```
 
 Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). The `peerDependencies` range declares it, so npm flags an older pi at install time.
