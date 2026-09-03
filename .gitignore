@@ -4,6 +4,7 @@ node_modules/
 # Build outputs (dist/index.js ships: pi loads the bundle, not src)
 dist/*
 !dist/index.js
+!dist/index.js.map
 build/
 *.tsbuildinfo
 plan/

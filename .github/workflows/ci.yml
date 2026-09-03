@@ -19,6 +19,10 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test
+      # pi loads dist/index.js, not src: a src-only commit with a stale committed
+      # bundle ships old behavior to every run while lint/typecheck/test stay green.
+      - uses: oven-sh/setup-bun@v2
+      - run: npm run bundle && git diff --exit-code dist/ || { echo "dist/index.js is stale: run npm run bundle and commit it"; exit 1; }
 
   # The pi devDependencies pin the compile baseline POST-migration (0.84.2), so the `build`
   # job above is what guards the modelRegistry -> modelRuntime world: PR #152's
