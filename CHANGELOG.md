@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The extension now loads from a single-file bundle (`dist/index.js`, built by
+  `npm run bundle`, never committed) instead of the 48-file `src/` graph. pi imports extensions through jiti with its module cache
+  off, so the src graph cost ~380ms of every warm startup; the bundle imports in ~15-30ms.
+  `build` chains typecheck + bundle, `prepublishOnly` builds it for npm consumers,
+  installers run it at sync time, and CI proves the bundle builds from src. typebox and `@sinclair/typebox` stay
+  external and resolve to the pi-provided copies through the loader virtual modules;
+  croner and nanoid are bundled in and moved to devDependencies.
+- **Path-derived extension name changed from `[src]` to `[dist]`** (the package-name
+  selector `[pi-subagents]` is unaffected and remains the documented way to select it).
+  A config that selected this extension as `extensions: ["src"]` or `tools: ext:src`
+  must switch to the package name.
+
 ## [0.19.0] - 2026-08-25
 
 > **⚠️ Breaking — this release requires pi 0.84.0 or newer** (`peerDependencies` moves from `>=0.81.0`). `SubagentWorkflow` needs two host APIs that do not exist below it, and both fail the typecheck rather than degrading quietly — see the `Changed` entry below for which, and why neither was worth reimplementing to hold the old floor. npm flags an older pi at install time.
