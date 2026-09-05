@@ -632,6 +632,23 @@ describe("ConversationViewer", () => {
       expect(out.indexOf("$ two")).toBeLessThan(out.indexOf("LIVE RESULT"));
     });
 
+    it("syncs an appended result before a reused identifier updates without a start", () => {
+      const messages: any[] = [
+        { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "one" } }] },
+      ];
+      const session = mockSession(messages);
+      const viewer = new ConversationViewer(mockTui(200, 120), session, mockRecord(), undefined, ansiTheme(), vi.fn());
+      messages.push({ role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: "FIRST RESULT" }] });
+      messages.push({ role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "two" } }] });
+      const listener = session.subscribe.mock.calls[0][0];
+      listener({ type: "tool_execution_update", toolCallId: "dup", toolName: "bash", args: { command: "two" }, partialResult: { content: [{ type: "text", text: "SECOND LIVE" }] } });
+      const out = strip(viewer.render(120).join("\n"));
+
+      expect(out.indexOf("$ one")).toBeLessThan(out.indexOf("FIRST RESULT"));
+      expect(out.indexOf("FIRST RESULT")).toBeLessThan(out.indexOf("$ two"));
+      expect(out.indexOf("$ two")).toBeLessThan(out.indexOf("SECOND LIVE"));
+    });
+
     it("drops completed state before an identifier is reused without a new event", () => {
       const messages: any[] = [
         { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "one" } }] },

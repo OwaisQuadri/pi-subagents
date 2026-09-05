@@ -455,7 +455,7 @@ export class ConversationViewer implements Component {
         const execution = this.toolExecutions.get(event.toolCallId);
         const occurrence = execution?.result === undefined && execution !== undefined
           ? execution.occurrence
-          : this.finalToolResultCounts.get(event.toolCallId) ?? 0;
+          : this.finalToolResultCount(event.toolCallId);
         if (execution?.occurrence === occurrence) {
           execution.toolName = event.toolName;
           execution.args = event.args;
