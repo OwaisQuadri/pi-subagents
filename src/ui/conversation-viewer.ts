@@ -300,7 +300,7 @@ function toolOutputLines(output: ToolOutput, expanded: boolean, width: number, t
     const lineLimit = expanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
     const preview = truncateToVisualLines(capped.text, lineLimit, Math.max(1, width - 4));
     if (output.omitted || capped.elided || preview.skippedCount > 0) {
-      const omitted = !output.omitted && preview.skippedCount > 0
+      const omitted = !output.omitted && capped.elided === 0 && preview.skippedCount > 0
         ? `${preview.skippedCount} earlier line${preview.skippedCount === 1 ? "" : "s"}`
         : "earlier output";
       lines.push(theme.fg("dim", `    ... ${omitted}`));
@@ -382,6 +382,7 @@ export class ConversationViewer implements Component {
     lines: string[];
   }>();
   private readonly finalToolResultCounts = new Map<string, number>();
+  private finalToolResultMessages: AgentSession["messages"] | undefined;
   private finalToolResultMessageCount = 0;
 
   constructor(
@@ -419,7 +420,7 @@ export class ConversationViewer implements Component {
     this.keys = createViewerKeys(keybindings);
     this.isToolOutputAvailable = session.messages.some(message => {
       if (message.role !== "toolResult") return false;
-      const output = partialResultText(message);
+      const output = this.finalToolResultText(message);
       return !!output.text.trimEnd() || output.omitted;
     }) || [...(activity?.activeToolCalls.values() ?? [])].some(call => {
       const output = partialResultText(call.partialResult);
@@ -455,6 +456,7 @@ export class ConversationViewer implements Component {
             partialResult: partialResultText(event.partialResult),
           });
         }
+        this.pruneCompletedToolExecutions();
       }
       if (event.type === "tool_execution_end") {
         const occurrence = this.finalToolResultCount(event.toolCallId);
@@ -866,8 +868,14 @@ export class ConversationViewer implements Component {
   }
 
   private syncFinalToolResultCounts(): void {
-    for (; this.finalToolResultMessageCount < this.session.messages.length; this.finalToolResultMessageCount++) {
-      const message = this.session.messages[this.finalToolResultMessageCount];
+    const messages = this.session.messages;
+    if (messages !== this.finalToolResultMessages || messages.length < this.finalToolResultMessageCount) {
+      this.finalToolResultCounts.clear();
+      this.finalToolResultMessages = messages;
+      this.finalToolResultMessageCount = 0;
+    }
+    for (; this.finalToolResultMessageCount < messages.length; this.finalToolResultMessageCount++) {
+      const message = messages[this.finalToolResultMessageCount];
       if (message.role === "toolResult" && message.toolCallId) {
         this.finalToolResultCounts.set(message.toolCallId, (this.finalToolResultCounts.get(message.toolCallId) ?? 0) + 1);
       }
@@ -932,12 +940,13 @@ export class ConversationViewer implements Component {
     if (output.text.trimEnd() || output.omitted) this.isToolOutputAvailable = true;
     const isRunning = result === undefined && execution?.result === undefined && this.record.status === "running";
     const startedAt = execution?.startedAt ?? active?.startedAt;
+    const displayToolName = boundedLine(toolName);
     const heading = isRunning && startedAt !== undefined
       ? this.activeHeader({ toolName, args: toolArgs, startedAt }, context.width)
-      : truncateToWidth(this.theme.fg(isError ? "error" : "muted", `  [Tool: ${toolName}${isError ? " · error" : ""}]`), context.width);
+      : truncateToWidth(this.theme.fg(isError ? "error" : "muted", `  [Tool: ${displayToolName}${isError ? " · error" : ""}]`), context.width);
     const start = context.lines.length;
     context.lines.push(heading);
-    context.headers.push({ id, occurrence, index: context.lines.length - 1, name: toolName, args: toolArgs, isError, isRunning });
+    context.headers.push({ id, occurrence, index: context.lines.length - 1, name: displayToolName, args: toolArgs, isError, isRunning });
     context.lines.push(...toolArgumentLines(toolName, toolArgs, context.width, this.theme));
     context.lines.push(...this.cachedToolOutputLines(output, context.width));
     context.ranges.push({ id, occurrence, start, end: context.lines.length });
@@ -1040,7 +1049,7 @@ export class ConversationViewer implements Component {
         }
         for (const toolCall of toolCalls) {
           if (toolCall.id) this.renderToolBlock(toolCall.id, toolCall.name, toolCall.args, toolContext);
-          else lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${toolCall.name}]`), width));
+          else lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${boundedLine(toolCall.name)}]`), width));
         }
         needsSeparator = true;
       } else if (message.role === "toolResult") {
