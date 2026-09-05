@@ -12,7 +12,7 @@ import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { type ActiveToolCall, type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatMs, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** An assistant message's tool call, and the message that answers it. */
@@ -25,6 +25,7 @@ interface ToolBlock {
   component: ToolExecutionComponent;
   /** The result already handed to the component, if any. */
   result?: ToolResultPart;
+  partial?: unknown;
   /**
    * The block's rendered rows and the width they were produced at.
    *
@@ -191,6 +192,21 @@ function truncationNote(elided: number): string {
   return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function partialToolResult(partial: unknown): { content: Array<{ type: string; text?: string }>; details?: unknown } {
+  if (typeof partial === "string") return { content: [{ type: "text", text: partial }] };
+  const record = objectRecord(partial);
+  const content = Array.isArray(record?.content)
+    ? record.content.filter((block): block is { type: string; text?: string } => objectRecord(block)?.type === "text")
+    : [];
+  return { content, details: record?.details };
+}
+
 export class ConversationViewer implements Component, Focusable {
   private scrollOffset = 0;
   private autoScroll = true;
@@ -230,6 +246,7 @@ export class ConversationViewer implements Component, Focusable {
   private readonly toolRendering = piThemeAvailable();
   /** Whether tool blocks show their full output; toggled with pi's expand key. */
   private toolsExpanded = false;
+  private elapsedTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private tui: TUI,
@@ -282,8 +299,11 @@ export class ConversationViewer implements Component, Focusable {
       if (this.fullscreen && !this.scrollView.isFollowingEnd && event.type === "message_start" && ["user", "assistant", "toolResult", "bashExecution"].includes(event.message.role)) {
         this.newMessages++;
       }
+      if (event.type === "tool_execution_start") this.ensureElapsedTimer();
+      if (event.type === "tool_execution_end") this.syncElapsedTimer();
       this.tui.requestRender();
     });
+    this.syncElapsedTimer();
   }
 
   handleInput(data: string): void {
@@ -735,6 +755,7 @@ export class ConversationViewer implements Component, Focusable {
 
   dispose(): void {
     this.closed = true;
+    this.clearElapsedTimer();
     this.scrollView.setScrollbar("hidden"); // clears Pi's auto-hide timer
     if (this.unsubscribe) {
       this.unsubscribe();
@@ -743,6 +764,49 @@ export class ConversationViewer implements Component, Focusable {
   }
 
   // ---- Private ----
+
+  private isAnyToolCallActive(): boolean {
+    return this.record.status === "running" && (this.activity?.activeToolCalls.size ?? 0) > 0;
+  }
+
+  private ensureElapsedTimer(): void {
+    if (this.elapsedTimer || !this.isAnyToolCallActive()) return;
+    this.elapsedTimer = setInterval(() => {
+      if (this.closed || !this.isAnyToolCallActive()) {
+        this.clearElapsedTimer();
+        return;
+      }
+      this.tui.requestRender();
+    }, 100);
+  }
+
+  private clearElapsedTimer(): void {
+    if (!this.elapsedTimer) return;
+    clearInterval(this.elapsedTimer);
+    this.elapsedTimer = undefined;
+  }
+
+  private syncElapsedTimer(): void {
+    if (this.isAnyToolCallActive()) this.ensureElapsedTimer();
+    else this.clearElapsedTimer();
+  }
+
+  private activeToolCall(id: string): ActiveToolCall | undefined {
+    return this.record.status === "running" ? this.activity?.activeToolCalls.get(id) : undefined;
+  }
+
+  private activeHeader(call: ActiveToolCall, width: number): string {
+    const args = objectRecord(call.args);
+    const timeout = call.toolName === "bash"
+      ? typeof args?.timeout === "number" ? `timeout ${args.timeout}s` : "no timeout"
+      : undefined;
+    const parts = [
+      stripTerminalSequences(call.toolName),
+      formatMs(Math.max(0, Date.now() - call.startedAt)),
+      timeout,
+    ].filter((part): part is string => !!part);
+    return truncateToWidth(this.theme.fg("muted", `  [Tool: ${parts.join(" · ")}]`), width);
+  }
 
   private viewportHeight(): number {
     if (this.fullscreen) return Math.max(0, this.tui.terminal.rows - this.chromeLines());
@@ -817,8 +881,10 @@ export class ConversationViewer implements Component, Focusable {
             : this.markdownLines(msg, text, width, false)));
         }
         for (const call of toolCalls) {
+          const active = results.has(call.id) ? undefined : this.activeToolCall(call.id);
+          if (active) lines.push(this.activeHeader(active, width));
           if (!this.toolRendering) {
-            lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${call.name}]`), width));
+            if (!active) lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${call.name}]`), width));
             continue;
           }
           foldedCalls.add(call.id);
@@ -827,7 +893,7 @@ export class ConversationViewer implements Component, Focusable {
           const notRun = msg.stopReason === "aborted" ? "Operation aborted"
             : msg.stopReason === "error" ? msg.errorMessage || "Error"
             : undefined;
-          lines.push(...this.toolBlockLines(call, results.get(call.id), notRun, width));
+          lines.push(...this.toolBlockLines(call, results.get(call.id), notRun, width, active));
         }
       } else if (msg.role === "toolResult") {
         // Rendered under its call above. A result whose call is not in the
@@ -882,7 +948,7 @@ export class ConversationViewer implements Component, Focusable {
    * generic `name key=value` header plus a bounded preview that the expand key
    * unfolds.
    */
-  private toolBlockLines(call: ToolCallPart, result: ToolResultPart | undefined, notRun: string | undefined, width: number): string[] {
+  private toolBlockLines(call: ToolCallPart, result: ToolResultPart | undefined, notRun: string | undefined, width: number, active?: ActiveToolCall): string[] {
     let block = this.toolBlocks.get(call.id);
     let changed = false;
     if (!block) {
@@ -908,6 +974,11 @@ export class ConversationViewer implements Component, Focusable {
       if (notRun && !result) component.updateResult({ content: [{ type: "text", text: notRun }], isError: true });
       block = { component };
       this.toolBlocks.set(call.id, block);
+      changed = true;
+    }
+    if (!result && active?.partialResult !== undefined && block.partial !== active.partialResult) {
+      block.partial = active.partialResult;
+      block.component.updateResult({ ...partialToolResult(active.partialResult), isError: false }, true);
       changed = true;
     }
     if (result && block.result !== result) {

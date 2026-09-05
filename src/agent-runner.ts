@@ -491,11 +491,12 @@ export function resolveDefaultModel(
   return parentModel;
 }
 
-/** Info about a tool event in the subagent. */
-export interface ToolActivity {
-  type: "start" | "end";
-  toolName: string;
-}
+/** Tool lifecycle data retained for live subagent surfaces. */
+export type ToolActivity =
+  | { type: "start"; toolCallId: string; toolName: string; args: unknown }
+  | { type: "update"; toolCallId: string; toolName: string; args: unknown; partialResult: unknown }
+  | { type: "end"; toolCallId: string; toolName: string }
+  | { type: "end"; toolCallId?: undefined; toolName: string };
 
 export interface RunOptions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
@@ -737,10 +738,24 @@ function observeRun(session: AgentSession, options: RunObserverOptions) {
       options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
     }
     if (event.type === "tool_execution_start") {
-      options.onToolActivity?.({ type: "start", toolName: event.toolName });
+      options.onToolActivity?.({
+        type: "start",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        args: event.args,
+      });
+    }
+    if (event.type === "tool_execution_update") {
+      options.onToolActivity?.({
+        type: "update",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        args: event.args,
+        partialResult: event.partialResult,
+      });
     }
     if (event.type === "tool_execution_end") {
-      options.onToolActivity?.({ type: "end", toolName: event.toolName });
+      options.onToolActivity?.({ type: "end", toolCallId: event.toolCallId, toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
       const u = (event.message as any).usage;

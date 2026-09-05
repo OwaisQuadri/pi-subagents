@@ -440,6 +440,7 @@ export const isNumericSettingKey = (id: string): id is NumericSettingKey => Obje
  * `test/settings-defaults.test.ts` checks it against a boot with no files.
  */
 export const SETTING_DEFAULTS: { readonly [K in keyof Required<SubagentsSettings>]: SubagentsSettings[K] } = {
+  agentOverrides: undefined,
   maxConcurrent: 10,
   maxConcurrentForeground: 0,
   maxConcurrentNested: 10,

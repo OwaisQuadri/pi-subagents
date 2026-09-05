@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Active tool calls in the conversation viewer now show what they are waiting on** ([#277](https://github.com/tintinweb/pi-subagents/issues/277)). Each call renders a bounded, terminal-sanitized argument summary, dynamically increasing elapsed time, Bash timeout status, and a live partial-output tail while it runs; `ctrl+o` toggles a larger bounded view. Concurrent calls are tracked by ID, and completed results retain their existing transcript display.
+
 ### Changed
 
 - The extension now loads from a single-file bundle (`dist/index.js`, built by
