@@ -205,6 +205,87 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
 
     expect(contentReads).toBe(0);
   });
+
+  it("reads one live partial result once per dirty frame", () => {
+    let contentReads = 0;
+    let text = "first";
+    const partialResult = {} as any;
+    Object.defineProperty(partialResult, "content", {
+      get: () => {
+        contentReads++;
+        return [{ type: "text", text }];
+      },
+    });
+    const session = makeSession(300);
+    session.messages.push({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "live", name: "bash", arguments: { command: "sleep 10" } }],
+    } as any);
+    const record = makeFleet({ running: 1 })[0];
+    const activity = {
+      activeTools: new Map([["live", "bash"]]),
+      activeToolCalls: new Map([["live", {
+        toolName: "bash",
+        args: { command: "sleep 10" },
+        startedAt: Date.now() - 1_000,
+        partialResult,
+      }]]),
+      toolUses: 1,
+      responseText: "",
+      turnCount: 1,
+    };
+    const viewer = new ConversationViewer(perfTui(), session, record, activity as any, perfTheme, () => {});
+    viewer.render(120);
+    contentReads = 0;
+    text = "second";
+    (viewer as any).contentDirty = true;
+
+    viewer.render(120);
+    viewer.dispose();
+
+    expect(contentReads).toBeLessThanOrEqual(1);
+  });
+
+  it("does not rescan transcript roles for each live event", () => {
+    let roleReads = 0;
+    const messages = Array.from({ length: 5_000 }, (_, i) => {
+      const message = { content: `message ${i}` } as any;
+      Object.defineProperty(message, "role", {
+        get: () => {
+          roleReads++;
+          return "user";
+        },
+      });
+      return message;
+    });
+    let listener = (_event: unknown) => {};
+    const session = {
+      ...makeSession(0),
+      messages,
+      subscribe: (callback: (event: unknown) => void) => {
+        listener = callback;
+        return () => {};
+      },
+    } as any;
+    const viewer = new ConversationViewer(
+      perfTui(), session, makeFleet({ running: 1 })[0], undefined, perfTheme, () => {},
+    );
+    roleReads = 0;
+
+    listener({ type: "tool_execution_start", toolCallId: "live", toolName: "bash", args: {} });
+    for (let i = 0; i < 10; i++) {
+      listener({
+        type: "tool_execution_update",
+        toolCallId: "live",
+        toolName: "bash",
+        args: {},
+        partialResult: { content: [{ type: "text", text: `chunk ${i}` }] },
+      });
+    }
+    viewer.dispose();
+
+    expect(roleReads).toBeLessThanOrEqual(1);
+  });
 });
 
 describe("AgentWidget — one frame does not rescan per agent", () => {

@@ -477,6 +477,17 @@ describe("ConversationViewer", () => {
       expect(out).not.toContain("[Result]");
     });
 
+    it("bounds retained starts that never receive an end event", () => {
+      const session = mockSession([{ role: "user", content: "start" }]);
+      const viewer = new ConversationViewer(mockTui(200, 120), session, mockRecord(), undefined, ansiTheme(), vi.fn());
+      const listener = session.subscribe.mock.calls[0][0];
+      for (let i = 0; i < 500; i++) {
+        listener({ type: "tool_execution_start", toolCallId: `call-${i}`, toolName: "bash", args: { command: "sleep" } });
+      }
+
+      expect((viewer as any).toolExecutions.size).toBeLessThanOrEqual(64);
+    });
+
     it("retains a start event that arrives before its transcript call", () => {
       const messages: any[] = [{ role: "user", content: "start" }];
       const session = mockSession(messages);
@@ -505,6 +516,18 @@ describe("ConversationViewer", () => {
 
       expect(out).toContain("STEERING MESSAGE");
       expect(out).toContain("NEW ASSISTANT TEXT");
+    });
+
+    it("pairs a result that appears before its tool call without duplicating it", () => {
+      const messages = [
+        { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "UNIQUE RESULT" }] },
+        { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "one" } }] },
+      ];
+      const out = strip(viewerForTools(messages).viewer.render(120).join("\n"));
+
+      expect(out.match(/UNIQUE RESULT/g)).toHaveLength(1);
+      expect(out).not.toContain("[Result]");
+      expect(out.indexOf("$ one")).toBeLessThan(out.indexOf("UNIQUE RESULT"));
     });
 
     it("pairs final results by toolCallId despite parallel completion order and reopens them", () => {
@@ -633,6 +656,18 @@ describe("ConversationViewer", () => {
       expect(content).not.toContain("ctrl+o");
     });
 
+    it("keeps the newest tail after tab expansion", () => {
+      const output = Array.from({ length: 4_000 }, (_, i) => `\t\t\tline ${i}`).join("\n");
+      const messages = [
+        { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "stream" } }] },
+        { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: output }] },
+      ];
+      const content = strip(((viewerForTools(messages).viewer as any).buildContentLines(116) as string[]).join("\n"));
+
+      expect(content).toContain("line 3999");
+      expect(content).not.toContain("line 3109");
+    });
+
     it("uses an unknown omission label after tail slicing", () => {
       const output = Array.from({ length: 4_000 }, (_, i) => `line ${i}`).join("\n");
       const messages = [
@@ -687,6 +722,7 @@ describe("ConversationViewer", () => {
         ...Array.from({ length: 30 }, (_, i) => ({ role: "user", content: `before ${i}` })),
         { role: "assistant", content: [{ type: "toolCall", id: "anchored", name: "bash", arguments: { command: "anchor" } }] },
         { role: "toolResult", toolCallId: "anchored", content: [{ type: "text", text: output }] },
+        ...Array.from({ length: 100 }, (_, i) => ({ role: "user", content: `after ${i}` })),
       ];
       const { viewer } = viewerForTools(messages);
       viewer.render(120);
@@ -697,6 +733,40 @@ describe("ConversationViewer", () => {
       viewer.handleInput("\x0f");
       const expanded = (viewer as any).buildContentLines(116) as string[];
       expect(strip(expanded[(viewer as any).scrollOffset + 1])).toContain("[Tool: bash]");
+
+      viewer.handleInput("\x0f");
+      const compact = (viewer as any).buildContentLines(116) as string[];
+      expect(strip(compact[(viewer as any).scrollOffset + 1])).toContain("[Tool: bash]");
+      expect((viewer as any).scrollOffset).toBeLessThanOrEqual(Math.max(0, compact.length - (viewer as any).viewportHeight()));
+    });
+
+    it("keeps the viewed occurrence when identifiers repeat", () => {
+      const output = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
+      const messages = [
+        ...Array.from({ length: 20 }, (_, i) => ({ role: "user", content: `before ${i}` })),
+        { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "first" } }] },
+        { role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: output }] },
+        ...Array.from({ length: 20 }, (_, i) => ({ role: "user", content: `middle ${i}` })),
+        { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "second" } }] },
+        { role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: output }] },
+        ...Array.from({ length: 100 }, (_, i) => ({ role: "user", content: `after ${i}` })),
+      ];
+      const { viewer } = viewerForTools(messages);
+      viewer.render(120);
+      const content = (viewer as any).buildContentLines(116) as string[];
+      const toolLines = content.flatMap((line, index) => strip(line).includes("[Tool: bash]") ? [index] : []);
+      (viewer as any).scrollOffset = toolLines[1] - 1;
+      (viewer as any).autoScroll = false;
+
+      viewer.handleInput("\x0f");
+      let toggled = (viewer as any).buildContentLines(116) as string[];
+      expect(strip(toggled[(viewer as any).scrollOffset + 1])).toContain("[Tool: bash]");
+      expect(strip(toggled[(viewer as any).scrollOffset + 2])).toContain("$ second");
+
+      viewer.handleInput("\x0f");
+      toggled = (viewer as any).buildContentLines(116) as string[];
+      expect(strip(toggled[(viewer as any).scrollOffset + 1])).toContain("[Tool: bash]");
+      expect(strip(toggled[(viewer as any).scrollOffset + 2])).toContain("$ second");
     });
   });
 

@@ -43,11 +43,12 @@ const TOOL_EXECUTION_MAX_RETAINED = 64;
 type ToolCall = { id?: string; name: string; args: unknown };
 type ToolOutput = { text: string; omitted: boolean };
 type ToolResultMessage = Extract<AgentSession["messages"][number], { role: "toolResult" }>;
-type ToolRange = { id: string; start: number; end: number };
+type ToolRange = { id: string; occurrence: number; start: number; end: number };
 type ToolHeader = { id: string; occurrence: number; index: number; name: string; args: unknown; isError: boolean; isRunning: boolean };
 type ToolRenderContext = {
   lines: string[];
   finalResults: Map<string, ToolResultMessage[]>;
+  activeOutputs: Map<string, ToolOutput>;
   callOccurrences: Map<string, number>;
   ranges: ToolRange[];
   headers: ToolHeader[];
@@ -293,7 +294,9 @@ function toolOutputLines(output: ToolOutput, expanded: boolean, width: number, t
   const lines: string[] = [];
   const text = output.text.trimEnd();
   if (text) {
-    const capped = capResult(text);
+    const capped = text.length <= RESULT_MAX_CHARS
+      ? { text, elided: 0 }
+      : { text: text.slice(-RESULT_MAX_CHARS), elided: text.length - RESULT_MAX_CHARS };
     const lineLimit = expanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
     const preview = truncateToVisualLines(capped.text, lineLimit, Math.max(1, width - 4));
     if (output.omitted || capped.elided || preview.skippedCount > 0) {
@@ -378,6 +381,8 @@ export class ConversationViewer implements Component {
     expanded: boolean;
     lines: string[];
   }>();
+  private readonly finalToolResultCounts = new Map<string, number>();
+  private finalToolResultMessageCount = 0;
 
   constructor(
     private tui: TUI,
@@ -431,6 +436,7 @@ export class ConversationViewer implements Component {
           args: event.args,
           startedAt: Date.now(),
         });
+        this.pruneCompletedToolExecutions();
         this.ensureElapsedTimer();
       }
       if (event.type === "tool_execution_update") {
@@ -469,6 +475,7 @@ export class ConversationViewer implements Component {
       }
       this.tui.requestRender();
     });
+    this.syncFinalToolResultCounts();
     this.syncElapsedTimer();
   }
 
@@ -533,8 +540,11 @@ export class ConversationViewer implements Component {
       this.contentDirty = true;
       if (anchor) {
         const after = this.buildContentFrame(this.lastInnerW);
-        const next = after.toolRanges.find(range => range.id === anchor.id);
-        if (next) this.scrollOffset = Math.max(0, next.start - screenOffset);
+        const next = after.toolRanges.find(range => range.id === anchor.id && range.occurrence === anchor.occurrence);
+        if (next) {
+          const maxScroll = Math.max(0, after.lines.length - this.viewportHeight());
+          this.scrollOffset = Math.min(maxScroll, Math.max(0, next.start - screenOffset));
+        }
       }
       this.tui.requestRender();
       return;
@@ -820,9 +830,11 @@ export class ConversationViewer implements Component {
 
   private pruneCompletedToolExecutions(): void {
     while (this.toolExecutions.size > TOOL_EXECUTION_MAX_RETAINED) {
-      const completed = [...this.toolExecutions].find(([, execution]) => execution.result !== undefined);
-      if (!completed) return;
-      this.toolExecutions.delete(completed[0]);
+      const entries = [...this.toolExecutions];
+      const evicted = entries.find(([, execution]) => execution.result !== undefined)
+        ?? entries.find(([id]) => !this.activity?.activeToolCalls.has(id))
+        ?? entries[0];
+      this.toolExecutions.delete(evicted[0]);
     }
   }
 
@@ -849,11 +861,17 @@ export class ConversationViewer implements Component {
   }
 
   private finalToolResultCount(id: string): number {
-    let count = 0;
-    for (const message of this.session.messages) {
-      if (message.role === "toolResult" && message.toolCallId === id) count++;
+    this.syncFinalToolResultCounts();
+    return this.finalToolResultCounts.get(id) ?? 0;
+  }
+
+  private syncFinalToolResultCounts(): void {
+    for (; this.finalToolResultMessageCount < this.session.messages.length; this.finalToolResultMessageCount++) {
+      const message = this.session.messages[this.finalToolResultMessageCount];
+      if (message.role === "toolResult" && message.toolCallId) {
+        this.finalToolResultCounts.set(message.toolCallId, (this.finalToolResultCounts.get(message.toolCallId) ?? 0) + 1);
+      }
     }
-    return count;
   }
 
   private activeHeader(call: ActiveToolCall, width: number): string {
@@ -908,7 +926,7 @@ export class ConversationViewer implements Component {
         : execution?.partialResult !== undefined
           ? execution.partialResult
           : active
-            ? this.partialText(active)
+            ? context.activeOutputs.get(id) ?? this.partialText(active)
             : { text: "", omitted: false };
     const isError = result?.isError === true || execution?.isError === true;
     if (output.text.trimEnd() || output.omitted) this.isToolOutputAvailable = true;
@@ -922,7 +940,7 @@ export class ConversationViewer implements Component {
     context.headers.push({ id, occurrence, index: context.lines.length - 1, name: toolName, args: toolArgs, isError, isRunning });
     context.lines.push(...toolArgumentLines(toolName, toolArgs, context.width, this.theme));
     context.lines.push(...this.cachedToolOutputLines(output, context.width));
-    context.ranges.push({ id, start, end: context.lines.length });
+    context.ranges.push({ id, occurrence, start, end: context.lines.length });
     if (result) {
       context.consumedResults.add(result);
       if (this.toolExecutions.get(id) === execution) this.toolExecutions.delete(id);
@@ -935,7 +953,7 @@ export class ConversationViewer implements Component {
 
   private buildContentFrame(width: number): {
     lines: string[];
-    toolRanges: Array<{ id: string; start: number; end: number }>;
+    toolRanges: ToolRange[];
   } {
     if (width <= 0) return { lines: [], toolRanges: [] };
 
@@ -944,9 +962,13 @@ export class ConversationViewer implements Component {
     const messages = this.session.messages;
     const activeToolCallCount = this.activity?.activeToolCalls.size ?? 0;
     const cache = this.activeToolFrameCache;
+    const activeOutputs = new Map<string, ToolOutput>();
     const activeStateSignature = this.contentDirty
-      ? [...(this.activity?.activeToolCalls ?? new Map<string, ActiveToolCall>())].map(([id, call]) =>
-        `${id}:${call.toolName}:${String(call.args)}:${partialResultText(call.partialResult).text}`).join("\u0000")
+      ? [...(this.activity?.activeToolCalls ?? new Map<string, ActiveToolCall>())].map(([id, call]) => {
+        const output = this.partialText(call);
+        activeOutputs.set(id, output);
+        return `${id}:${call.toolName}:${String(call.args)}:${output.text}:${output.omitted}`;
+      }).join("\u0000")
       : cache?.activeStateSignature;
     if (this.hasActiveToolCalls() && cache?.width === width && cache.mode === mode
       && cache.status === this.record.status && cache.activeToolCallCount === activeToolCallCount
@@ -972,6 +994,17 @@ export class ConversationViewer implements Component {
 
     this.isToolOutputAvailable = false;
     const finalResults = indexFinalToolResults(messages);
+    const pairedResults = new Set<ToolResultMessage>();
+    const callCounts = new Map<string, number>();
+    for (const message of messages) {
+      if (message.role !== "assistant") continue;
+      for (const call of parseToolCalls(message.content)) {
+        if (call.id) callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
+      }
+    }
+    for (const [id, count] of callCounts) {
+      for (const result of finalResults.get(id)?.slice(0, count) ?? []) pairedResults.add(result);
+    }
 
     const lines: string[] = [];
     const toolRanges: ToolRange[] = [];
@@ -979,10 +1012,11 @@ export class ConversationViewer implements Component {
     const toolContext: ToolRenderContext = {
       lines,
       finalResults,
+      activeOutputs,
       callOccurrences: new Map(),
       ranges: toolRanges,
       headers: toolHeaders,
-      consumedResults: new Set(),
+      consumedResults: pairedResults,
       width,
     };
     let needsSeparator = false;
