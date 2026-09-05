@@ -142,6 +142,69 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
     expect(dirtySmall.messageReads).toBeLessThanOrEqual(2);
     expect(dirtyLarge.messageReads).toBe(dirtySmall.messageReads);
   });
+
+  it("does not reread completed results during a live output update", () => {
+    let contentReads = 0;
+    const messages: any[] = [];
+    for (let i = 0; i < 60; i++) {
+      messages.push({
+        role: "assistant",
+        content: [{ type: "toolCall", id: `done-${i}`, name: "bash", arguments: { command: "true" } }],
+      });
+      const content = [{ type: "text", text: `completed ${i}\n`.repeat(20) }];
+      const result = { role: "toolResult", toolCallId: `done-${i}` } as any;
+      Object.defineProperty(result, "content", {
+        enumerable: true,
+        get: () => {
+          contentReads++;
+          return content;
+        },
+      });
+      messages.push(result);
+    }
+    messages.push({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "live", name: "bash", arguments: { command: "sleep 10" } }],
+    });
+    let listener = (_event: unknown) => {};
+    const session = {
+      ...makeSession(0),
+      messages,
+      subscribe: (callback: (event: unknown) => void) => {
+        listener = callback;
+        return () => {};
+      },
+    } as any;
+    const record = makeFleet({ running: 1 })[0];
+    const activity = {
+      activeTools: new Map([["live", "bash"]]),
+      activeToolCalls: new Map([["live", {
+        toolName: "bash",
+        args: { command: "sleep 10" },
+        startedAt: Date.now() - 1_000,
+        partialResult: { content: [{ type: "text", text: "first" }] },
+      }]]),
+      toolUses: 61,
+      responseText: "",
+      turnCount: 1,
+    };
+    const viewer = new ConversationViewer(perfTui(), session, record, activity as any, perfTheme, () => {});
+    listener({ type: "tool_execution_start", toolCallId: "live", toolName: "bash", args: { command: "sleep 10" } });
+    viewer.render(120);
+    contentReads = 0;
+
+    listener({
+      type: "tool_execution_update",
+      toolCallId: "live",
+      toolName: "bash",
+      args: { command: "sleep 10" },
+      partialResult: { content: [{ type: "text", text: "first\nsecond" }] },
+    });
+    viewer.render(120);
+    viewer.dispose();
+
+    expect(contentReads).toBe(0);
+  });
 });
 
 describe("AgentWidget — one frame does not rescan per agent", () => {

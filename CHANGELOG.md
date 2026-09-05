@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Active tool calls in the conversation viewer now show what they are waiting on** ([#277](https://github.com/tintinweb/pi-subagents/issues/277)). Each call renders a bounded, terminal-sanitized argument summary, dynamically increasing elapsed time, Bash timeout status, and a live partial-output tail while it runs; `ctrl+o` toggles a larger bounded view. Concurrent calls are tracked by ID, and completed results retain their existing transcript display.
+- **Tool calls keep their live and final output in one durable conversation-viewer block** ([#277](https://github.com/tintinweb/pi-subagents/issues/277)). Each call renders bounded, terminal-sanitized arguments and output under one indent. Results pair by tool-call identifier when parallel calls complete out of order or when a user reopens history. Compact blocks show an omission line, three visual output lines, and a separate expansion hint. `ctrl+o` toggles every block and keeps bottom-follow on the newest output. After a manual scroll, the viewer keeps the inspected call in place.
 
 ### Changed
 

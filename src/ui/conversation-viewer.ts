@@ -5,7 +5,7 @@
  * Subscribes to session events for real-time streaming updates.
  */
 
-import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, getMarkdownTheme, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
@@ -34,12 +34,26 @@ export const VIEWPORT_HEIGHT_PCT = 70;
  */
 export const RESULT_MAX_CHARS = 16_000;
 const TOOL_ARGUMENT_MAX_CHARS = 240;
-const TOOL_OUTPUT_TAIL_LINES = 4;
+const TOOL_OUTPUT_TAIL_LINES = 3;
 const TOOL_OUTPUT_EXPANDED_LINES = 40;
-const TOOL_OUTPUT_TAIL_CHARS = 2_000;
-const TOOL_OUTPUT_EXPANDED_CHARS = 8_000;
 const TOOL_OUTPUT_RAW_MAX_CHARS = 16_000;
 const TOOL_OUTPUT_MAX_BLOCKS = 64;
+const TOOL_EXECUTION_MAX_RETAINED = 64;
+
+type ToolCall = { id?: string; name: string; args: unknown };
+type ToolOutput = { text: string; omitted: boolean };
+type ToolResultMessage = Extract<AgentSession["messages"][number], { role: "toolResult" }>;
+type ToolRange = { id: string; start: number; end: number };
+type ToolHeader = { id: string; occurrence: number; index: number; name: string; args: unknown; isError: boolean; isRunning: boolean };
+type ToolRenderContext = {
+  lines: string[];
+  finalResults: Map<string, ToolResultMessage[]>;
+  callOccurrences: Map<string, number>;
+  ranges: ToolRange[];
+  headers: ToolHeader[];
+  consumedResults: Set<ToolResultMessage>;
+  width: number;
+};
 
 /** Cycle order for the viewer's `m` key. */
 const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
@@ -196,7 +210,7 @@ function fallbackArguments(args: unknown): string {
   return boundedLine(`{${parts.join(",")}${entries.length > parts.length ? ",…" : ""}}`);
 }
 
-function partialResultText(result: unknown): { text: string; omitted: boolean } {
+function partialResultText(result: unknown): ToolOutput {
   const content = typeof result === "string" ? [result] : objectRecord(result)?.content;
   if (!Array.isArray(content)) return { text: "", omitted: false };
 
@@ -233,20 +247,67 @@ function partialResultText(result: unknown): { text: string; omitted: boolean } 
   };
 }
 
-function outputTail(text: string, expanded: boolean, width: number): { lines: string[]; omittedLines: number; omittedChars: number } {
-  const normalized = text;
-  const source = normalized.split("\n");
-  const lineLimit = expanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
-  const modeCharLimit = expanded ? TOOL_OUTPUT_EXPANDED_CHARS : TOOL_OUTPUT_TAIL_CHARS;
-  const charLimit = Math.min(modeCharLimit, width * lineLimit);
-  const lineBounded = source.slice(-lineLimit).join("\n");
-  const tail = lineBounded.slice(-charLimit);
-  const lines = tail.split("\n");
-  return {
-    lines,
-    omittedLines: source.length - lines.length,
-    omittedChars: normalized.length - tail.length,
-  };
+function indexFinalToolResults(messages: AgentSession["messages"]): Map<string, ToolResultMessage[]> {
+  const results = new Map<string, ToolResultMessage[]>();
+  for (const message of messages) {
+    if (message.role === "toolResult" && message.toolCallId) {
+      const calls = results.get(message.toolCallId);
+      if (calls) calls.push(message);
+      else results.set(message.toolCallId, [message]);
+    }
+  }
+  return results;
+}
+
+function parseToolCalls(content: Extract<AgentSession["messages"][number], { role: "assistant" }> ["content"]): ToolCall[] {
+  const calls: ToolCall[] = [];
+  for (const block of content) {
+    if (block.type !== "toolCall") continue;
+    const tool = block as unknown as {
+      id?: string; toolCallId?: string; toolUseId?: string; name?: string; toolName?: string; arguments?: unknown; input?: unknown;
+    };
+    calls.push({
+      id: tool.id ?? tool.toolCallId ?? tool.toolUseId,
+      name: tool.name ?? tool.toolName ?? "unknown",
+      args: tool.arguments ?? tool.input,
+    });
+  }
+  return calls;
+}
+
+function toolArgumentLines(toolName: string, args: unknown, width: number, theme: Theme): string[] {
+  const record = objectRecord(args);
+  if (toolName === "bash" && record?.command !== undefined) {
+    return [truncateToWidth(`  $ ${boundedLine(record.command)}`, width)];
+  }
+  if (record) {
+    const primary = ["path", "query", "pattern"].flatMap(key =>
+      record[key] === undefined ? [] : [`${key}: ${boundedLine(record[key])}`]);
+    return (primary.length > 0 ? primary : [fallbackArguments(args)])
+      .map(summary => truncateToWidth(theme.fg("dim", `  ${summary}`), width));
+  }
+  return args === undefined ? [] : [truncateToWidth(theme.fg("dim", `  ${fallbackArguments(args)}`), width)];
+}
+
+function toolOutputLines(output: ToolOutput, expanded: boolean, width: number, theme: Theme): string[] {
+  const lines: string[] = [];
+  const text = output.text.trimEnd();
+  if (text) {
+    const capped = capResult(text);
+    const lineLimit = expanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
+    const preview = truncateToVisualLines(capped.text, lineLimit, Math.max(1, width - 4));
+    if (output.omitted || capped.elided || preview.skippedCount > 0) {
+      const omitted = !output.omitted && preview.skippedCount > 0
+        ? `${preview.skippedCount} earlier line${preview.skippedCount === 1 ? "" : "s"}`
+        : "earlier output";
+      lines.push(theme.fg("dim", `    ... ${omitted}`));
+    }
+    lines.push(...preview.visualLines.map(line => truncateToWidth(`    ${theme.fg("dim", line)}`, width)));
+  } else if (output.omitted) {
+    lines.push(theme.fg("dim", "    ... earlier output"));
+  }
+  if (text || output.omitted) lines.push(theme.fg("dim", `    ctrl+o to ${expanded ? "collapse" : "expand"}`));
+  return lines;
 }
 
 export class ConversationViewer implements Component {
@@ -265,18 +326,33 @@ export class ConversationViewer implements Component {
   /** Set by the `m` key. Wins over the setting so `m` works without a persist hook. */
   private markdownModeOverride: ViewerMarkdownMode | undefined;
   private activeOutputExpanded = false;
+  private isToolOutputAvailable = false;
+  private readonly toolExecutions = new Map<string, {
+    occurrence: number;
+    toolName: string;
+    args: unknown;
+    startedAt: number;
+    partialResult?: ToolOutput;
+    result?: ToolOutput;
+    isError?: boolean;
+  }>();
   private elapsedTimer: ReturnType<typeof setInterval> | undefined;
   private contentDirty = true;
-  private activeFrameCache: {
+  private stateRevision = 0;
+  private activeToolFrameCache: {
     width: number;
     mode: ViewerMarkdownMode;
     status: AgentRecord["status"];
     lines: string[];
-    headers: Array<{ index: number; id: string; call: ActiveToolCall }>;
-    staticMessageCount: number;
-    staticLineCount: number;
-    staticNeedsSeparator: boolean;
-    staticLastMessage?: object;
+    toolRanges: ToolRange[];
+    headers: ToolHeader[];
+    activeToolCallCount: number;
+    executionCount: number;
+    messages: AgentSession["messages"];
+    messageCount: number;
+    stateRevision: number;
+    expanded: boolean;
+    activeStateSignature: string;
   } | undefined;
   /**
    * One `Markdown` per message, so its own text/width cache does the work. A
@@ -294,7 +370,13 @@ export class ConversationViewer implements Component {
   private readonly rawLineCache = new WeakMap<object, { text: string; width: number; dim: boolean; lines: string[] }>();
   private readonly partialResultCache = new WeakMap<ActiveToolCall, {
     source: unknown;
-    value: { text: string; omitted: boolean };
+    value: ToolOutput;
+  }>();
+  private readonly finalToolResultCache = new WeakMap<ToolResultMessage, ToolOutput>();
+  private readonly toolOutputLineCache = new WeakMap<ToolOutput, {
+    width: number;
+    expanded: boolean;
+    lines: string[];
   }>();
 
   constructor(
@@ -330,11 +412,61 @@ export class ConversationViewer implements Component {
   ) {
     this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
+    this.isToolOutputAvailable = session.messages.some(message => {
+      if (message.role !== "toolResult") return false;
+      const output = partialResultText(message);
+      return !!output.text.trimEnd() || output.omitted;
+    }) || [...(activity?.activeToolCalls.values() ?? [])].some(call => {
+      const output = partialResultText(call.partialResult);
+      return !!output.text.trimEnd() || output.omitted;
+    });
     this.unsubscribe = session.subscribe((event) => {
       if (this.closed) return;
       this.contentDirty = true;
-      if (event.type === "tool_execution_start") this.ensureElapsedTimer();
-      if (event.type === "tool_execution_end") this.syncElapsedTimer();
+      this.stateRevision++;
+      if (event.type === "tool_execution_start") {
+        this.toolExecutions.set(event.toolCallId, {
+          occurrence: this.finalToolResultCount(event.toolCallId),
+          toolName: event.toolName,
+          args: event.args,
+          startedAt: Date.now(),
+        });
+        this.ensureElapsedTimer();
+      }
+      if (event.type === "tool_execution_update") {
+        const occurrence = this.finalToolResultCount(event.toolCallId);
+        const execution = this.toolExecutions.get(event.toolCallId);
+        if (execution?.occurrence === occurrence) {
+          execution.toolName = event.toolName;
+          execution.args = event.args;
+          execution.partialResult = partialResultText(event.partialResult);
+        } else {
+          this.toolExecutions.set(event.toolCallId, {
+            occurrence,
+            toolName: event.toolName,
+            args: event.args,
+            startedAt: Date.now(),
+            partialResult: partialResultText(event.partialResult),
+          });
+        }
+      }
+      if (event.type === "tool_execution_end") {
+        const occurrence = this.finalToolResultCount(event.toolCallId);
+        const execution = this.toolExecutions.get(event.toolCallId);
+        if (execution?.occurrence === occurrence) {
+          execution.result = partialResultText(event.result);
+          execution.isError = event.isError;
+        } else this.toolExecutions.set(event.toolCallId, {
+          occurrence,
+          toolName: event.toolName,
+          args: undefined,
+          startedAt: Date.now(),
+          result: partialResultText(event.result),
+          isError: event.isError,
+        });
+        this.pruneCompletedToolExecutions();
+        this.syncElapsedTimer();
+      }
       this.tui.requestRender();
     });
     this.syncElapsedTimer();
@@ -391,10 +523,19 @@ export class ConversationViewer implements Component {
       this.tui.requestRender();
       return;
     }
-    if (matchesKey(data, "ctrl+o") && this.hasActiveToolCalls()) {
+    if (matchesKey(data, "ctrl+o") && this.isToolOutputAvailable) {
       this.stopArmed = false;
+      const before = this.buildContentFrame(this.lastInnerW);
+      const anchor = before.toolRanges.find(range => range.start <= this.scrollOffset && this.scrollOffset < range.end)
+        ?? before.toolRanges.find(range => range.start >= this.scrollOffset);
+      const screenOffset = anchor ? anchor.start - this.scrollOffset : 0;
       this.activeOutputExpanded = !this.activeOutputExpanded;
       this.contentDirty = true;
+      if (anchor) {
+        const after = this.buildContentFrame(this.lastInnerW);
+        const next = after.toolRanges.find(range => range.id === anchor.id);
+        if (next) this.scrollOffset = Math.max(0, next.start - screenOffset);
+      }
       this.tui.requestRender();
       return;
     }
@@ -515,7 +656,7 @@ export class ConversationViewer implements Component {
       // at 80 columns with steer + stop present, and this group has no
       // degradation step below "drop the line-count readout".
       actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
-      if (this.hasActiveToolCalls()) {
+      if (this.isToolOutputAvailable) {
         actions.push(th.fg("dim", `ctrl+o ${this.activeOutputExpanded ? "compact" : "expand"}`));
       }
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
@@ -563,12 +704,28 @@ export class ConversationViewer implements Component {
     return lines;
   }
 
-  private partialText(call: ActiveToolCall): { text: string; omitted: boolean } {
+  private partialText(call: ActiveToolCall): ToolOutput {
     const cached = this.partialResultCache.get(call);
     if (!this.contentDirty && cached && cached.source === call.partialResult) return cached.value;
     const value = partialResultText(call.partialResult);
     this.partialResultCache.set(call, { source: call.partialResult, value });
     return value;
+  }
+
+  private finalToolResultText(result: ToolResultMessage): ToolOutput {
+    const cached = this.finalToolResultCache.get(result);
+    if (cached) return cached;
+    const output = partialResultText(result);
+    this.finalToolResultCache.set(result, output);
+    return output;
+  }
+
+  private cachedToolOutputLines(output: ToolOutput, width: number): string[] {
+    const cached = this.toolOutputLineCache.get(output);
+    if (cached && cached.width === width && cached.expanded === this.activeOutputExpanded) return cached.lines;
+    const lines = toolOutputLines(output, this.activeOutputExpanded, width, this.theme);
+    this.toolOutputLineCache.set(output, { width, expanded: this.activeOutputExpanded, lines });
+    return lines;
   }
 
   private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
@@ -658,7 +815,15 @@ export class ConversationViewer implements Component {
   // ---- Private ----
 
   private hasActiveToolCalls(): boolean {
-    return this.record.status === "running" && (this.activity?.activeToolCalls.size ?? 0) > 0;
+    return this.record.status === "running" && ((this.activity?.activeToolCalls.size ?? 0) > 0 || [...this.toolExecutions.values()].some(execution => execution.result === undefined));
+  }
+
+  private pruneCompletedToolExecutions(): void {
+    while (this.toolExecutions.size > TOOL_EXECUTION_MAX_RETAINED) {
+      const completed = [...this.toolExecutions].find(([, execution]) => execution.result !== undefined);
+      if (!completed) return;
+      this.toolExecutions.delete(completed[0]);
+    }
   }
 
   private ensureElapsedTimer(): void {
@@ -681,6 +846,14 @@ export class ConversationViewer implements Component {
   private syncElapsedTimer(): void {
     if (this.hasActiveToolCalls() && this.record.status === "running") this.ensureElapsedTimer();
     else this.clearElapsedTimer();
+  }
+
+  private finalToolResultCount(id: string): number {
+    let count = 0;
+    for (const message of this.session.messages) {
+      if (message.role === "toolResult" && message.toolCallId === id) count++;
+    }
+    return count;
   }
 
   private activeHeader(call: ActiveToolCall, width: number): string {
@@ -719,180 +892,170 @@ export class ConversationViewer implements Component {
     return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
   }
 
+  private renderToolBlock(id: string, name: string, args: unknown, context: ToolRenderContext): void {
+    const occurrence = context.callOccurrences.get(id) ?? 0;
+    context.callOccurrences.set(id, occurrence + 1);
+    const result = context.finalResults.get(id)?.[occurrence];
+    const active = result === undefined ? this.activity?.activeToolCalls.get(id) : undefined;
+    const candidate = this.toolExecutions.get(id);
+    const execution = candidate?.occurrence === occurrence ? candidate : undefined;
+    const toolName = execution?.toolName ?? active?.toolName ?? name;
+    const toolArgs = execution?.args ?? active?.args ?? args;
+    const output = result !== undefined
+      ? this.finalToolResultText(result)
+      : execution?.result !== undefined
+        ? execution.result
+        : execution?.partialResult !== undefined
+          ? execution.partialResult
+          : active
+            ? this.partialText(active)
+            : { text: "", omitted: false };
+    const isError = result?.isError === true || execution?.isError === true;
+    if (output.text.trimEnd() || output.omitted) this.isToolOutputAvailable = true;
+    const isRunning = result === undefined && execution?.result === undefined && this.record.status === "running";
+    const startedAt = execution?.startedAt ?? active?.startedAt;
+    const heading = isRunning && startedAt !== undefined
+      ? this.activeHeader({ toolName, args: toolArgs, startedAt }, context.width)
+      : truncateToWidth(this.theme.fg(isError ? "error" : "muted", `  [Tool: ${toolName}${isError ? " · error" : ""}]`), context.width);
+    const start = context.lines.length;
+    context.lines.push(heading);
+    context.headers.push({ id, occurrence, index: context.lines.length - 1, name: toolName, args: toolArgs, isError, isRunning });
+    context.lines.push(...toolArgumentLines(toolName, toolArgs, context.width, this.theme));
+    context.lines.push(...this.cachedToolOutputLines(output, context.width));
+    context.ranges.push({ id, start, end: context.lines.length });
+    if (result) {
+      context.consumedResults.add(result);
+      if (this.toolExecutions.get(id) === execution) this.toolExecutions.delete(id);
+    }
+  }
+
   private buildContentLines(width: number): string[] {
-    if (width <= 0) return [];
+    return this.buildContentFrame(width).lines;
+  }
+
+  private buildContentFrame(width: number): {
+    lines: string[];
+    toolRanges: Array<{ id: string; start: number; end: number }>;
+  } {
+    if (width <= 0) return { lines: [], toolRanges: [] };
 
     const th = this.theme;
-    const messages = this.session.messages;
-    if (messages.length === 0) return [th.fg("dim", "(waiting for first message...)")];
-
     const mode = this.markdownMode();
-    const cache = this.activeFrameCache;
-    const cacheMatches = this.hasActiveToolCalls()
-      && cache?.width === width
-      && cache.mode === mode
-      && cache.status === this.record.status
-      && cache.staticMessageCount <= messages.length
-      && (cache.staticMessageCount === 0 || messages[cache.staticMessageCount - 1] === cache.staticLastMessage);
-    if (cacheMatches && !this.contentDirty
-      && cache.headers.length === this.activity?.activeToolCalls.size
-      && cache.headers.every(header => this.activity?.activeToolCalls.get(header.id) === header.call)) {
-      for (const header of cache.headers) cache.lines[header.index] = this.activeHeader(header.call, width);
-      return cache.lines;
+    const messages = this.session.messages;
+    const activeToolCallCount = this.activity?.activeToolCalls.size ?? 0;
+    const cache = this.activeToolFrameCache;
+    const activeStateSignature = this.contentDirty
+      ? [...(this.activity?.activeToolCalls ?? new Map<string, ActiveToolCall>())].map(([id, call]) =>
+        `${id}:${call.toolName}:${String(call.args)}:${partialResultText(call.partialResult).text}`).join("\u0000")
+      : cache?.activeStateSignature;
+    if (this.hasActiveToolCalls() && cache?.width === width && cache.mode === mode
+      && cache.status === this.record.status && cache.activeToolCallCount === activeToolCallCount
+      && cache.executionCount === this.toolExecutions.size && cache.messages === messages
+      && cache.messageCount === messages.length && cache.stateRevision === this.stateRevision
+      && cache.expanded === this.activeOutputExpanded && cache.activeStateSignature === activeStateSignature) {
+      for (const header of cache.headers) {
+        const active = this.activity?.activeToolCalls.get(header.id);
+        const candidate = this.toolExecutions.get(header.id);
+        const execution = candidate?.occurrence === header.occurrence ? candidate : undefined;
+        const startedAt = execution?.startedAt ?? active?.startedAt;
+        cache.lines[header.index] = header.isRunning && this.record.status === "running" && startedAt !== undefined
+          ? this.activeHeader({ toolName: execution?.toolName ?? active?.toolName ?? header.name, args: execution?.args ?? active?.args ?? header.args, startedAt }, width)
+          : truncateToWidth(th.fg(header.isError ? "error" : "muted", `  [Tool: ${header.name}${header.isError ? " · error" : ""}]`), width);
+      }
+      return { lines: cache.lines, toolRanges: cache.toolRanges };
     }
 
-    const lines = cacheMatches ? cache.lines : [];
-    const startMessage = cacheMatches ? cache.staticMessageCount : 0;
-    if (cacheMatches) lines.length = cache.staticLineCount;
-    const activeHeaders: Array<{ index: number; id: string; call: ActiveToolCall }> = [];
-    let staticMessageCount = cacheMatches ? cache.staticMessageCount : 0;
-    let staticLineCount = cacheMatches ? cache.staticLineCount : 0;
-    let staticNeedsSeparator = cacheMatches ? cache.staticNeedsSeparator : false;
-    let staticLastMessage = cacheMatches ? cache.staticLastMessage : undefined;
-    let foundActivePrefix = cacheMatches;
-    let needsSeparator = cacheMatches ? cache.staticNeedsSeparator : false;
-    for (let messageIndex = startMessage; messageIndex < messages.length; messageIndex++) {
-      const msg = messages[messageIndex];
-      const messageStartLine = lines.length;
-      const separatorBeforeMessage = needsSeparator;
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
+    if (messages.length === 0) {
+      this.isToolOutputAvailable = false;
+      return { lines: [th.fg("dim", "(waiting for first message...)")], toolRanges: [] };
+    }
+
+    this.isToolOutputAvailable = false;
+    const finalResults = indexFinalToolResults(messages);
+
+    const lines: string[] = [];
+    const toolRanges: ToolRange[] = [];
+    const toolHeaders: ToolHeader[] = [];
+    const toolContext: ToolRenderContext = {
+      lines,
+      finalResults,
+      callOccurrences: new Map(),
+      ranges: toolRanges,
+      headers: toolHeaders,
+      consumedResults: new Set(),
+      width,
+    };
+    let needsSeparator = false;
+
+    for (const message of messages) {
+      if (message.role === "user") {
+        const text = typeof message.content === "string" ? message.content : extractText(message.content);
         if (!text.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
-        lines.push(...this.cachedRawLines(msg, text.trim(), width, false));
-      } else if (msg.role === "assistant") {
-        const textParts: string[] = [];
-        const toolCalls: Array<{ id?: string; name: string }> = [];
-        for (const c of msg.content) {
-          if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            const block = c as unknown as { id?: string; toolCallId?: string; toolUseId?: string; name?: string; toolName?: string };
-            toolCalls.push({
-              id: block.id ?? block.toolCallId ?? block.toolUseId,
-              name: block.name ?? block.toolName ?? "unknown",
-            });
-          }
-        }
+        lines.push(...this.cachedRawLines(message, text.trim(), width, false));
+        needsSeparator = true;
+      } else if (message.role === "assistant") {
+        const textParts = message.content.flatMap(content => content.type === "text" && content.text ? [content.text] : []);
+        const toolCalls = parseToolCalls(message.content);
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
           const text = textParts.join("\n").trim();
-          lines.push(...(mode === "off"
-            ? this.cachedRawLines(msg, text, width, false)
-            : this.markdownLines(msg, text, width, false)));
+          lines.push(...(mode === "off" ? this.cachedRawLines(message, text, width, false) : this.markdownLines(message, text, width, false)));
         }
         for (const toolCall of toolCalls) {
-          const active = this.record.status === "running" && toolCall.id
-            ? this.activity?.activeToolCalls.get(toolCall.id)
-            : undefined;
-          if (!active) {
-            lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${toolCall.name}]`), width));
-            continue;
-          }
-
-          if (!foundActivePrefix) {
-            staticMessageCount = messageIndex;
-            staticLineCount = messageStartLine;
-            staticNeedsSeparator = separatorBeforeMessage;
-            staticLastMessage = messageIndex > 0 ? messages[messageIndex - 1] : undefined;
-            foundActivePrefix = true;
-          }
-          lines.push(this.activeHeader(active, width));
-          activeHeaders.push({ index: lines.length - 1, id: toolCall.id!, call: active });
-
-          const args = objectRecord(active.args);
-          if (active.toolName === "bash") {
-            if (args?.command !== undefined) {
-              lines.push(truncateToWidth(`$ ${boundedLine(args.command)}`, width));
-            }
-          } else if (args) {
-            const primary = ["path", "query", "pattern"].flatMap(key =>
-              args[key] === undefined ? [] : [`${key}: ${boundedLine(args[key])}`]);
-            const summaries = primary.length > 0 ? primary : [fallbackArguments(active.args)];
-            for (const summary of summaries) {
-              lines.push(truncateToWidth(th.fg("dim", summary), width));
-            }
-          } else {
-            lines.push(truncateToWidth(th.fg("dim", fallbackArguments(active.args)), width));
-          }
-
-          const partial = this.partialText(active);
-          const partialText = partial.text.trimEnd();
-          if (partial.omitted && !partialText) {
-            const action = this.activeOutputExpanded ? "" : " (ctrl+o to expand)";
-            lines.push(th.fg("dim", `... earlier output${action}`));
-          }
-          if (partialText) {
-            const tail = outputTail(partialText, this.activeOutputExpanded, width);
-            const rendered = this.rawLines(tail.lines.join("\n"), width, true);
-            const displayLines = this.activeOutputExpanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
-            const omittedRenderedLines = Math.max(0, rendered.length - displayLines);
-            if (partial.omitted || omittedRenderedLines > 0) {
-              const action = this.activeOutputExpanded ? "" : " (ctrl+o to expand)";
-              lines.push(th.fg("dim", `... earlier output${action}`));
-            } else if (tail.omittedLines > 0) {
-              const action = this.activeOutputExpanded ? "" : " (ctrl+o to expand)";
-              lines.push(th.fg("dim", `... ${tail.omittedLines} earlier line${tail.omittedLines === 1 ? "" : "s"}${action}`));
-            } else if (tail.omittedChars > 0) {
-              lines.push(th.fg("dim", `... ${humanCount(tail.omittedChars)} earlier characters`));
-            }
-            lines.push(...rendered.slice(-displayLines));
-          }
+          if (toolCall.id) this.renderToolBlock(toolCall.id, toolCall.name, toolCall.args, toolContext);
+          else lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${toolCall.name}]`), width));
         }
-      } else if (msg.role === "toolResult") {
-        const { text, elided } = capResult(extractText(msg.content).trim());
+        needsSeparator = true;
+      } else if (message.role === "toolResult") {
+        if (toolContext.consumedResults.has(message)) continue;
+        const { text, elided } = capResult(extractText(message.content).trim());
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
-        lines.push(...(mode === "all"
-          ? this.markdownLines(msg, text, width, true)
-          : this.cachedRawLines(msg, text, width, true)));
+        lines.push(...(mode === "all" ? this.markdownLines(message, text, width, true) : this.cachedRawLines(message, text, width, true)));
         if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-      } else if ((msg as any).role === "bashExecution") {
-        const bash = msg as any;
+        needsSeparator = true;
+      } else if ((message as { role?: string }).role === "bashExecution") {
+        const bash = message as unknown as { command: string; output?: string };
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
         if (bash.output?.trim()) {
-          // Same cap as a tool result, never Markdown: command output is the one
-          // thing here that is definitionally not authored as Markdown.
           const { text, elided } = capResult(bash.output.trim());
-          lines.push(...this.cachedRawLines(msg, text, width, true));
+          lines.push(...this.cachedRawLines(message, text, width, true));
           if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
         }
-      } else {
-        continue;
+        needsSeparator = true;
       }
-      needsSeparator = true;
     }
 
-    // Streaming indicator for running agents
     if (this.record.status === "running" && this.activity) {
-      const act = describeActivity(this.activity.activeTools, this.activity.responseText);
       lines.push("");
-      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
+      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", describeActivity(this.activity.activeTools, this.activity.responseText)), width));
     }
-
-    const clampStart = cacheMatches ? staticLineCount : 0;
-    for (let i = clampStart; i < lines.length; i++) lines[i] = truncateToWidth(lines[i], width);
-    if (this.hasActiveToolCalls() && foundActivePrefix) {
-      this.activeFrameCache = {
+    const frame = { lines: lines.map(line => truncateToWidth(line, width)), toolRanges };
+    if (this.hasActiveToolCalls()) {
+      this.activeToolFrameCache = {
+        ...frame,
         width,
         mode,
         status: this.record.status,
-        lines,
-        headers: activeHeaders,
-        staticMessageCount,
-        staticLineCount,
-        staticNeedsSeparator,
-        staticLastMessage,
+        headers: toolHeaders,
+        activeToolCallCount,
+        executionCount: this.toolExecutions.size,
+        messages,
+        messageCount: messages.length,
+        stateRevision: this.stateRevision,
+        expanded: this.activeOutputExpanded,
+        activeStateSignature: activeStateSignature ?? "",
       };
       this.contentDirty = false;
     } else {
-      this.activeFrameCache = undefined;
+      this.activeToolFrameCache = undefined;
     }
-    return lines;
+    return frame;
   }
+
 }
