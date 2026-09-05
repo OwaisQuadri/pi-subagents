@@ -66,24 +66,14 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
     return counts.wrap + counts.markdownRender;
   }
 
-  // The viewer rebuilds every line of the transcript on every frame, so the work
-  // is expected to grow with it. What must not happen is growing FASTER than it:
-  // ten times the messages, at most ~ten times the work. A quadratic here is
-  // invisible on a short conversation and locks the TUI on a long one.
-  it("does ~10x the work for 10x the messages (raw wrap path)", () => {
-    const small = wrapsFor(30, "off");
-    const large = wrapsFor(300, "off");
-
-    expect(small).toBeGreaterThan(0);
-    expect(large / small).toBeLessThanOrEqual(11);
+  it("does not re-wrap unchanged raw history on a warm frame", () => {
+    expect(wrapsFor(30, "off")).toBe(0);
+    expect(wrapsFor(300, "off")).toBe(0);
   });
 
-  it("does ~10x the work for 10x the messages (markdown path)", () => {
-    const small = wrapsFor(30, "assistant");
-    const large = wrapsFor(300, "assistant");
-
-    expect(small).toBeGreaterThan(0);
-    expect(large / small).toBeLessThanOrEqual(11);
+  it("does not re-render unchanged Markdown history on a warm frame", () => {
+    expect(wrapsFor(30, "assistant")).toBe(0);
+    expect(wrapsFor(300, "assistant")).toBe(0);
   });
 
   // #259's WeakMap is keyed by the message object. If a refactor ever rebuilds
@@ -100,6 +90,57 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
     viewer.render(120);
 
     expect(counts.markdownNew).toBe(afterFirst);
+  });
+
+  it("keeps elapsed-time frames constant-cost across transcript sizes", () => {
+    function activeWorkFor(messageCount: number, dirty = false): { leaves: number; messageReads: number } {
+      const session = makeSession(messageCount);
+      session.messages.push({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "live-1", name: "bash", arguments: { command: "sleep 10" } }],
+      } as any);
+      let messageReads = 0;
+      session.messages = new Proxy(session.messages, {
+        get(target, property, receiver) {
+          if (typeof property === "string" && /^\d+$/.test(property)) messageReads++;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const record = makeFleet({ running: 1 })[0];
+      const activity = {
+        activeTools: new Map([["live-1", "bash"]]),
+        activeToolCalls: new Map([["live-1", {
+          toolName: "bash",
+          args: { command: "sleep 10" },
+          startedAt: Date.now() - 1_000,
+          partialResult: { content: [{ type: "text", text: "quiet build" }] },
+        }]]),
+        toolUses: 1,
+        responseText: "",
+        turnCount: 1,
+      };
+      const viewer = new ConversationViewer(perfTui(), session, record, activity, perfTheme, () => {});
+      viewer.render(120);
+      counts.wrap = 0;
+      counts.markdownRender = 0;
+      messageReads = 0;
+      if (dirty) (viewer as any).contentDirty = true;
+      viewer.render(120);
+      viewer.dispose();
+      return { leaves: counts.wrap + counts.markdownRender, messageReads };
+    }
+
+    const small = activeWorkFor(30);
+    const large = activeWorkFor(300);
+    expect(small.leaves).toBeLessThanOrEqual(1);
+    expect(large.leaves).toBe(small.leaves);
+    expect(small.messageReads).toBeLessThanOrEqual(1);
+    expect(large.messageReads).toBe(small.messageReads);
+
+    const dirtySmall = activeWorkFor(30, true);
+    const dirtyLarge = activeWorkFor(300, true);
+    expect(dirtySmall.messageReads).toBeLessThanOrEqual(2);
+    expect(dirtyLarge.messageReads).toBe(dirtySmall.messageReads);
   });
 });
 

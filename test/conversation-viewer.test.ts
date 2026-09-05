@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRecord } from "../src/types.js";
 
 // ── Mock wrapTextWithAnsi ──────────────────────────────────────────────
@@ -8,6 +8,7 @@ import type { AgentRecord } from "../src/types.js";
 // its import.
 
 let wrapOverride: ((text: string, width: number) => string[]) | null = null;
+let wrapCalls = 0;
 /** Bumped per `new Markdown(...)`, so a test can assert the per-message cache holds. */
 let markdownConstructions = 0;
 /** Bumped per Markdown render attempt, including failed ones. */
@@ -35,6 +36,7 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
       }
     },
     wrapTextWithAnsi: (...args: [string, number]) => {
+      wrapCalls++;
       if (wrapOverride) return wrapOverride(...args);
       return original.wrapTextWithAnsi(...args);
     },
@@ -94,6 +96,7 @@ function assertAllLinesFit(lines: string[], width: number) {
 
 beforeEach(() => {
   wrapOverride = null;
+  wrapCalls = 0;
   markdownConstructions = 0;
   markdownRenderCalls = 0;
   markdownThrows = false;
@@ -178,6 +181,273 @@ describe("ConversationViewer cost display", () => {
 });
 
 describe("ConversationViewer", () => {
+  describe("active tool calls", () => {
+    const activeViewers: Array<InstanceType<typeof ConversationViewer>> = [];
+    const strip = (text: string) => text.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+
+    function activeViewer(
+      calls: Array<{
+        id: string;
+        name: string;
+        args: unknown;
+        startedAt?: number;
+        partialResult?: unknown;
+      }>,
+      rows = 200,
+    ) {
+      const activeToolCalls = new Map(calls.map(call => [call.id, {
+        toolName: call.name,
+        args: call.args,
+        startedAt: call.startedAt ?? Date.now() - 1_000,
+        partialResult: call.partialResult,
+      }]));
+      const activity = {
+        activeTools: new Map(calls.map(call => [call.id, call.name])),
+        activeToolCalls,
+        toolUses: 0,
+        responseText: "",
+        turnCount: 1,
+      };
+      const messages = [{
+        role: "assistant",
+        content: calls.map(call => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.args })),
+      }];
+      const tui = mockTui(rows, 120);
+      const viewer = new ConversationViewer(
+        tui, mockSession(messages), mockRecord(), activity, ansiTheme(), vi.fn(),
+      );
+      activeViewers.push(viewer);
+      return { viewer, tui, activeToolCalls };
+    }
+
+    afterEach(() => {
+      for (const viewer of activeViewers) viewer.dispose();
+      activeViewers.length = 0;
+      vi.useRealTimers();
+    });
+
+    it("shows a bash command, dynamic elapsed time, and configured timeout", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:12.400Z"));
+      const { viewer, tui } = activeViewer([{
+        id: "call-1",
+        name: "bash",
+        args: { command: "npm test", timeout: 30 },
+        startedAt: Date.now() - 12_400,
+      }]);
+
+      expect(strip(viewer.render(120).join("\n"))).toContain("[Tool: bash · 12.4s · timeout 30s]");
+      expect(strip(viewer.render(120).join("\n"))).toContain("$ npm test");
+
+      vi.advanceTimersByTime(600);
+      expect(tui.requestRender).toHaveBeenCalled();
+      expect(strip(viewer.render(120).join("\n"))).toContain("[Tool: bash · 13.0s · timeout 30s]");
+      viewer.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("explicitly says when bash has no timeout", () => {
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "bash",
+        args: { command: "sleep 10" },
+      }]);
+
+      expect(strip(viewer.render(120).join("\n"))).toContain("[Tool: bash · 1.0s · no timeout]");
+    });
+
+    it("summarizes primary file/search arguments and bounds a fallback", () => {
+      const { viewer } = activeViewer([
+        { id: "read-1", name: "read", args: { path: "src/index.ts", offset: 10 } },
+        { id: "grep-1", name: "grep", args: { pattern: "needle", path: "src" } },
+        { id: "other-1", name: "custom", args: { payload: "x".repeat(1_000) } },
+      ]);
+      const out = strip(viewer.render(120).join("\n"));
+
+      expect(out).toContain("path: src/index.ts");
+      expect(out).toContain("pattern: needle");
+      expect(out).toContain("path: src");
+      expect(out).toContain('{"payload":"');
+      expect(out).not.toContain("x".repeat(500));
+    });
+
+    it("shows a compact live tail and ctrl+o expands it within a bound", () => {
+      const output = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n");
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "bash",
+        args: { command: "npm test" },
+        partialResult: { content: [{ type: "text", text: output }] },
+      }]);
+
+      const compact = strip(viewer.render(120).join("\n"));
+      expect(compact).toContain("earlier lines (ctrl+o to expand)");
+      expect(compact).toContain("line 79");
+      expect(compact).not.toContain("line 0");
+
+      viewer.handleInput("\x0f");
+      const expanded = strip(viewer.render(120).join("\n"));
+      expect(expanded).toContain("line 40");
+      expect(expanded).toContain("line 79");
+      expect(expanded).not.toContain("line 0");
+      expect(expanded).toContain("ctrl+o compact");
+    });
+
+    it("refreshes a partial result mutated in place on dirty frames", () => {
+      const partialResult = { content: [{ type: "text", text: "first chunk" }] };
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "bash",
+        args: { command: "npm test" },
+        partialResult,
+      }]);
+
+      expect(strip(viewer.render(120).join("\n"))).toContain("first chunk");
+      partialResult.content[0].text = "second chunk";
+      (viewer as any).contentDirty = true;
+
+      const updated = strip(viewer.render(120).join("\n"));
+      expect(updated).toContain("second chunk");
+      expect(updated).not.toContain("first chunk");
+    });
+
+    it("keeps active arguments and output bounded at narrow widths", () => {
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "custom",
+        args: { payload: "a".repeat(10_000) },
+        partialResult: { content: [{ type: "text", text: "b".repeat(20_000) }] },
+      }]);
+
+      const content = (viewer as any).buildContentLines(36) as string[];
+      assertAllLinesFit(content, 36);
+      expect(content.length).toBeLessThan(20);
+      expect(strip(content.join("\n"))).toContain("earlier output");
+    });
+
+    it("strips terminal control sequences from arguments and partial output", () => {
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "bash",
+        args: { command: "printf '\u001b[31mred\u001b[0m\u001b]8;;https://evil.test\u0007link\u001b]8;;\u0007\u001b\u0000[6n\u001b\u007fc'" },
+        partialResult: { content: [{ type: "text", text: "wipe\u001b[\u00072Jokstart\u001b\u0000[6nmid\u001b\u007fcend\u001b\u0000Psecret\u001b\\safe output\u001b]unterminatedTAILnested\u001b\u001bPdrop\u001b\\]0;repwn\u0007safe" }] },
+      }]);
+      const raw = viewer.render(120).join("\n");
+      const out = strip(raw);
+
+      expect(out).toContain("redlink");
+      expect(out).toContain("wipeokstartmidendsafe output]unterminatedTAILnestedsafe");
+      expect(raw).not.toContain("evil.test");
+      expect(raw).not.toContain("secret");
+      expect(raw).not.toContain("repwn");
+      expect(raw).not.toContain("owned");
+      expect(raw).not.toContain("\u001b[6n");
+      expect(raw).not.toContain("\u001bc");
+    });
+
+    it("does not re-wrap unchanged history on elapsed-time renders", () => {
+      const history = Array.from({ length: 50 }, (_, i) => ({
+        role: "toolResult",
+        toolCallId: `old-${i}`,
+        content: [{ type: "text", text: `historical output ${i}` }],
+      }));
+      const active = {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "sleep 10" } }],
+      };
+      const activity = {
+        activeTools: new Map([["call-1", "bash"]]),
+        activeToolCalls: new Map([["call-1", {
+          toolName: "bash",
+          args: { command: "sleep 10" },
+          startedAt: Date.now() - 1_000,
+        }]]),
+        toolUses: 50,
+        responseText: "",
+        turnCount: 1,
+      };
+      const viewer = new ConversationViewer(
+        mockTui(200, 120), mockSession([...history, active]), mockRecord(), activity,
+        ansiTheme(), vi.fn(),
+      );
+      activeViewers.push(viewer);
+
+      viewer.render(120);
+      const afterFirst = wrapCalls;
+      viewer.render(120);
+
+      expect(afterFirst).toBeGreaterThanOrEqual(history.length);
+      expect(wrapCalls).toBe(afterFirst);
+    });
+
+    it("marks omitted non-text blocks without scanning an unbounded block list", () => {
+      const content: unknown[] = Array.from({ length: 100 }, () => ({ type: "image", data: "ignored" }));
+      content.unshift({ type: "text", text: "older text" });
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "custom",
+        args: {},
+        partialResult: { content },
+      }]);
+      const out = strip(viewer.render(120).join("\n"));
+
+      expect(out).toContain("earlier output");
+      expect(out).not.toContain("older text");
+    });
+
+    it("tracks concurrent same-name calls independently and settles one", () => {
+      const { viewer, activeToolCalls } = activeViewer([
+        { id: "call-1", name: "read", args: { path: "one.ts" } },
+        { id: "call-2", name: "read", args: { path: "two.ts" } },
+      ]);
+
+      expect(strip(viewer.render(120).join("\n"))).toContain("path: one.ts");
+      expect(strip(viewer.render(120).join("\n"))).toContain("path: two.ts");
+
+      activeToolCalls.delete("call-1");
+      const after = strip(viewer.render(120).join("\n"));
+      expect(after).not.toContain("path: one.ts");
+      expect(after).toContain("path: two.ts");
+      expect(after).toContain("[Tool: read]");
+    });
+
+    it("ignores stale active state after the record settles", () => {
+      vi.useFakeTimers();
+      const { viewer } = activeViewer([{
+        id: "call-1",
+        name: "bash",
+        args: { command: "sleep 10" },
+      }]);
+      const record = (viewer as any).record as AgentRecord;
+      record.status = "completed";
+
+      expect(strip(viewer.render(120).join("\n"))).toContain("[Tool: bash]");
+      const settled = strip(viewer.render(120).join("\n"));
+      expect(settled).not.toContain("no timeout");
+      expect(settled).not.toContain("ctrl+o expand");
+      vi.advanceTimersByTime(100);
+      expect(vi.getTimerCount()).toBe(0);
+      (viewer as any).ensureElapsedTimer();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("preserves the completed result display", () => {
+      const messages = [
+        { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "npm test" } }] },
+        { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "PASS" }] },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(200, 120), mockSession(messages), mockRecord({ status: "completed" }), undefined,
+        ansiTheme(), vi.fn(),
+      );
+      const out = strip(viewer.render(120).join("\n"));
+
+      expect(out).toContain("[Tool: bash]");
+      expect(out).toContain("[Result]");
+      expect(out).toContain("PASS");
+    });
+  });
+
   it("closes with Ctrl+C when not composing", () => {
     const done = vi.fn();
     const viewer = new ConversationViewer(
@@ -311,6 +581,7 @@ describe("ConversationViewer", () => {
     it("no line exceeds width with running activity indicator", () => {
       const activity = {
         activeTools: new Map([["read", "file.ts"], ["grep", "pattern"]]),
+        activeToolCalls: new Map(),
         toolUses: 5, tokens: "10k", responseText: "R".repeat(400),
         session: { getSessionStats: () => ({ tokens: { total: 50000 } }) },
       };
