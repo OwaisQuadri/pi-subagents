@@ -124,7 +124,7 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
       counts.wrap = 0;
       counts.markdownRender = 0;
       messageReads = 0;
-      if (dirty) (viewer as any).contentDirty = true;
+      if (dirty) (viewer as any).isContentDirty = true;
       viewer.render(120);
       viewer.dispose();
       return { leaves: counts.wrap + counts.markdownRender, messageReads };

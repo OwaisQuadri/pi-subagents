@@ -305,7 +305,7 @@ describe("ConversationViewer", () => {
 
       expect(strip(viewer.render(120).join("\n"))).toContain("first chunk");
       partialResult.content[0].text = "second chunk";
-      (viewer as any).contentDirty = true;
+      (viewer as any).isContentDirty = true;
 
       const updated = strip(viewer.render(120).join("\n"));
       expect(updated).toContain("second chunk");

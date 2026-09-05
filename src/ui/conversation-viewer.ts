@@ -198,6 +198,98 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+const TOOL_ARGUMENT_MAX_CHARS = 240;
+const TOOL_OUTPUT_TAIL_LINES = 4;
+const TOOL_OUTPUT_EXPANDED_LINES = 40;
+const TOOL_OUTPUT_TAIL_CHARS = 2_000;
+const TOOL_OUTPUT_EXPANDED_CHARS = 8_000;
+const TOOL_OUTPUT_RAW_MAX_CHARS = 16_000;
+const TOOL_OUTPUT_MAX_BLOCKS = 64;
+
+function stripUnsafeTerminalSequences(text: string): string {
+  let safe = text;
+  for (let pass = 0; pass < 4; pass++) {
+    const sanitized = safe
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      .replace(/\x1b[PX^_][^\x1b\x9c]*(?:\x1b\\|\x9c)/g, "")
+      .replace(/[\x90\x98\x9d-\x9f][^\x07\x9c\x90\x98\x9d-\x9f]*(?:\x07|\x9c)/g, "")
+      .replace(/(?:\x1b\[|\x9b)[0-?\x00-\x1a\x1c-\x1f\x7f-\x9f]*[ -/]*[@-~]/g, "")
+      .replace(/[\x00-\x06\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]/g, "");
+    if (sanitized === safe) break;
+    safe = sanitized;
+  }
+  return safe
+    .replace(/\x1b(?![[\]PX^_])[ -/]*[0-~]/g, "")
+    .replace(/\x1b/g, "")
+    .replace(/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]/g, "");
+}
+
+function boundedLine(value: unknown, maxChars = TOOL_ARGUMENT_MAX_CHARS): string {
+  const raw = Array.isArray(value) ? `[${value.length} items]` : typeof value === "string" ? value : String(value);
+  const line = stripUnsafeTerminalSequences(raw.slice(0, TOOL_ARGUMENT_MAX_CHARS * 4)).replace(/\s+/g, " ").trim();
+  return line.length <= maxChars ? line : `${line.slice(0, maxChars - 1)}…`;
+}
+
+function fallbackArguments(args: unknown): string {
+  const record = objectRecord(args);
+  if (!record) return boundedLine(args);
+  const entries = Object.entries(record);
+  const parts = entries.slice(0, 4).map(([key, value]) => {
+    const summary = typeof value === "string"
+      ? JSON.stringify(boundedLine(value, 80))
+      : value === null || typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : Array.isArray(value) ? `[${value.length} items]` : "{…}";
+    return `${JSON.stringify(key)}:${summary}`;
+  });
+  return boundedLine(`{${parts.join(",")}${entries.length > parts.length ? ",…" : ""}}`);
+}
+
+function partialResultText(result: unknown): { text: string; isOmitted: boolean } {
+  const content = typeof result === "string" ? [result] : objectRecord(result)?.content;
+  if (!Array.isArray(content)) return { text: "", isOmitted: false };
+  const chunks: string[] = [];
+  let remaining = TOOL_OUTPUT_RAW_MAX_CHARS;
+  const firstBlock = Math.max(0, content.length - TOOL_OUTPUT_MAX_BLOCKS);
+  let isOmitted = firstBlock > 0;
+  for (let i = content.length - 1; i >= firstBlock; i--) {
+    const block = typeof content[i] === "string" ? content[i] : objectRecord(content[i]);
+    const text = typeof block === "string"
+      ? block
+      : block?.type === "text" && typeof block.text === "string" ? block.text : undefined;
+    if (text === undefined) {
+      isOmitted = true;
+      continue;
+    }
+    const separator = chunks.length > 0 ? 1 : 0;
+    const room = remaining - separator;
+    if (room <= 0) {
+      isOmitted = true;
+      break;
+    }
+    const chunk = text.slice(-room);
+    chunks.unshift(chunk);
+    remaining -= chunk.length + separator;
+    if (chunk.length < text.length) {
+      isOmitted = true;
+      break;
+    }
+  }
+  return {
+    text: stripUnsafeTerminalSequences(chunks.join("\n").replace(/\r\n?/g, "\n").replace(/\t/g, "    ")),
+    isOmitted,
+  };
+}
+
+function outputTail(text: string, isExpanded: boolean, width: number): { lines: string[]; omittedLines: number; omittedChars: number } {
+  const source = text.split("\n");
+  const lineLimit = isExpanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
+  const charLimit = Math.min(isExpanded ? TOOL_OUTPUT_EXPANDED_CHARS : TOOL_OUTPUT_TAIL_CHARS, width * lineLimit);
+  const tail = source.slice(-lineLimit).join("\n").slice(-charLimit);
+  const lines = tail.split("\n");
+  return { lines, omittedLines: source.length - lines.length, omittedChars: text.length - tail.length };
+}
+
 function partialToolResult(partial: unknown): { content: Array<{ type: string; text?: string }>; details?: unknown } {
   if (typeof partial === "string") return { content: [{ type: "text", text: partial }] };
   const record = objectRecord(partial);
@@ -236,7 +328,7 @@ export class ConversationViewer implements Component, Focusable {
    * keystroke — the component caches, but only across calls to the same object.
    * Weak so a compacted-away message doesn't pin its render.
    */
-  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
+  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean; renderedWidth?: number; renderedLines?: string[] }>();
   /** One block per tool call id, so a redraw reuses the component's own caches. */
   private readonly toolBlocks = new Map<string, ToolBlock>();
   /**
@@ -246,6 +338,29 @@ export class ConversationViewer implements Component, Focusable {
   private readonly toolRendering = piThemeAvailable();
   /** Whether tool blocks show their full output; toggled with pi's expand key. */
   private toolsExpanded = false;
+  private isContentDirty = true;
+  private activePrefix: {
+    width: number;
+    mode: ViewerMarkdownMode;
+    isExpanded: boolean;
+    messageCount: number;
+    lastMessage: object | undefined;
+    lines: string[];
+    toolRanges: Array<{ id: string; start: number; end: number }>;
+    needsSeparator: boolean;
+    foldedCalls: Set<string>;
+  } | undefined;
+  private activeFrame: {
+    width: number;
+    mode: ViewerMarkdownMode;
+    isExpanded: boolean;
+    status: AgentRecord["status"];
+    messageCount: number;
+    lines: string[];
+    headers: Array<{ index: number; call: ActiveToolCall }>;
+  } | undefined;
+  private readonly rawLineCache = new WeakMap<object, { text: string; width: number; dim: boolean; lines: string[] }>();
+  private toolRanges: Array<{ id: string; start: number; end: number }> = [];
   private elapsedTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
@@ -296,6 +411,7 @@ export class ConversationViewer implements Component, Focusable {
     }, { follow: "end", scrollbar: this.fullscreen ? scrollbarMode : "hidden" });
     this.unsubscribe = session.subscribe(event => {
       if (this.closed) return;
+      this.isContentDirty = true;
       if (this.fullscreen && !this.scrollView.isFollowingEnd && event.type === "message_start" && ["user", "assistant", "toolResult", "bashExecution"].includes(event.message.role)) {
         this.newMessages++;
       }
@@ -308,6 +424,7 @@ export class ConversationViewer implements Component, Focusable {
 
   handleInput(data: string): void {
     if (this.closed) return;
+    this.isContentDirty = true;
     if (this.fullscreen && (this.keys.bottom(data) || (!this.composer && matchesKey(data, "end")))) {
       this.jumpToLatest();
       return;
@@ -376,10 +493,33 @@ export class ConversationViewer implements Component, Focusable {
     // Unfold tool output — the same key, and the same meaning, as in the main
     // transcript. It is what the renderers' own elision notices refer to.
     if (this.keys.expand(data)) {
+      const isFollowing = this.fullscreen ? this.scrollView.isFollowingEnd : this.autoScroll;
+      const top = this.fullscreen ? this.scrollView.scrollTop : this.scrollOffset;
+      this.buildContentLines(this.lastInnerW);
+      const anchor = isFollowing ? undefined
+        : this.toolRanges.find(range => range.start <= top && top < range.end)
+          ?? this.toolRanges.find(range => range.start >= top);
       this.toolsExpanded = !this.toolsExpanded;
       for (const block of this.toolBlocks.values()) {
         block.component.setExpanded(this.toolsExpanded);
         block.rows = undefined;
+      }
+      if (anchor) {
+        const total = this.buildContentLines(this.lastInnerW).length;
+        const next = this.toolRanges.find(range => range.id === anchor.id);
+        if (next) {
+          const viewportHeight = this.viewportHeight();
+          const maxScroll = Math.max(0, total - viewportHeight);
+          const target = Math.min(maxScroll, Math.max(0, next.start - (anchor.start - top)));
+          if (this.fullscreen) {
+            this.scrollView.updateLayout(total, viewportHeight, () => {
+              if (!this.closed) this.tui.requestRender();
+            });
+            this.scrollView.scrollTo(target);
+          } else {
+            this.scrollOffset = target;
+          }
+        }
       }
       this.tui.requestRender();
       return;
@@ -623,6 +763,7 @@ export class ConversationViewer implements Component, Focusable {
       // at 80 columns with steer + stop present, and this group has no
       // degradation step below "drop the line-count readout".
       footerActions.push({ label: `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`, key: "m" });
+      if (this.isAnyToolCallActive()) footerActions.push({ label: `ctrl+o ${this.toolsExpanded ? "compact" : "expand"}`, key: "\x0f" });
       const actions = footerActions.map(a => th.fg(a.key === "x" && this.stopArmed ? "error" : "dim", a.label));
       footerActions.push({ label: "Esc close", key: "\x1b" });
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
@@ -674,6 +815,47 @@ export class ConversationViewer implements Component, Focusable {
     return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
   }
 
+  private cachedRawLines(msg: object, text: string, width: number, dim: boolean): string[] {
+    const cached = this.rawLineCache.get(msg);
+    if (cached && cached.text === text && cached.width === width && cached.dim === dim) return cached.lines;
+    const lines = this.rawLines(text, width, dim);
+    this.rawLineCache.set(msg, { text, width, dim, lines });
+    return lines;
+  }
+
+  private activeDetailLines(active: ActiveToolCall, width: number): string[] {
+    const th = this.theme;
+    const lines: string[] = [];
+    const args = objectRecord(active.args);
+    if (active.toolName === "bash") {
+      if (args?.command !== undefined) lines.push(truncateToWidth(`  $ ${boundedLine(args.command)}`, width));
+    } else {
+      const primary = args ? ["path", "query", "pattern"].flatMap(key =>
+        args[key] === undefined ? [] : [`${key}: ${boundedLine(args[key])}`]) : [];
+      const summaries = primary.length > 0 ? primary : [fallbackArguments(active.args)];
+      for (const summary of summaries) lines.push(truncateToWidth(th.fg("dim", `  ${summary}`), width));
+    }
+    const partial = partialResultText(active.partialResult);
+    const text = partial.text.trimEnd();
+    const action = this.toolsExpanded ? "" : " (ctrl+o to expand)";
+    if (!text) {
+      if (partial.isOmitted) lines.push(th.fg("dim", `  ... earlier output${action}`));
+      return lines;
+    }
+    const tail = outputTail(text, this.toolsExpanded, width);
+    const rendered = this.rawLines(tail.lines.join("\n"), Math.max(1, width - 2), true);
+    const displayLines = this.toolsExpanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
+    if (partial.isOmitted || rendered.length > displayLines) {
+      lines.push(th.fg("dim", `  ... earlier output${action}`));
+    } else if (tail.omittedLines > 0) {
+      lines.push(th.fg("dim", `  ... ${tail.omittedLines} earlier line${tail.omittedLines === 1 ? "" : "s"}${action}`));
+    } else if (tail.omittedChars > 0) {
+      lines.push(th.fg("dim", `  ... ${humanCount(tail.omittedChars)} earlier characters`));
+    }
+    lines.push(...rendered.slice(-displayLines).map(line => `  ${line}`));
+    return lines;
+  }
+
   /** Render `text` as Markdown, reusing this message's component instance. */
   private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
     let entry = this.markdownCache.get(msg);
@@ -695,6 +877,8 @@ export class ConversationViewer implements Component, Focusable {
       };
       this.markdownCache.set(msg, entry);
     } else if (entry.text !== text) {
+      entry.renderedWidth = undefined;
+      entry.renderedLines = undefined;
       // Streaming: the message object is stable, its text grows. A failed
       // prefix remains unsafe after append-only deltas, so retry only when the
       // content was replaced or truncated.
@@ -703,10 +887,14 @@ export class ConversationViewer implements Component, Focusable {
       entry.text = text;
       if (shouldRetry) entry.failed = false;
     }
-    if (entry.failed) return this.rawLines(text, width, dim);
+    if (entry.failed) return this.cachedRawLines(msg, text, width, dim);
+    if (entry.renderedWidth === width && entry.renderedLines) return entry.renderedLines;
 
     try {
-      return entry.md.render(width);
+      const rendered = entry.md.render(width);
+      entry.renderedWidth = width;
+      entry.renderedLines = rendered;
+      return rendered;
     } catch {
       // The parser is recursive and this is arbitrary tool output: ~54 nested
       // blockquotes overflow the stack, and no amount of fuzzing proves that is
@@ -837,24 +1025,47 @@ export class ConversationViewer implements Component, Focusable {
 
     const th = this.theme;
     const messages = this.session.messages;
-    const lines: string[] = [];
+    const mode = this.markdownMode();
+    const frame = this.activeFrame;
+    if (!this.isContentDirty && frame && this.isAnyToolCallActive()
+      && frame.width === width && frame.mode === mode && frame.isExpanded === this.toolsExpanded
+      && frame.status === this.record.status && frame.messageCount === messages.length
+      && frame.headers.length === this.activity?.activeToolCalls.size
+      && frame.headers.every(header => [...this.activity!.activeToolCalls.values()].includes(header.call))) {
+      for (const header of frame.headers) frame.lines[header.index] = this.activeHeader(header.call, width);
+      return frame.lines;
+    }
+    const activeHeaders: Array<{ index: number; call: ActiveToolCall }> = [];
 
     if (messages.length === 0) {
-      lines.push(th.fg("dim", "(waiting for first message...)"));
-      return lines;
+      this.toolRanges = [];
+      return [th.fg("dim", "(waiting for first message...)")];
     }
+
+    const prefix = this.activePrefix;
+    const isPrefixReusable = prefix !== undefined && this.isAnyToolCallActive()
+      && prefix.width === width && prefix.mode === mode && prefix.isExpanded === this.toolsExpanded
+      && prefix.messageCount <= messages.length
+      && (prefix.messageCount === 0 || messages[prefix.messageCount - 1] === prefix.lastMessage);
+    const firstMessage = isPrefixReusable ? prefix.messageCount : 0;
+    const pending: typeof messages = [];
+    for (let index = firstMessage; index < messages.length; index++) pending.push(messages[index]);
+    const lines: string[] = isPrefixReusable ? [...prefix.lines] : [];
+    this.toolRanges = isPrefixReusable ? [...prefix.toolRanges] : [];
+    let nextPrefix: typeof this.activePrefix;
 
     // A result is folded into the block of the call it answers, so every call
     // has to find its result before the loop reaches it.
     const results = new Map<string, ToolResultPart>();
-    for (const msg of messages) {
+    for (const msg of pending) {
       if (msg.role === "toolResult") results.set(msg.toolCallId, msg);
     }
-    const foldedCalls = new Set<string>();
+    const foldedCalls = new Set<string>(isPrefixReusable ? prefix.foldedCalls : []);
 
-    const mode = this.markdownMode();
-    let needsSeparator = false;
-    for (const msg of messages) {
+    let needsSeparator = isPrefixReusable ? prefix.needsSeparator : false;
+    for (let pendingIndex = 0; pendingIndex < pending.length; pendingIndex++) {
+      const msg = pending[pendingIndex];
+      const messageStart = { lines: lines.length, ranges: this.toolRanges.length, needsSeparator };
       if (msg.role === "user") {
         const text = typeof msg.content === "string"
           ? msg.content
@@ -862,7 +1073,7 @@ export class ConversationViewer implements Component, Focusable {
         if (!text.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
+        for (const line of this.cachedRawLines(msg, text.trim(), width, false)) {
           lines.push(line);
         }
       } else if (msg.role === "assistant") {
@@ -877,14 +1088,27 @@ export class ConversationViewer implements Component, Focusable {
         if (textParts.length > 0) {
           const text = textParts.join("\n").trim();
           lines.push(...(mode === "off"
-            ? this.rawLines(text, width, false)
+            ? this.cachedRawLines(msg, text, width, false)
             : this.markdownLines(msg, text, width, false)));
         }
         for (const call of toolCalls) {
           const active = results.has(call.id) ? undefined : this.activeToolCall(call.id);
-          if (active) lines.push(this.activeHeader(active, width));
+          if (active && !nextPrefix) {
+            const messageCount = firstMessage + pendingIndex;
+            nextPrefix = {
+              width, mode, isExpanded: this.toolsExpanded, messageCount,
+              lastMessage: messageCount === 0 ? undefined : messageCount > firstMessage ? pending[pendingIndex - 1] : prefix?.lastMessage,
+              lines: lines.slice(0, messageStart.lines), toolRanges: this.toolRanges.slice(0, messageStart.ranges),
+              needsSeparator: messageStart.needsSeparator, foldedCalls: new Set([...foldedCalls].filter(id => !toolCalls.some(c => c.id === id))),
+            };
+          }
+          if (active) {
+            lines.push(this.activeHeader(active, width));
+            activeHeaders.push({ index: lines.length - 1, call: active });
+          }
           if (!this.toolRendering) {
             if (!active) lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${call.name}]`), width));
+            else lines.push(...this.activeDetailLines(active, width));
             continue;
           }
           foldedCalls.add(call.id);
@@ -893,7 +1117,9 @@ export class ConversationViewer implements Component, Focusable {
           const notRun = msg.stopReason === "aborted" ? "Operation aborted"
             : msg.stopReason === "error" ? msg.errorMessage || "Error"
             : undefined;
+          const start = lines.length - (active ? 1 : 0);
           lines.push(...this.toolBlockLines(call, results.get(call.id), notRun, width, active));
+          this.toolRanges.push({ id: call.id, start, end: lines.length });
         }
       } else if (msg.role === "toolResult") {
         // Rendered under its call above. A result whose call is not in the
@@ -906,7 +1132,7 @@ export class ConversationViewer implements Component, Focusable {
         lines.push(th.fg("dim", "[Result]"));
         lines.push(...(mode === "all"
           ? this.markdownLines(msg, text, width, true)
-          : this.rawLines(text, width, true)));
+          : this.cachedRawLines(msg, text, width, true)));
         if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
@@ -916,7 +1142,7 @@ export class ConversationViewer implements Component, Focusable {
           // Same cap as a tool result, never Markdown: command output is the one
           // thing here that is definitionally not authored as Markdown.
           const { text, elided } = capResult(bash.output.trim());
-          lines.push(...this.rawLines(text, width, true));
+          lines.push(...this.cachedRawLines(msg, text, width, true));
           if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
         }
       } else {
@@ -935,7 +1161,14 @@ export class ConversationViewer implements Component, Focusable {
     // Only clamp what actually overflows: `truncateToWidth` takes a slow,
     // character-by-character path for any line carrying an escape sequence, and
     // a tool block's rows are already rendered at this width by its component.
-    return lines.map(l => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
+    const fitted = lines.map(l => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
+    const isActive = activeHeaders.length > 0 && this.isAnyToolCallActive();
+    this.activeFrame = isActive
+      ? { width, mode, isExpanded: this.toolsExpanded, status: this.record.status, messageCount: messages.length, lines: fitted, headers: activeHeaders }
+      : undefined;
+    this.activePrefix = isActive ? nextPrefix ?? (isPrefixReusable ? prefix : undefined) : undefined;
+    this.isContentDirty = false;
+    return fitted;
   }
 
   /**
