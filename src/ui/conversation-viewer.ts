@@ -35,7 +35,7 @@ export const VIEWPORT_HEIGHT_PCT = 70;
 export const RESULT_MAX_CHARS = 16_000;
 const TOOL_ARGUMENT_MAX_CHARS = 240;
 const TOOL_OUTPUT_TAIL_LINES = 3;
-const TOOL_OUTPUT_EXPANDED_LINES = RESULT_MAX_CHARS;
+const TOOL_OUTPUT_EXPANDED_MAX_LINES = 16_000;
 const TOOL_OUTPUT_RAW_MAX_CHARS = 16_000;
 const TOOL_OUTPUT_MAX_BLOCKS = 64;
 const TOOL_EXECUTION_MAX_RETAINED = 64;
@@ -297,7 +297,7 @@ function toolOutputLines(output: ToolOutput, expanded: boolean, width: number, t
     const capped = text.length <= RESULT_MAX_CHARS
       ? { text, elided: 0 }
       : { text: text.slice(-RESULT_MAX_CHARS), elided: text.length - RESULT_MAX_CHARS };
-    const lineLimit = expanded ? TOOL_OUTPUT_EXPANDED_LINES : TOOL_OUTPUT_TAIL_LINES;
+    const lineLimit = expanded ? TOOL_OUTPUT_EXPANDED_MAX_LINES : TOOL_OUTPUT_TAIL_LINES;
     const preview = truncateToVisualLines(capped.text, lineLimit, Math.max(1, width - 4));
     if (output.omitted || capped.elided || preview.skippedCount > 0) {
       const omitted = !output.omitted && capped.elided === 0 && preview.skippedCount > 0
@@ -350,7 +350,6 @@ export class ConversationViewer implements Component {
     toolRanges: ToolRange[];
     headers: ToolHeader[];
     activeToolCallCount: number;
-    executionCount: number;
     messages: AgentSession["messages"];
     messageCount: number;
     stateRevision: number;
@@ -441,8 +440,10 @@ export class ConversationViewer implements Component {
       this.contentDirty = true;
       this.stateRevision++;
       if (event.type === "tool_execution_start") {
+        const occurrence = this.currentFinalToolResultCount(event.toolCallId);
+        this.finalToolResultCounts.set(event.toolCallId, occurrence);
         this.toolExecutions.set(event.toolCallId, {
-          occurrence: this.finalToolResultCount(event.toolCallId),
+          occurrence,
           toolName: event.toolName,
           args: event.args,
           startedAt: Date.now(),
@@ -451,8 +452,10 @@ export class ConversationViewer implements Component {
         this.ensureElapsedTimer();
       }
       if (event.type === "tool_execution_update") {
-        const occurrence = this.finalToolResultCounts.get(event.toolCallId) ?? 0;
         const execution = this.toolExecutions.get(event.toolCallId);
+        const occurrence = execution?.result === undefined && execution !== undefined
+          ? execution.occurrence
+          : this.finalToolResultCounts.get(event.toolCallId) ?? 0;
         if (execution?.occurrence === occurrence) {
           execution.toolName = event.toolName;
           execution.args = event.args;
@@ -469,8 +472,10 @@ export class ConversationViewer implements Component {
         this.pruneCompletedToolExecutions();
       }
       if (event.type === "tool_execution_end") {
-        const occurrence = this.finalToolResultCount(event.toolCallId);
         const execution = this.toolExecutions.get(event.toolCallId);
+        const occurrence = execution?.result === undefined && execution !== undefined
+          ? execution.occurrence
+          : this.finalToolResultCount(event.toolCallId);
         if (execution?.occurrence === occurrence) {
           execution.result = partialResultText(event.result);
           execution.isError = event.isError;
@@ -877,6 +882,14 @@ export class ConversationViewer implements Component {
     return this.finalToolResultCounts.get(id) ?? 0;
   }
 
+  private currentFinalToolResultCount(id: string): number {
+    let count = 0;
+    for (const message of this.session.messages) {
+      if (message.role === "toolResult" && message.toolCallId === id) count++;
+    }
+    return count;
+  }
+
   private syncFinalToolResultCounts(): void {
     const messages = this.session.messages;
     const firstMessage = messages[0];
@@ -1017,10 +1030,11 @@ export class ConversationViewer implements Component {
     }
 
     const isRebuildingSuffix = isCacheCompatible;
-    const finalResults = isRebuildingSuffix ? cache.staticFinalResults : indexFinalToolResults(messages);
-    const pairedResults = isRebuildingSuffix ? cache.staticPairedResults : new Set<ToolResultMessage>();
-    const callCounts = isRebuildingSuffix ? new Map(cache.staticCallOccurrences) : new Map<string, number>();
-    if (!isRebuildingSuffix) {
+    const isPairingIndexCurrent = isRebuildingSuffix && cache.messageCount === messages.length;
+    const finalResults = isPairingIndexCurrent ? cache.staticFinalResults : indexFinalToolResults(messages);
+    const pairedResults = isPairingIndexCurrent ? cache.staticPairedResults : new Set<ToolResultMessage>();
+    const callCounts = new Map<string, number>();
+    if (!isPairingIndexCurrent) {
       for (const message of messages) {
         if (message.role !== "assistant") continue;
         for (const call of parseToolCalls(message.content)) {
@@ -1132,7 +1146,6 @@ export class ConversationViewer implements Component {
         status: this.record.status,
         headers: toolHeaders,
         activeToolCallCount,
-        executionCount: this.toolExecutions.size,
         messages,
         messageCount: messages.length,
         stateRevision: this.stateRevision,

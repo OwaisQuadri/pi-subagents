@@ -278,9 +278,9 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
     const viewer = new ConversationViewer(
       perfTui(), session, makeFleet({ running: 1 })[0], undefined, perfTheme, () => {},
     );
+    listener({ type: "tool_execution_start", toolCallId: "live", toolName: "bash", args: {} });
     roleReads = 0;
 
-    listener({ type: "tool_execution_start", toolCallId: "live", toolName: "bash", args: {} });
     for (let i = 0; i < 10; i++) {
       listener({
         type: "tool_execution_update",

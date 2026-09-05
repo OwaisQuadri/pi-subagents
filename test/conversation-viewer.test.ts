@@ -551,6 +551,31 @@ describe("ConversationViewer", () => {
       expect(out).toContain("NEW ASSISTANT TEXT");
     });
 
+    it("pairs calls and results appended while another tool remains active", () => {
+      const messages: any[] = [
+        { role: "assistant", content: [{ type: "toolCall", id: "live", name: "bash", arguments: { command: "sleep" } }] },
+      ];
+      const session = mockSession(messages);
+      const viewer = new ConversationViewer(mockTui(200, 120), session, mockRecord(), undefined, ansiTheme(), vi.fn());
+      const listener = session.subscribe.mock.calls[0][0];
+      listener({ type: "tool_execution_start", toolCallId: "live", toolName: "bash", args: { command: "sleep" } });
+      viewer.render(120);
+
+      messages.push({ role: "assistant", content: [{ type: "toolCall", id: "fast", name: "bash", arguments: { command: "fast" } }] });
+      listener({ type: "tool_execution_start", toolCallId: "fast", toolName: "bash", args: { command: "fast" } });
+      listener({ type: "tool_execution_end", toolCallId: "fast", toolName: "bash", result: { content: [{ type: "text", text: "FAST UNIQUE" }] }, isError: false });
+      messages.push({ role: "toolResult", toolCallId: "fast", content: [{ type: "text", text: "FAST UNIQUE" }] });
+      let out = strip(viewer.render(120).join("\n"));
+      expect(out.match(/FAST UNIQUE/g)).toHaveLength(1);
+      expect(out).not.toContain("[Result]");
+
+      messages.push({ role: "assistant", content: [{ type: "toolCall", id: "silent", name: "bash", arguments: { command: "silent" } }] });
+      messages.push({ role: "toolResult", toolCallId: "silent", content: [{ type: "text", text: "SILENT UNIQUE" }] });
+      out = strip(viewer.render(120).join("\n"));
+      expect(out.match(/SILENT UNIQUE/g)).toHaveLength(1);
+      expect(out).not.toContain("[Result]");
+    });
+
     it("pairs a result that appears before its tool call without duplicating it", () => {
       const messages = [
         { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "UNIQUE RESULT" }] },
@@ -662,14 +687,16 @@ describe("ConversationViewer", () => {
 
     it("keeps live output after an equal-length in-place transcript replacement", () => {
       const messages: any[] = [
+        { role: "user", content: "keep first" },
         { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "one" } }] },
         { role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: "FIRST RESULT" }] },
+        { role: "user", content: "keep last" },
       ];
       const session = mockSession(messages);
       const viewer = new ConversationViewer(mockTui(200, 120), session, mockRecord(), undefined, ansiTheme(), vi.fn());
       viewer.render(120);
-      messages[0] = { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "two" } }] };
-      messages[1] = { role: "user", content: "replacement" };
+      messages[1] = { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "two" } }] };
+      messages[2] = { role: "user", content: "replacement" };
       const listener = session.subscribe.mock.calls[0][0];
       listener({ type: "tool_execution_start", toolCallId: "dup", toolName: "bash", args: { command: "two" } });
       listener({ type: "tool_execution_update", toolCallId: "dup", toolName: "bash", args: { command: "two" }, partialResult: { content: [{ type: "text", text: "LIVE AFTER IN-PLACE REPLACEMENT" }] } });
