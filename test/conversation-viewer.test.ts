@@ -290,7 +290,7 @@ describe("ConversationViewer", () => {
       const expanded = strip(viewer.render(120).join("\n"));
       expect(expanded).toContain("line 40");
       expect(expanded).toContain("line 79");
-      expect(expanded).not.toContain("line 0");
+      expect(expanded).toContain("line 0");
       expect(expanded).toContain("ctrl+o compact");
     });
 
@@ -344,6 +344,22 @@ describe("ConversationViewer", () => {
       expect(raw).not.toContain("owned");
       expect(raw).not.toContain("\u001b[6n");
       expect(raw).not.toContain("\u001bc");
+    });
+
+    it("strips terminal control sequences from orphan and bash outputs", () => {
+      const messages = [
+        { role: "toolResult", toolCallId: "orphan", content: [{ type: "text", text: "orphan\x1b[2J output" }] },
+        { role: "bashExecution", command: "safe\x1b[2J command", output: "bash\x1b[2J output" },
+      ];
+      const raw = new ConversationViewer(
+        mockTui(200, 120), mockSession(messages), mockRecord({ status: "completed" }), undefined,
+        ansiTheme(), vi.fn(),
+      ).render(120).join("\n");
+
+      expect(raw).not.toContain("\x1b[2J");
+      expect(strip(raw)).toContain("orphan output");
+      expect(strip(raw)).toContain("safe command");
+      expect(strip(raw)).toContain("bash output");
     });
 
     it("does not re-wrap unchanged history on elapsed-time renders", () => {
@@ -644,6 +660,23 @@ describe("ConversationViewer", () => {
       expect(strip(viewer.render(120).join("\n"))).toContain("LIVE AFTER COMPACTION");
     });
 
+    it("keeps live output after an equal-length in-place transcript replacement", () => {
+      const messages: any[] = [
+        { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "one" } }] },
+        { role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: "FIRST RESULT" }] },
+      ];
+      const session = mockSession(messages);
+      const viewer = new ConversationViewer(mockTui(200, 120), session, mockRecord(), undefined, ansiTheme(), vi.fn());
+      viewer.render(120);
+      messages[0] = { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "two" } }] };
+      messages[1] = { role: "user", content: "replacement" };
+      const listener = session.subscribe.mock.calls[0][0];
+      listener({ type: "tool_execution_start", toolCallId: "dup", toolName: "bash", args: { command: "two" } });
+      listener({ type: "tool_execution_update", toolCallId: "dup", toolName: "bash", args: { command: "two" }, partialResult: { content: [{ type: "text", text: "LIVE AFTER IN-PLACE REPLACEMENT" }] } });
+
+      expect(strip(viewer.render(120).join("\n"))).toContain("LIVE AFTER IN-PLACE REPLACEMENT");
+    });
+
     it("sanitizes completed tool names", () => {
       const messages = [
         { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "safe\x1b[2Junsafe", arguments: {} }] },
@@ -761,6 +794,21 @@ describe("ConversationViewer", () => {
       const out = strip(viewer.render(120).join("\n"));
       expect(out).toContain("line 0");
       expect(out.match(/ctrl\+o to collapse/g)).toHaveLength(2);
+    });
+
+    it("makes the full bounded completed result reachable when expanded", () => {
+      const output = Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n");
+      const messages = [
+        { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "long" } }] },
+        { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: output }] },
+      ];
+      const { viewer } = viewerForTools(messages);
+      viewer.handleInput("\x0f");
+      const content = strip(((viewer as any).buildContentLines(116) as string[]).join("\n"));
+
+      expect(content).toContain("line 0");
+      expect(content).toContain("line 499");
+      expect(content).toContain("ctrl+o to collapse");
     });
 
     it("keeps the viewed tool at its screen offset while toggling", () => {

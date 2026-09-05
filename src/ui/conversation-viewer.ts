@@ -35,7 +35,7 @@ export const VIEWPORT_HEIGHT_PCT = 70;
 export const RESULT_MAX_CHARS = 16_000;
 const TOOL_ARGUMENT_MAX_CHARS = 240;
 const TOOL_OUTPUT_TAIL_LINES = 3;
-const TOOL_OUTPUT_EXPANDED_LINES = 40;
+const TOOL_OUTPUT_EXPANDED_LINES = RESULT_MAX_CHARS;
 const TOOL_OUTPUT_RAW_MAX_CHARS = 16_000;
 const TOOL_OUTPUT_MAX_BLOCKS = 64;
 const TOOL_EXECUTION_MAX_RETAINED = 64;
@@ -356,6 +356,14 @@ export class ConversationViewer implements Component {
     stateRevision: number;
     expanded: boolean;
     activeStateSignature: string;
+    staticMessageCount: number;
+    staticLineCount: number;
+    staticLastMessage: object | undefined;
+    staticFinalResults: Map<string, ToolResultMessage[]>;
+    staticPairedResults: Set<ToolResultMessage>;
+    staticCallOccurrences: Map<string, number>;
+    staticToolRanges: ToolRange[];
+    isStaticToolOutputAvailable: boolean;
   } | undefined;
   /**
    * One `Markdown` per message, so its own text/width cache does the work. A
@@ -383,6 +391,8 @@ export class ConversationViewer implements Component {
   }>();
   private readonly finalToolResultCounts = new Map<string, number>();
   private finalToolResultMessages: AgentSession["messages"] | undefined;
+  private finalToolResultFirstMessage: object | undefined;
+  private finalToolResultLastMessage: object | undefined;
   private finalToolResultMessageCount = 0;
 
   constructor(
@@ -441,7 +451,7 @@ export class ConversationViewer implements Component {
         this.ensureElapsedTimer();
       }
       if (event.type === "tool_execution_update") {
-        const occurrence = this.finalToolResultCount(event.toolCallId);
+        const occurrence = this.finalToolResultCounts.get(event.toolCallId) ?? 0;
         const execution = this.toolExecutions.get(event.toolCallId);
         if (execution?.occurrence === occurrence) {
           execution.toolName = event.toolName;
@@ -869,7 +879,15 @@ export class ConversationViewer implements Component {
 
   private syncFinalToolResultCounts(): void {
     const messages = this.session.messages;
-    if (messages !== this.finalToolResultMessages || messages.length < this.finalToolResultMessageCount) {
+    const firstMessage = messages[0];
+    const lastMessage = messages[messages.length - 1];
+    const isSameLengthReplacement = messages === this.finalToolResultMessages
+      && messages.length === this.finalToolResultMessageCount
+      && (firstMessage !== this.finalToolResultFirstMessage
+        || lastMessage !== this.finalToolResultLastMessage);
+    if (messages !== this.finalToolResultMessages
+      || messages.length < this.finalToolResultMessageCount
+      || isSameLengthReplacement) {
       this.finalToolResultCounts.clear();
       this.finalToolResultMessages = messages;
       this.finalToolResultMessageCount = 0;
@@ -880,6 +898,8 @@ export class ConversationViewer implements Component {
         this.finalToolResultCounts.set(message.toolCallId, (this.finalToolResultCounts.get(message.toolCallId) ?? 0) + 1);
       }
     }
+    this.finalToolResultFirstMessage = firstMessage;
+    this.finalToolResultLastMessage = lastMessage;
   }
 
   private activeHeader(call: ActiveToolCall, width: number): string {
@@ -979,20 +999,15 @@ export class ConversationViewer implements Component {
         return `${id}:${call.toolName}:${String(call.args)}:${output.text}:${output.omitted}`;
       }).join("\u0000")
       : cache?.activeStateSignature;
-    if (this.hasActiveToolCalls() && cache?.width === width && cache.mode === mode
+    const isCacheCompatible = this.hasActiveToolCalls() && cache?.width === width && cache.mode === mode
       && cache.status === this.record.status && cache.activeToolCallCount === activeToolCallCount
-      && cache.executionCount === this.toolExecutions.size && cache.messages === messages
-      && cache.messageCount === messages.length && cache.stateRevision === this.stateRevision
-      && cache.expanded === this.activeOutputExpanded && cache.activeStateSignature === activeStateSignature) {
-      for (const header of cache.headers) {
-        const active = this.activity?.activeToolCalls.get(header.id);
-        const candidate = this.toolExecutions.get(header.id);
-        const execution = candidate?.occurrence === header.occurrence ? candidate : undefined;
-        const startedAt = execution?.startedAt ?? active?.startedAt;
-        cache.lines[header.index] = header.isRunning && this.record.status === "running" && startedAt !== undefined
-          ? this.activeHeader({ toolName: execution?.toolName ?? active?.toolName ?? header.name, args: execution?.args ?? active?.args ?? header.args, startedAt }, width)
-          : truncateToWidth(th.fg(header.isError ? "error" : "muted", `  [Tool: ${header.name}${header.isError ? " · error" : ""}]`), width);
-      }
+      && cache.messages === messages
+      && cache.expanded === this.activeOutputExpanded
+      && cache.staticMessageCount <= messages.length
+      && (cache.staticMessageCount === 0 || messages[cache.staticMessageCount - 1] === cache.staticLastMessage);
+    if (isCacheCompatible && !this.contentDirty && cache.messageCount === messages.length
+      && cache.stateRevision === this.stateRevision && cache.activeStateSignature === activeStateSignature) {
+      for (const header of cache.headers) this.refreshToolHeader(cache.lines, header, width);
       return { lines: cache.lines, toolRanges: cache.toolRanges };
     }
 
@@ -1001,36 +1016,64 @@ export class ConversationViewer implements Component {
       return { lines: [th.fg("dim", "(waiting for first message...)")], toolRanges: [] };
     }
 
-    this.isToolOutputAvailable = false;
-    const finalResults = indexFinalToolResults(messages);
-    const pairedResults = new Set<ToolResultMessage>();
-    const callCounts = new Map<string, number>();
-    for (const message of messages) {
-      if (message.role !== "assistant") continue;
-      for (const call of parseToolCalls(message.content)) {
-        if (call.id) callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
+    const isRebuildingSuffix = isCacheCompatible;
+    const finalResults = isRebuildingSuffix ? cache.staticFinalResults : indexFinalToolResults(messages);
+    const pairedResults = isRebuildingSuffix ? cache.staticPairedResults : new Set<ToolResultMessage>();
+    const callCounts = isRebuildingSuffix ? new Map(cache.staticCallOccurrences) : new Map<string, number>();
+    if (!isRebuildingSuffix) {
+      for (const message of messages) {
+        if (message.role !== "assistant") continue;
+        for (const call of parseToolCalls(message.content)) {
+          if (call.id) callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
+        }
+      }
+      for (const [id, count] of callCounts) {
+        for (const result of finalResults.get(id)?.slice(0, count) ?? []) pairedResults.add(result);
       }
     }
-    for (const [id, count] of callCounts) {
-      for (const result of finalResults.get(id)?.slice(0, count) ?? []) pairedResults.add(result);
-    }
 
-    const lines: string[] = [];
-    const toolRanges: ToolRange[] = [];
+    const lines = isRebuildingSuffix ? cache.lines : [];
+    const toolRanges = isRebuildingSuffix ? cache.toolRanges : [];
+    if (isRebuildingSuffix) {
+      lines.length = cache.staticLineCount;
+      toolRanges.length = cache.staticToolRanges.length;
+    }
     const toolHeaders: ToolHeader[] = [];
     const toolContext: ToolRenderContext = {
       lines,
       finalResults,
       activeOutputs,
-      callOccurrences: new Map(),
+      callOccurrences: isRebuildingSuffix ? new Map(cache.staticCallOccurrences) : new Map(),
       ranges: toolRanges,
       headers: toolHeaders,
       consumedResults: pairedResults,
       width,
     };
-    let needsSeparator = false;
+    let needsSeparator = isRebuildingSuffix ? cache.staticLineCount > 0 : false;
+    let staticMessageCount = isRebuildingSuffix ? cache.staticMessageCount : messages.length;
+    let staticLineCount = isRebuildingSuffix ? cache.staticLineCount : 0;
+    let staticLastMessage = isRebuildingSuffix ? cache.staticLastMessage : undefined;
+    let staticToolRanges = isRebuildingSuffix ? cache.staticToolRanges : [] as ToolRange[];
+    let staticCallOccurrences = isRebuildingSuffix ? cache.staticCallOccurrences : new Map<string, number>();
+    let isStaticToolOutputAvailable = isRebuildingSuffix ? cache.isStaticToolOutputAvailable : false;
+    const activeIds = new Set<string>([
+      ...(this.activity?.activeToolCalls.keys() ?? []),
+      ...[...this.toolExecutions].filter(([, execution]) => execution.result === undefined).map(([id]) => id),
+    ]);
+    const startMessage = isRebuildingSuffix ? cache.staticMessageCount : 0;
+    this.isToolOutputAvailable = isRebuildingSuffix ? cache.isStaticToolOutputAvailable : false;
 
-    for (const message of messages) {
+    for (let messageIndex = startMessage; messageIndex < messages.length; messageIndex++) {
+      const message = messages[messageIndex];
+      if (!isRebuildingSuffix && staticMessageCount === messages.length && message.role === "assistant"
+        && parseToolCalls(message.content).some(call => call.id !== undefined && activeIds.has(call.id))) {
+        staticMessageCount = messageIndex;
+        staticLineCount = lines.length;
+        staticLastMessage = messages[messageIndex - 1];
+        staticToolRanges = [...toolRanges];
+        staticCallOccurrences = new Map(toolContext.callOccurrences);
+        isStaticToolOutputAvailable = this.isToolOutputAvailable;
+      }
       if (message.role === "user") {
         const text = typeof message.content === "string" ? message.content : extractText(message.content);
         if (!text.trim()) continue;
@@ -1054,7 +1097,7 @@ export class ConversationViewer implements Component {
         needsSeparator = true;
       } else if (message.role === "toolResult") {
         if (toolContext.consumedResults.has(message)) continue;
-        const { text, elided } = capResult(extractText(message.content).trim());
+        const { text, elided } = capResult(stripUnsafeTerminalSequences(extractText(message.content)).trim());
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
@@ -1064,9 +1107,9 @@ export class ConversationViewer implements Component {
       } else if ((message as { role?: string }).role === "bashExecution") {
         const bash = message as unknown as { command: string; output?: string };
         if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
+        lines.push(truncateToWidth(th.fg("muted", `  $ ${boundedLine(bash.command)}`), width));
         if (bash.output?.trim()) {
-          const { text, elided } = capResult(bash.output.trim());
+          const { text, elided } = capResult(stripUnsafeTerminalSequences(bash.output).trim());
           lines.push(...this.cachedRawLines(message, text, width, true));
           if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
         }
@@ -1078,7 +1121,9 @@ export class ConversationViewer implements Component {
       lines.push("");
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", describeActivity(this.activity.activeTools, this.activity.responseText)), width));
     }
-    const frame = { lines: lines.map(line => truncateToWidth(line, width)), toolRanges };
+    const clampStart = isRebuildingSuffix ? staticLineCount : 0;
+    for (let i = clampStart; i < lines.length; i++) lines[i] = truncateToWidth(lines[i], width);
+    const frame = { lines, toolRanges };
     if (this.hasActiveToolCalls()) {
       this.activeToolFrameCache = {
         ...frame,
@@ -1093,12 +1138,28 @@ export class ConversationViewer implements Component {
         stateRevision: this.stateRevision,
         expanded: this.activeOutputExpanded,
         activeStateSignature: activeStateSignature ?? "",
+        staticMessageCount,
+        staticLineCount,
+        staticLastMessage,
+        staticFinalResults: finalResults,
+        staticPairedResults: pairedResults,
+        staticCallOccurrences,
+        staticToolRanges,
+        isStaticToolOutputAvailable,
       };
       this.contentDirty = false;
-    } else {
-      this.activeToolFrameCache = undefined;
-    }
+    } else this.activeToolFrameCache = undefined;
     return frame;
+  }
+
+  private refreshToolHeader(lines: string[], header: ToolHeader, width: number): void {
+    const active = this.activity?.activeToolCalls.get(header.id);
+    const candidate = this.toolExecutions.get(header.id);
+    const execution = candidate?.occurrence === header.occurrence ? candidate : undefined;
+    const startedAt = execution?.startedAt ?? active?.startedAt;
+    lines[header.index] = header.isRunning && this.record.status === "running" && startedAt !== undefined
+      ? this.activeHeader({ toolName: execution?.toolName ?? active?.toolName ?? header.name, args: execution?.args ?? active?.args ?? header.args, startedAt }, width)
+      : truncateToWidth(this.theme.fg(header.isError ? "error" : "muted", `  [Tool: ${header.name}${header.isError ? " · error" : ""}]`), width);
   }
 
 }

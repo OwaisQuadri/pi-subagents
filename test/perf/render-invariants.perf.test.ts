@@ -92,20 +92,25 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
     expect(counts.markdownNew).toBe(afterFirst);
   });
 
-  it("keeps elapsed-time frames constant-cost across transcript sizes", () => {
-    function activeWorkFor(messageCount: number, dirty = false): { leaves: number; messageReads: number } {
+  it("rebuilds only the live suffix across tool execution updates", () => {
+    function activeWorkFor(messageCount: number): { leaves: number; messageReads: number } {
       const session = makeSession(messageCount);
       session.messages.push({
         role: "assistant",
         content: [{ type: "toolCall", id: "live-1", name: "bash", arguments: { command: "sleep 10" } }],
       } as any);
       let messageReads = 0;
+      let listener = (_event: unknown) => {};
       session.messages = new Proxy(session.messages, {
         get(target, property, receiver) {
           if (typeof property === "string" && /^\d+$/.test(property)) messageReads++;
           return Reflect.get(target, property, receiver);
         },
       });
+      session.subscribe = (callback: (event: unknown) => void) => {
+        listener = callback;
+        return () => {};
+      };
       const record = makeFleet({ running: 1 })[0];
       const activity = {
         activeTools: new Map([["live-1", "bash"]]),
@@ -119,28 +124,31 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
         responseText: "",
         turnCount: 1,
       };
-      const viewer = new ConversationViewer(perfTui(), session, record, activity, perfTheme, () => {});
+      const viewer = new ConversationViewer(perfTui(), session, record, activity, perfTheme, () => {}, undefined, undefined, undefined, false, () => "off");
       viewer.render(120);
       counts.wrap = 0;
       counts.markdownRender = 0;
       messageReads = 0;
-      if (dirty) (viewer as any).contentDirty = true;
-      viewer.render(120);
+      for (let i = 0; i < 30; i++) {
+        listener({
+          type: "tool_execution_update",
+          toolCallId: "live-1",
+          toolName: "bash",
+          args: { command: "sleep 10" },
+          partialResult: { content: [{ type: "text", text: `chunk ${i}` }] },
+        });
+        viewer.render(120);
+      }
       viewer.dispose();
       return { leaves: counts.wrap + counts.markdownRender, messageReads };
     }
 
-    const small = activeWorkFor(30);
-    const large = activeWorkFor(300);
-    expect(small.leaves).toBeLessThanOrEqual(1);
+    const small = activeWorkFor(2_000);
+    const large = activeWorkFor(10_000);
+    expect(small.leaves).toBeLessThanOrEqual(30);
     expect(large.leaves).toBe(small.leaves);
-    expect(small.messageReads).toBeLessThanOrEqual(1);
+    expect(small.messageReads).toBeLessThanOrEqual(90);
     expect(large.messageReads).toBe(small.messageReads);
-
-    const dirtySmall = activeWorkFor(30, true);
-    const dirtyLarge = activeWorkFor(300, true);
-    expect(dirtySmall.messageReads).toBeLessThanOrEqual(2);
-    expect(dirtyLarge.messageReads).toBe(dirtySmall.messageReads);
   });
 
   it("does not reread completed results during a live output update", () => {
