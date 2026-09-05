@@ -649,6 +649,29 @@ describe("ConversationViewer", () => {
       expect(out.indexOf("$ two")).toBeLessThan(out.indexOf("SECOND LIVE"));
     });
 
+    it("keeps occurrence counts exact across start, end, and no-start reuse", () => {
+      const messages: any[] = [
+        { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "first" } }] },
+      ];
+      const session = mockSession(messages);
+      const viewer = new ConversationViewer(mockTui(200, 120), session, mockRecord(), undefined, ansiTheme(), vi.fn());
+      const listener = session.subscribe.mock.calls[0][0];
+      viewer.render(120);
+      messages.push({ role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: "FIRST RESULT" }] });
+      messages.push({ role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "second" } }] });
+      listener({ type: "tool_execution_start", toolCallId: "dup", toolName: "bash", args: { command: "second" } });
+      listener({ type: "tool_execution_end", toolCallId: "dup", toolName: "bash", result: { content: [{ type: "text", text: "SECOND DONE" }] }, isError: false });
+      viewer.render(120);
+      messages.push({ role: "toolResult", toolCallId: "dup", content: [{ type: "text", text: "SECOND RESULT" }] });
+      messages.push({ role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "third" } }] });
+      listener({ type: "tool_execution_update", toolCallId: "dup", toolName: "bash", args: { command: "third" }, partialResult: { content: [{ type: "text", text: "THIRD LIVE" }] } });
+      const out = strip(viewer.render(120).join("\n"));
+
+      expect((viewer as any).finalToolResultCounts.get("dup")).toBe(2);
+      expect(out.indexOf("SECOND RESULT")).toBeLessThan(out.indexOf("$ third"));
+      expect(out.indexOf("$ third")).toBeLessThan(out.indexOf("THIRD LIVE"));
+    });
+
     it("drops completed state before an identifier is reused without a new event", () => {
       const messages: any[] = [
         { role: "assistant", content: [{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "one" } }] },

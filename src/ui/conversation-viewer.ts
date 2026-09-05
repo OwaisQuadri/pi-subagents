@@ -441,7 +441,6 @@ export class ConversationViewer implements Component {
       this.stateRevision++;
       if (event.type === "tool_execution_start") {
         const occurrence = this.currentFinalToolResultCount(event.toolCallId);
-        this.finalToolResultCounts.set(event.toolCallId, occurrence);
         this.toolExecutions.set(event.toolCallId, {
           occurrence,
           toolName: event.toolName,
@@ -883,11 +882,18 @@ export class ConversationViewer implements Component {
   }
 
   private currentFinalToolResultCount(id: string): number {
-    let count = 0;
-    for (const message of this.session.messages) {
-      if (message.role === "toolResult" && message.toolCallId === id) count++;
+    const messages = this.session.messages;
+    this.finalToolResultCounts.clear();
+    for (const message of messages) {
+      if (message.role === "toolResult" && message.toolCallId) {
+        this.finalToolResultCounts.set(message.toolCallId, (this.finalToolResultCounts.get(message.toolCallId) ?? 0) + 1);
+      }
     }
-    return count;
+    this.finalToolResultMessages = messages;
+    this.finalToolResultFirstMessage = messages[0];
+    this.finalToolResultLastMessage = messages[messages.length - 1];
+    this.finalToolResultMessageCount = messages.length;
+    return this.finalToolResultCounts.get(id) ?? 0;
   }
 
   private syncFinalToolResultCounts(): void {
