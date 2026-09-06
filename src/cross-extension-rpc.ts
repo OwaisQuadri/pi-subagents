@@ -16,6 +16,7 @@
 import { isTopLevelAgent } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
+import type { SessionModelOverride } from "./session-model-override.js";
 import type { AgentRecord } from "./types.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
@@ -31,6 +32,7 @@ export type RpcReply<T = void> =
 
 /** RPC protocol version — bumped when the envelope or method contracts change. */
 export const PROTOCOL_VERSION = 2;
+export const SESSION_MODEL_OVERRIDE_CHANNEL = "subagents:rpc:model_override";
 
 /** Minimal AgentManager interface needed by the spawn/stop/consume RPCs. */
 export interface SpawnCapable {
@@ -62,6 +64,7 @@ export interface RpcDeps {
   pi: unknown;                    // passed through to manager.spawn
   getCtx: () => unknown | undefined;  // returns current ExtensionContext
   manager: SpawnCapable;
+  sessionModelOverride: SessionModelOverride;
 }
 
 export interface RpcHandle {
@@ -70,6 +73,7 @@ export interface RpcHandle {
   unsubStop: () => void;
   unsubConsume: () => void;
   unsubSteer: () => void;
+  unsubModelOverride: () => void;
 }
 
 /**
@@ -101,7 +105,7 @@ function handleRpc<P extends { requestId: string }>(
  * Returns unsub functions for cleanup.
  */
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
-  const { events, pi, getCtx, manager } = deps;
+  const { events, pi, getCtx, manager, sessionModelOverride } = deps;
 
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
     return { version: PROTOCOL_VERSION };
@@ -182,6 +186,29 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     if (!record) throw new Error("Agent not found");
     if (!isTopLevelAgent(record)) throw new Error("Agent is owned by another agent or workflow");
   };
+  const unsubModelOverride = handleRpc<{ requestId: string; [key: string]: unknown }>(
+    events, SESSION_MODEL_OVERRIDE_CHANNEL, (params) => {
+      const ctx = getCtx();
+      if (!ctx) throw new Error("No active session");
+      const { requestId: _requestId, ...request } = params;
+      const { modelRegistry, cwd } = ctx as { modelRegistry?: ModelRegistry; cwd?: string };
+      const validateModel = modelRegistry
+        ? (model: { provider: string; id: string }, modelInput: string) => {
+            const verdict = checkModelScope({
+              model,
+              cwd: cwd ?? process.cwd(),
+              modelRegistry,
+              callerSupplied: true,
+              agentLabel: "session model override",
+              modelInput,
+            });
+            return verdict.kind === "error" ? { success: false, error: verdict.message } : { success: true };
+          }
+        : undefined;
+      const result = sessionModelOverride.update(request, modelRegistry, validateModel);
+      if (!result.success) throw new Error(result.error);
+    },
+  );
 
   const unsubStop = handleRpc<{ requestId: string; agentId: string }>(
     events, "subagents:rpc:stop", ({ agentId }) => {
@@ -217,5 +244,5 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     },
   );
 
-  return { unsubPing, unsubSpawn, unsubStop, unsubConsume, unsubSteer };
+  return { unsubPing, unsubSpawn, unsubStop, unsubConsume, unsubSteer, unsubModelOverride };
 }

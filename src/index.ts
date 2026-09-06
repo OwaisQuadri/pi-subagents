@@ -37,6 +37,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { SessionModelOverride } from "./session-model-override.js";
 import {
   applyAndEmitLoaded,
   applySettings,
@@ -599,6 +600,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Background completion: route through group join or send individual nudge
+  const sessionModelOverride = new SessionModelOverride();
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
@@ -711,7 +713,7 @@ export default function (pi: ExtensionAPI) {
   }, (record, message) => {
     if (!isTopLevelAgent(record)) return;
     pi.events.emit("subagents:steered", { id: record.id, message });
-  });
+  }, sessionModelOverride);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -911,6 +913,7 @@ export default function (pi: ExtensionAPI) {
           },
           steer: (id, message) => manager.steer(id, message),
         },
+        sessionModelOverride,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -1179,6 +1182,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
     rpcHandle?.unsubSteer();
+    rpcHandle?.unsubModelOverride();
     rpcHandle = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child

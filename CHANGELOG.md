@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-extension session model overrides** force the resolved model and thinking level for later new subagents through `subagents:rpc:model_override`. The in-memory policy applies uniformly to top-level, workflow, nested, scheduled, and RPC spawns, can exclude agent types, and is cleared explicitly or on extension shutdown; resumed children keep their existing session model.
 - **Active tool calls in the conversation viewer now show what they are waiting on** ([#277](https://github.com/tintinweb/pi-subagents/issues/277)). Each call renders a bounded, terminal-sanitized argument summary, dynamically increasing elapsed time, Bash timeout status, and a live partial-output tail while it runs; `ctrl+o` toggles a larger bounded view. Concurrent calls are tracked by ID, and completed results retain their existing transcript display.
 - **Live tool output stays in the call's durable conversation-viewer block.** Partial output streams into the same block that later holds the final result. `ctrl+o` keeps bottom-follow on the newest output, and after a manual scroll it keeps the inspected call in place.
 
