@@ -33,7 +33,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
-- **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
+- **Cross-extension RPC** — other pi extensions can spawn, stop, join, or session-override subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, `subagents:rpc:model_override`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
@@ -817,6 +817,26 @@ const unsub = pi.events.on(`subagents:rpc:stop:reply:${requestId}`, (reply) => {
 });
 pi.events.emit("subagents:rpc:stop", { requestId, agentId: "agent-id-here" });
 ```
+
+### Session model override
+
+Force the model and thinking level for later new agents in this extension session. The override applies after normal Agent, workflow, nested, scheduled, and cross-extension spawn resolution; it does not change an existing child or a resumed child. `excludedAgentTypes` is case-insensitive and leaves those types on normal routing. The state is in memory only and is discarded when the extension session ends.
+
+```typescript
+const requestId = crypto.randomUUID();
+const unsub = pi.events.on(`subagents:rpc:model_override:reply:${requestId}`, (reply) => {
+  unsub();
+  if (!reply.success) console.error("Model override failed:", reply.error);
+});
+pi.events.emit("subagents:rpc:model_override", {
+  requestId,
+  model: "openai-codex/gpt-5.5",
+  thinkingLevel: "high",
+  excludedAgentTypes: ["Explore"],
+});
+```
+
+`model` is resolved through the active session's model registry, so an unavailable, misspelled, or out-of-scope value returns the same hard error as `subagents:rpc:spawn` and leaves the existing override untouched. An activation requires `model` and `thinkingLevel` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`); `excludedAgentTypes` is optional. Unknown fields and malformed payloads fail without changing state. Clear a valid override with `{ requestId, clear: true }`.
 
 ### Consume
 
