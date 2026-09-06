@@ -28,7 +28,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
-const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
+const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop", "subagents:rpc:model_override"] as const;
 
 function makePi() {
   const tools = new Map<string, any>();

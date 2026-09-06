@@ -34,6 +34,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { SessionModelOverride } from "./session-model-override.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
@@ -587,6 +588,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Background completion: route through group join or send individual nudge
+  const sessionModelOverride = new SessionModelOverride();
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
@@ -666,7 +668,7 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
-  });
+  }, sessionModelOverride);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -842,6 +844,7 @@ export default function (pi: ExtensionAPI) {
             return true;
           },
         },
+        sessionModelOverride,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -1121,6 +1124,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
+    rpcHandle?.unsubModelOverride();
     rpcHandle = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child

@@ -2,8 +2,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
+import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, SESSION_MODEL_OVERRIDE_CHANNEL, type SpawnCapable } from "../src/cross-extension-rpc.js";
 import { isScopeModelsEnabled, setScopeModelsEnabled } from "../src/model-scope.js";
+import { SessionModelOverride } from "../src/session-model-override.js";
 
 /** Simple in-process event bus for testing. */
 function createEventBus(): EventBus {
@@ -25,6 +26,7 @@ describe("cross-extension RPC", () => {
   let manager: SpawnCapable;
   let ctx: object | undefined;
   let deps: RpcDeps;
+  let sessionModelOverride: SessionModelOverride;
 
   beforeEach(() => {
     events = createEventBus();
@@ -36,7 +38,8 @@ describe("cross-extension RPC", () => {
       consumeResult: vi.fn().mockReturnValue(true),
     };
     ctx = { session: true };
-    deps = { events, pi: { events }, getCtx: () => ctx, manager };
+    sessionModelOverride = new SessionModelOverride();
+    deps = { events, pi: { events }, getCtx: () => ctx, manager, sessionModelOverride };
   });
 
   // --- ping ---
@@ -331,6 +334,60 @@ describe("cross-extension RPC", () => {
 
   // --- concurrent requests ---
 
+  describe("session model override RPC", () => {
+    const forcedModel = { id: "gpt-5.5", provider: "openai-codex", name: "GPT 5.5" };
+    const otherModel = { id: "claude-sonnet-4", provider: "anthropic", name: "Claude Sonnet 4" };
+    const registry = {
+      find: (provider: string, id: string) =>
+        [forcedModel, otherModel].find(model => model.provider === provider && model.id === id),
+      getAll: () => [forcedModel, otherModel],
+      getAvailable: () => [forcedModel, otherModel],
+    };
+
+    beforeEach(() => {
+      ctx = { session: true, modelRegistry: registry };
+      deps = { events, pi: { events }, getCtx: () => ctx, manager, sessionModelOverride };
+    });
+
+    it("activates, excludes, rejects invalid changes, and clears", async () => {
+      registerRpcHandlers(deps);
+      const activateReply = vi.fn();
+      events.on(`${SESSION_MODEL_OVERRIDE_CHANNEL}:reply:req-override`, activateReply);
+      events.emit(SESSION_MODEL_OVERRIDE_CHANNEL, {
+        requestId: "req-override",
+        model: "openai-codex/gpt-5.5",
+        thinkingLevel: "high",
+        excludedAgentTypes: ["Explore"],
+      });
+
+      await vi.waitFor(() => expect(activateReply).toHaveBeenCalledWith({ success: true }));
+      expect(sessionModelOverride.apply("Plan", { model: otherModel, thinkingLevel: "low" })).toEqual({
+        model: forcedModel,
+        thinkingLevel: "high",
+      });
+      expect(sessionModelOverride.apply("explore", { model: otherModel, thinkingLevel: "low" })).toEqual({
+        model: otherModel,
+        thinkingLevel: "low",
+      });
+
+      const invalidReply = vi.fn();
+      events.on(`${SESSION_MODEL_OVERRIDE_CHANNEL}:reply:req-invalid`, invalidReply);
+      events.emit(SESSION_MODEL_OVERRIDE_CHANNEL, {
+        requestId: "req-invalid",
+        clear: true,
+        model: "openai-codex/gpt-5.5",
+      });
+      await vi.waitFor(() => expect(invalidReply).toHaveBeenCalledWith(expect.objectContaining({ success: false })));
+      expect(sessionModelOverride.apply("Plan", {})).toEqual({ model: forcedModel, thinkingLevel: "high" });
+
+      const clearReply = vi.fn();
+      events.on(`${SESSION_MODEL_OVERRIDE_CHANNEL}:reply:req-clear`, clearReply);
+      events.emit(SESSION_MODEL_OVERRIDE_CHANNEL, { requestId: "req-clear", clear: true });
+      await vi.waitFor(() => expect(clearReply).toHaveBeenCalledWith({ success: true }));
+      expect(sessionModelOverride.apply("Plan", { model: otherModel })).toEqual({ model: otherModel });
+    });
+  });
+
   describe("concurrent requests", () => {
     it("handles multiple simultaneous spawn requests independently", async () => {
       let callCount = 0;
@@ -369,7 +426,7 @@ describe("cross-extension RPC", () => {
 
     beforeEach(() => {
       ctx = { session: true, modelRegistry: registry };
-      deps = { events, pi: { events }, getCtx: () => ctx, manager };
+      deps = { events, pi: { events }, getCtx: () => ctx, manager, sessionModelOverride };
     });
 
     it("resolves a string model to a Model instance before manager.spawn", async () => {
@@ -493,7 +550,7 @@ describe("cross-extension RPC", () => {
       );
       setScopeModelsEnabled(true);
       ctx = { session: true, cwd: projectDir, modelRegistry: registry };
-      deps = { events, pi: { events }, getCtx: () => ctx, manager };
+      deps = { events, pi: { events }, getCtx: () => ctx, manager, sessionModelOverride };
     });
 
     afterEach(() => {
@@ -549,6 +606,33 @@ describe("cross-extension RPC", () => {
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x", { model: BLOCKED },
       );
+    });
+
+    it("refuses an out-of-scope override without replacing the active policy", async () => {
+      registerRpcHandlers(deps);
+      const activeReply = vi.fn();
+      events.on(`${SESSION_MODEL_OVERRIDE_CHANNEL}:reply:req-so1`, activeReply);
+      events.emit(SESSION_MODEL_OVERRIDE_CHANNEL, {
+        requestId: "req-so1",
+        model: "openai-codex/gpt-5.5",
+        thinkingLevel: "high",
+      });
+      await vi.waitFor(() => expect(activeReply).toHaveBeenCalledWith({ success: true }));
+
+      const blockedReply = vi.fn();
+      events.on(`${SESSION_MODEL_OVERRIDE_CHANNEL}:reply:req-so2`, blockedReply);
+      events.emit(SESSION_MODEL_OVERRIDE_CHANNEL, {
+        requestId: "req-so2",
+        model: "anthropic/claude-sonnet-4",
+        thinkingLevel: "low",
+      });
+
+      await vi.waitFor(() => expect(blockedReply).toHaveBeenCalled());
+      const call = (blockedReply as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(call.success).toBe(false);
+      expect(call.error).toContain('Model not in scope: "anthropic/claude-sonnet-4"');
+      expect(call.error).toContain("  openai-codex/gpt-5.5");
+      expect(sessionModelOverride.apply("Plan", {})).toEqual({ model: ALLOWED, thinkingLevel: "high" });
     });
   });
 });

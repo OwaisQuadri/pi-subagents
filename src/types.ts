@@ -2,11 +2,11 @@
  * types.ts — Type definitions for the subagent system.
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
 
-export type { ThinkingLevel };
+export type ThinkingLevel = ModelThinkingLevel;
 
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
