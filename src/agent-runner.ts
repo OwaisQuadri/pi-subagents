@@ -18,6 +18,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { ASK_PARENT_QUESTION_TOOL_NAME, captureParentQuestionContext, createAskParentQuestionTool } from "./ask-parent-question.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -875,6 +876,16 @@ export async function runAgent(
     ? [createStructuredOutputTool(options.structuredOutput, structuredCapture)]
     : [];
   const structuredToolNames = new Set(structuredTools.map(tool => tool.name));
+  const parentQuestionTools = !options.isolated && !disallowedSet?.has(ASK_PARENT_QUESTION_TOOL_NAME)
+    ? [
+        createAskParentQuestionTool(
+          options.pi,
+          options.inheritContext ? captureParentQuestionContext(ctx) : undefined,
+          options.onAssistantUsage,
+        ),
+      ]
+    : [];
+  const parentQuestionToolNames = new Set(parentQuestionTools.map(tool => tool.name));
   // Re-admitted together at every gate below. Kept as one set so a new injected
   // tool cannot be added to some of the three gates and forgotten at the rest.
   //
@@ -886,6 +897,7 @@ export async function runAgent(
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
+    ...parentQuestionToolNames,
   ]);
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
@@ -932,6 +944,7 @@ export async function runAgent(
       // satisfy it would make the request unsatisfiable by construction rather
       // than merely restricted.
       ...structuredToolNames,
+      ...parentQuestionToolNames,
     ];
   } else {
     // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
@@ -996,7 +1009,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...structuredTools],
+    customTools: [...nestedTools, ...structuredTools, ...parentQuestionTools],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
