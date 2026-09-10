@@ -19,7 +19,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Each tool call owns one durable, indented block with its arguments and sanitized live or final output. Concurrent calls and out-of-order completions pair by tool-call identifier. Compact blocks show an omission line when needed, their latest three visual output lines, and separate `ctrl+o` expand and collapse lines. `ctrl+o` toggles every block during and after execution. The viewer keeps the inspected tool in place after a manual scroll. Bottom-follow stays on the newest output. Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too. Assistant text renders as Markdown; `m` cycles that between off, assistant-only and everything (see [Viewer markdown](#persistent-settings))
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
-- **Parent questions** — every non-isolated child can call `ask_parent_question`. A child with `inherit_context: true` first checks facts directly established by its spawning conversation; other children ask the user without exposing the parent transcript. Unresolved questions use an in-process `ask-user-question` RPC service
+- **Question tools** — every non-isolated child can call `ask_parent_question` to resolve facts directly established by its permitted parent conversation, or explicitly call `ask_user_question` for a human decision. Each tool respects its own denylist entry; parent questions never open a user dialog
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
 - **Scripted workflows** — a `SubagentWorkflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/agents → Workflows` or by selecting the run in FleetView. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. On by default, but it stands down for company: if another extension already provides a `Workflow` or `SubagentWorkflow` tool, this one warns and disables itself for the session rather than offering the model two orchestrators. Pin it either way with `"workflowsEnabled"` in `subagents.json` or `/agents → Settings → Workflows`. A script written for Claude Code's `Workflow` tool runs here unchanged: same globals, `schema` returns a validated object exactly as it does there, `budget` is present and always reports no token target (pi has no such directive) so its `budget.total`-guarded patterns still take the branch they were written for, and nested `workflow()` composes saved workflows one level deep. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
@@ -461,14 +461,29 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 ### `ask_parent_question`
 
-Available inside child agents unless `isolated: true` or `disallowed_tools` denies it. With `inherit_context: true`, it first checks the direct parent conversation with the parent model. It answers only when they directly determine the result. Without inherited-context permission, or when the inherited context does not determine the answer, it asks the user through `ask-user-question:rpc:*` when that in-process service advertises protocol version `1`.
+Available inside child agents unless `isolated: true` or `disallowed_tools` denies `ask_parent_question`. With `inherit_context: true`, it checks only the direct parent conversation with the parent model and answers only when that context directly determines the result. Without inherited context, or when it is insufficient, it returns `unavailable`; it never opens a user dialog.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `question` | string | yes | The question to resolve |
-| `details` | string | no | Additional context shown to the user when a question is needed |
+| `question` | string | yes | The question to resolve from the direct parent context |
+| `details` | string | no | Accepted but currently unused. The helper receives only `question` and the permitted parent conversation |
 
-It returns JSON with `status` (`answered`, `cancelled`, `unavailable`, or `error`), the original `question`, and, when answered, `source` (`parent_context` or `user`) plus the exact answer text.
+It returns JSON with `status` (`answered`, `cancelled`, `unavailable`, or `error`), the original `question`, and, when answered, `source: "parent_context"` plus the exact answer text.
+
+### `ask_user_question`
+
+Available inside child agents unless `isolated: true` or `disallowed_tools` denies `ask_user_question`. An explicit call opens the root session's existing question dialog through the in-process `ask-user-question` service.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `question` | string | yes | The single question to ask the user |
+| `details` | string | no | Additional context shown with the question |
+| `options` | array | no | Choices with `label`, optional `value`, and optional `description` |
+| `multiSelect` | boolean | no | Allow multiple choices for the question |
+
+The tool returns the normal service result with `content` and `details` unchanged. `details` includes `status` (`answered`, `cancelled`, `invalid`, or `unavailable`), `question`, `mode` (`text`, `single-select`, or `multi-select`), and `answers`. Each answer keeps its `text`, `option`, or `other` type, label, value, and option index where present. Transport failures and malformed question results return `details.status: "error"`.
+
+Discovery requires a synchronous version `1` reply on `ask-user-question:rpc:ping` before the tool calls `ask-user-question:rpc:ask`. Without a compatible service, it returns `unavailable` without sending the question. The question request times out after 300000 milliseconds and returns `error`. Abort stops the wait, forwards cancellation through the service request's signal, and returns `cancelled`.
 
 ### `get_subagent_result`
 
@@ -996,7 +1011,8 @@ src/
   native-memory-compaction.ts # Child-local observational-memory policy for native compaction
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
-  ask-parent-question.ts # Child parent-context decision and ask-user-question RPC fallback
+  ask-parent-question.ts # Child parent-context decision
+  ask-user-question.ts # Child client for the root ask-user-question service
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
   group-join.ts       # Group join manager: batched completion notifications with timeout

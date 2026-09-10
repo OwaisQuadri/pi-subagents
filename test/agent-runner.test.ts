@@ -939,7 +939,7 @@ function customTool(name: string): { execute(id: string, params: unknown): Promi
 
 /** Names of the tools injected into the session as `customTools`. */
 function customToolNames(): string[] {
-  const opts = createAgentSession.mock.calls[0][0];
+  const opts = createAgentSession.mock.calls.at(-1)?.[0] ?? {};
   return ((opts.customTools ?? []) as { name: string }[]).map(tool => tool.name);
 }
 
@@ -1091,8 +1091,14 @@ describe("agent-runner master tool allowlist", () => {
     // Order is not semantically meaningful (pi-mono dedupes via Set);
     // assert membership and exact size instead.
     const tools = lastToolsPassed();
-    expect(tools).toHaveLength(BUILTINS_7.length + 3);
-    expect(new Set(tools)).toEqual(new Set([...BUILTINS_7, "mcp", "mcp_call", "ask_parent_question"]));
+    expect(tools).toHaveLength(BUILTINS_7.length + 4);
+    expect(new Set(tools)).toEqual(new Set([
+      ...BUILTINS_7,
+      "mcp",
+      "mcp_call",
+      "ask_parent_question",
+      "ask_user_question",
+    ]));
   });
 
   it("enumerates tools across multiple loaded extensions", async () => {
@@ -1162,10 +1168,10 @@ describe("agent-runner master tool allowlist", () => {
 
     expect(createNestedSubagentTools).not.toHaveBeenCalled();
     expect(lastToolsPassed()).not.toContain("Agent");
-    expect(customToolNames()).toEqual(["ask_parent_question"]);
+    expect(customToolNames()).toEqual(["ask_parent_question", "ask_user_question"]);
   });
 
-  it("captures parent context only for an eligible child", async () => {
+  it("injects question tools independently without exposing parent context by default", async () => {
     const getBranch = ctx.sessionManager.getBranch as ReturnType<typeof vi.fn>;
     getBranch.mockClear();
     const isolated = createSession("OK");
@@ -1175,23 +1181,34 @@ describe("agent-runner master tool allowlist", () => {
 
     expect(getBranch).not.toHaveBeenCalled();
     expect(customToolNames()).not.toContain("ask_parent_question");
+    expect(customToolNames()).not.toContain("ask_user_question");
 
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ disallowedTools: ["ask_parent_question"] }));
-    const denied = createSession("OK");
-    createAgentSession.mockResolvedValue({ session: denied.session });
+    const parentDenied = createSession("OK");
+    createAgentSession.mockResolvedValue({ session: parentDenied.session });
 
     await runAgent(ctx, "Explore", "go", { pi });
 
     expect(getBranch).not.toHaveBeenCalled();
     expect(customToolNames()).not.toContain("ask_parent_question");
+    expect(customToolNames()).toContain("ask_user_question");
+
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ disallowedTools: ["ask_user_question"] }));
+    const userDenied = createSession("OK");
+    createAgentSession.mockResolvedValue({ session: userDenied.session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(getBranch).not.toHaveBeenCalled();
+    expect(customToolNames()).toContain("ask_parent_question");
+    expect(customToolNames()).not.toContain("ask_user_question");
 
     const eligible = createSession("OK");
     createAgentSession.mockResolvedValue({ session: eligible.session });
     await runAgent(ctx, "Explore", "go", { pi });
 
     expect(getBranch).not.toHaveBeenCalled();
-    expect((createAgentSession.mock.calls.at(-1)?.[0].customTools as { name: string }[])
-      .map(tool => tool.name)).toContain("ask_parent_question");
+    expect(customToolNames()).toEqual(expect.arrayContaining(["ask_parent_question", "ask_user_question"]));
 
     const inherited = createSession("OK");
     createAgentSession.mockResolvedValue({ session: inherited.session });
@@ -1226,7 +1243,7 @@ describe("agent-runner master tool allowlist", () => {
     expect(lastToolsPassed()).toEqual(expect.arrayContaining([
       "Agent", "get_subagent_result", "steer_subagent",
     ]));
-    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(4);
+    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(5);
   });
 
   it("keeps opt-in nested tools active UNDER EXTENSIONS despite the EXCLUDED-name collision", async () => {
@@ -1250,7 +1267,7 @@ describe("agent-runner master tool allowlist", () => {
     const opts = createAgentSession.mock.calls[0][0];
     // (a) not denied at the registry gate, and passed as customTools.
     expect(opts.excludeTools ?? []).not.toContain("Agent");
-    expect(opts.customTools).toHaveLength(4);
+    expect(opts.customTools).toHaveLength(5);
     // (b) survive the active-set renarrow alongside a real extension tool.
     const active = lastToolsPassed();
     expect(active).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent"]));
@@ -1626,7 +1643,11 @@ describe("agent-runner master tool allowlist", () => {
 
     const tools = lastToolsPassed();
     expect(tools).not.toContain("bash");
-    expect(tools).toEqual([...BUILTINS_7.filter((t) => t !== "bash"), "ask_parent_question"]);
+    expect(tools).toEqual([
+      ...BUILTINS_7.filter((t) => t !== "bash"),
+      "ask_parent_question",
+      "ask_user_question",
+    ]);
   });
 
   it("dynamic mode: leaves the allowlist unset, denies via excludeTools, activates post-bind", async () => {
@@ -2447,7 +2468,7 @@ describe("agent-runner ext: tool selectors", () => {
 
     expect(lastLoaderOpts().noExtensions).toBe(true);
     const tools = lastToolsPassed();
-    expect(tools).toEqual(["read", "ask_parent_question"]);
+    expect(tools).toEqual(["read", "ask_parent_question", "ask_user_question"]);
     expect(tools).not.toContain("foo_tool");
     expect(onToolActivity).toHaveBeenCalledWith(
       expect.objectContaining({

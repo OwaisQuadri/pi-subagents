@@ -230,7 +230,9 @@ At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins 
 
 ### `agent(prompt, opts?)`
 
-Spawns one subagent and resolves to its final text — or, with `schema`, to a validated object. Each non-isolated worker also receives `ask_parent_question`, which requests user input through the root event bus without exposing the parent transcript.
+Spawns one subagent and resolves to its final text — or, with `schema`, to a validated object.
+
+Each non-isolated worker also receives two separate tools, `ask_parent_question` and `ask_user_question`. Each tool respects its own `disallowed_tools` entry; `isolated: true` removes both. `ask_parent_question` uses only permitted direct parent context and returns `unavailable` when that context cannot answer. It never escalates to the user. An explicit `ask_user_question` call requests user input through the root event bus without exposing the parent transcript.
 
 **Returns `null` if the agent failed terminally *or* if you skipped it from the inspector**, indistinguishably. Filter with `.filter(Boolean)` when a `null` would break a later stage, and be careful with in-script retry loops: retrying on `null` will re-run something you deliberately skipped.
 
