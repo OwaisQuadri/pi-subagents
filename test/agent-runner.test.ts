@@ -937,8 +937,8 @@ function customTool(name: string): { execute(id: string, params: unknown): Promi
   return tool as unknown as { execute(id: string, params: unknown): Promise<unknown> };
 }
 
-/** Names of the tools injected into the session as `customTools`. */
 function customToolNames(): string[] {
+  expect(createAgentSession).toHaveBeenCalled();
   const opts = createAgentSession.mock.calls.at(-1)?.[0] ?? {};
   return ((opts.customTools ?? []) as { name: string }[]).map(tool => tool.name);
 }

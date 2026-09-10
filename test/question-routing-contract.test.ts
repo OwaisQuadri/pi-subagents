@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession: mocks.createAgentSession,
+  createEventBus: vi.fn(() => ({ emit: vi.fn(), on: vi.fn(() => () => {}) })),
   defineTool: (definition: unknown) => definition,
   DefaultResourceLoader: class {
     async reload() {}
@@ -18,6 +19,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: () => "/agent",
   SessionManager: { inMemory: () => ({}) },
   SettingsManager: { create: () => ({}) },
+  VERSION: "0.85.1",
 }));
 
 vi.mock("../src/agent-types.js", () => ({

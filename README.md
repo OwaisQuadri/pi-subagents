@@ -474,6 +474,8 @@ It returns JSON with `status` (`answered`, `cancelled`, `unavailable`, or `error
 
 Available inside child agents unless `isolated: true` or `disallowed_tools` denies `ask_user_question`. An explicit call opens the root session's existing question dialog through the in-process `ask-user-question` service.
 
+Migration: To prevent child questions from reaching the user, add `ask_user_question` to `disallowed_tools`. Denying `ask_parent_question` alone no longer blocks user questions.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `question` | string | yes | The single question to ask the user |
