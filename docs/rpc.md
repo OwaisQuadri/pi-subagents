@@ -6,6 +6,23 @@ The thing worth understanding up front is that **the bus is in-process.** Every 
 
 For the channel list, the reply envelope, the per-channel snippets and the event table, see [`README.md`](../README.md#cross-extension-rpc). This document is the reference README does not have room for: the complete spawn-option surface, every error string, the notification race, the registry, and what protocol version `2` does and does not promise.
 
+## Child-local memory compaction
+
+Observational-memory emits `om:compaction-policy` on the child's `pi.events` bus. The receiver in `src/native-memory-compaction.ts` handles it during the same synchronous `emit` call, without a reply channel.
+
+The mutable payload has these fields:
+
+- `isEnabled`: boolean; enables the policy or restores the original compaction settings.
+- `contextWindow`: number; the model's context capacity in tokens.
+- `threshold`: number; the token count that triggers compaction.
+- `isApplied`: boolean; the sender initializes it to `false`. The receiver sets it to `true` after it applies or disables the policy, before `emit` returns.
+- `keepRecentTokens`: optional number; a non-negative safe integer that sets a minimum token budget for recent context.
+- `error`: optional string; the receiver's rejection reason.
+
+Enabled policies require positive safe integers for `contextWindow` and `threshold`, with `threshold <= contextWindow`. The receiver rejects invalid policies without changing settings. Callers must check `error` and `isApplied`; an absent receiver leaves `isApplied` false.
+
+The receiver changes only the child's transient `SettingsManager` compaction settings, never parent or on-disk settings. Disabling the policy or releasing the receiver restores the original values. On Pi 0.85.1 or newer, native compaction waits between turns while observational-memory supplies the summary. Standalone observational-memory without this receiver keeps its existing extension-driven compaction path.
+
 ## Spawn options
 
 `subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:698-721`), which deletes internal-only fields first, and then `spawnResolved` (`src/index.ts:666-696`) overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.

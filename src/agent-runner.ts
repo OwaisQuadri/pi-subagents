@@ -11,6 +11,7 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createEventBus,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
@@ -24,6 +25,7 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { installMemoryCompactionPolicy } from "./native-memory-compaction.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -530,19 +532,46 @@ export interface RunResult {
  * Returns an object with a `getText()` getter and an `unsubscribe` function.
  */
 function collectResponseText(session: AgentSession) {
-  let text = "";
+  type AssistantMessage = Extract<AgentSession["messages"][number], { role: "assistant" }>;
+
+  let currentAssistantText = "";
+  let lastNonemptyAssistantText = "";
+  let lastAssistantMessage: AssistantMessage | undefined;
+  let isAssistantEventObserved = false;
+
+  const rememberAssistantMessage = (message: AssistantMessage) => {
+    if (!Array.isArray(message.content)) return;
+    isAssistantEventObserved = true;
+    lastAssistantMessage = message;
+    const text = extractText(message.content).trim();
+    if (text) lastNonemptyAssistantText = text;
+  };
+
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    // message_start also fires for user and toolResult messages — resetting on
-    // those would wipe assistant text already collected. Reset only when a new
-    // ASSISTANT message begins, so getText() is the last assistant message's text.
     if (event.type === "message_start" && event.message.role === "assistant") {
-      text = "";
+      currentAssistantText = "";
+      rememberAssistantMessage(event.message);
+      return;
     }
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      text += event.assistantMessageEvent.delta;
+    if (event.type === "message_update") {
+      if (event.message?.role === "assistant") rememberAssistantMessage(event.message);
+      if (event.assistantMessageEvent.type === "text_delta") {
+        isAssistantEventObserved = true;
+        currentAssistantText += event.assistantMessageEvent.delta;
+        if (currentAssistantText.trim()) lastNonemptyAssistantText = currentAssistantText;
+      }
+      return;
+    }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      rememberAssistantMessage(event.message);
     }
   });
-  return { getText: () => text, unsubscribe };
+  return {
+    getLastAssistantMessage: () => lastAssistantMessage,
+    getLastNonemptyAssistantText: () => lastNonemptyAssistantText,
+    isAssistantEventObserved: () => isAssistantEventObserved,
+    unsubscribe,
+  };
 }
 
 /**
@@ -576,17 +605,21 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
  * Bounded by `startIndex` (like the text fallback) so a resume that produced no
  * assistant message of its own never inherits a PRIOR turn's stop reason.
  */
+function assistantTurnError(message: Extract<AgentSession["messages"][number], { role: "assistant" }> | undefined): string | undefined {
+  if (!message) return undefined;
+  if (message.stopReason === "error") {
+    return message.errorMessage?.trim() || "provider error with no output";
+  }
+  if (message.stopReason === "length" && !extractText(message.content).trim()) {
+    return "run hit the output token limit before producing any text";
+  }
+  return undefined;
+}
+
 function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
   for (let i = session.messages.length - 1; i >= startIndex; i--) {
-    const msg = session.messages[i];
-    if (msg.role !== "assistant") continue;
-    if (msg.stopReason === "error") {
-      return (msg as { errorMessage?: string }).errorMessage?.trim() || "provider error with no output";
-    }
-    if (msg.stopReason === "length" && !extractText(msg.content).trim()) {
-      return "run hit the output token limit before producing any text";
-    }
-    return undefined;
+    const message = session.messages[i];
+    if (message.role === "assistant") return assistantTurnError(message);
   }
   return undefined;
 }
@@ -746,9 +779,14 @@ export async function runAgent(
           };
         };
 
+  const settingsManager = SettingsManager.create(configCwd, agentDir);
+  const eventBus = createEventBus();
+  installMemoryCompactionPolicy(eventBus, settingsManager);
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
+    settingsManager,
+    eventBus,
     noExtensions,
     additionalExtensionPaths,
     extensionsOverride,
@@ -966,7 +1004,6 @@ export async function runAgent(
     sessionExcludeTools = [...denyTools];
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,
@@ -1038,13 +1075,8 @@ export async function runAgent(
       });
     },
   });
-
-  // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
-  // the ACTIVE set still needs managing: pi activates only its four default
-  // built-ins at turn 1, and `ext:` narrowing has no registry-level expression
-  // (we can't deny the name of a tool that hasn't registered yet). Both are
-  // handled below by re-deriving scope from the loader's live extension maps —
-  // `registerTool` writes into those same maps, so late arrivals are judged too.
+  // `allowedToolNames` stays unset for extensions so late tool registrations survive.
+  // Scope active tools below from the loader's live extension maps.
   if (!noExtensions) {
     installExtensionToolScope(session, {
       loader,
@@ -1133,9 +1165,7 @@ export async function runAgent(
     }
   }
 
-  // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
-  const startLen = session.messages.length;
+  const historyFallbackStartIndex = session.messages.length;
   let structuredRetried = false;
   try {
     await session.prompt(effectivePrompt);
@@ -1156,7 +1186,9 @@ export async function runAgent(
     cleanupAbort();
   }
 
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  const isAssistantEventObserved = collector.isAssistantEventObserved();
+  const responseText = collector.getLastNonemptyAssistantText().trim()
+    || (!isAssistantEventObserved ? getLastAssistantText(session, historyFallbackStartIndex) : "");
   // A child asked for structured output that never gave any has failed, however
   // articulate its prose was. Reported through `failure` so it travels the same
   // path as a provider error rather than arriving as a successful empty answer.
@@ -1170,7 +1202,9 @@ export async function runAgent(
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    failure: (isAssistantEventObserved
+      ? assistantTurnError(collector.getLastAssistantMessage())
+      : finalTurnError(session, historyFallbackStartIndex)) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };
@@ -1189,10 +1223,7 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
-  // Boundary for the history fallback: the session already holds prior turns,
-  // so only assistant text produced by THIS resume prompt counts as its output
-  // — a failed resume must not surface the previous turn's answer (#144).
-  const startLen = session.messages.length;
+  const historyFallbackStartIndex = session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
@@ -1242,9 +1273,13 @@ export async function resumeAgent(
     cleanupAbort();
   }
 
+  const isAssistantEventObserved = collector.isAssistantEventObserved();
   return {
-    text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    text: collector.getLastNonemptyAssistantText().trim()
+      || (!isAssistantEventObserved ? getLastAssistantText(session, historyFallbackStartIndex) : ""),
+    failure: isAssistantEventObserved
+      ? assistantTurnError(collector.getLastAssistantMessage())
+      : finalTurnError(session, historyFallbackStartIndex),
   };
 }
 
