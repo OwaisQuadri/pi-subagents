@@ -920,6 +920,8 @@ All RPC replies use a standardized envelope: `{ success: true, data?: T }` on su
 
 **Full reference:** [`docs/rpc.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md) — the complete spawn-option surface (including the fields that are silently stripped), every error string, the completion-notification race, the `Symbol.for("pi-subagents:manager")` registry, and what protocol version `2` does and does not promise. [`tintinweb/pi-tasks`](https://github.com/tintinweb/pi-tasks) is the reference implementation.
 
+Observational-memory uses native awaited compaction through the child-local [`om:compaction-policy` contract](docs/rpc.md#child-local-memory-compaction). It is separate from the top-level request/reply channels.
+
 ### Discovery
 
 Listen for `subagents:ready` to know when RPC handlers are available:
@@ -1126,6 +1128,16 @@ disallowed_tools: write, edit
 
 This is useful for creating agents that inherit extension tools but should not have write access.
 
+## Testing memory compaction
+
+The cross-repository integration test requires the observational-memory package. Set `PI_OM_TEST_ROOT` to that package's root to opt in:
+
+```sh
+PI_OM_TEST_ROOT="<memory-package>" npx vitest run test/e2e/memory-compaction.e2e.test.ts
+```
+
+The test uses the pinned Pi 1.1.0 devDependency with a scripted provider; it needs no network access or provider credentials. It checks final-answer retention for Agent and workflow runs through memory compaction, plus provider-failure and explicit-cancellation controls. Without `PI_OM_TEST_ROOT`, the general `npm test` suite skips this integration suite; other package tests still run.
+
 ## Architecture
 
 ```
@@ -1150,6 +1162,7 @@ src/
 
   # Execution
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
+  native-memory-compaction.ts # Child-local observational-memory policy for native compaction
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   ask-parent-question.ts # Child parent-context decision and ask-user-question RPC fallback
