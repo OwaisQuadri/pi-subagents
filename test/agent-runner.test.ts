@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   createAgentSession,
+  createEventBus,
   defaultResourceLoaderCtor,
   loaderExtensionsRef,
   getAgentDir,
@@ -15,6 +16,7 @@ const {
   settingsManagerGetSessionDir,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
+  createEventBus: vi.fn(() => ({ emit: vi.fn(), on: vi.fn(() => () => {}) })),
   defaultResourceLoaderCtor: vi.fn(),
   loaderExtensionsRef: {
     current: { extensions: [], errors: [], runtime: {} } as {
@@ -33,6 +35,7 @@ const {
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
+  createEventBus,
   // Identity, as pi's own is: `defineTool` exists for the type inference, and
   // the structured-output tool is built through it.
   defineTool: (definition: unknown) => definition,
@@ -66,6 +69,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir,
   SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate, open: sessionManagerOpen },
   SettingsManager: { create: settingsManagerCreate },
+  VERSION: "0.85.1",
 }));
 
 vi.mock("../src/agent-types.js", () => ({
@@ -519,7 +523,43 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
     const result = await resumeAgent(session as any, "go");
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
-    expect(result.text).toBe("new partial"); // this resume's progress, not the prior answer
+    expect(result.text).toBe("new partial");
+  });
+
+  it("uses the final assistant event after compaction replaces resumed history with an empty provider error", async () => {
+    const { session, listeners } = createSession("");
+    session.messages.push(
+      { role: "assistant", content: [{ type: "text", text: "PREVIOUS ANSWER" }], stopReason: "stop" },
+    );
+    session.prompt = vi.fn(async () => {
+      session.messages.splice(0, session.messages.length, { role: "compactionSummary", summary: "compact" }, errorFinal);
+      for (const listener of listeners) {
+        listener({ type: "compaction_end", aborted: false, reason: "threshold", result: { tokensBefore: 10_000 } });
+        listener({ type: "message_end", message: errorFinal });
+      }
+    }) as any;
+
+    const result = await resumeAgent(session as any, "go");
+
+    expect(result.failure).toBe("retries exhausted: 529 overloaded");
+    expect(result.text).toBe("");
+  });
+
+  it("uses a resumed final message without text deltas after compaction", async () => {
+    const { session, listeners } = createSession("");
+    const finalMessage = { role: "assistant", content: [{ type: "text", text: "NEW ANSWER" }], stopReason: "stop" };
+    session.messages.push(
+      { role: "assistant", content: [{ type: "text", text: "PREVIOUS ANSWER" }], stopReason: "stop" },
+    );
+    session.prompt = vi.fn(async () => {
+      session.messages.splice(0, session.messages.length, { role: "compactionSummary", summary: "compact" }, finalMessage);
+      for (const listener of listeners) listener({ type: "message_end", message: finalMessage });
+    }) as any;
+
+    const result = await resumeAgent(session as any, "go");
+
+    expect(result.failure).toBeUndefined();
+    expect(result.text).toBe("NEW ANSWER");
   });
 
   it("collector: a toolResult/user message_start no longer wipes collected assistant text", async () => {
