@@ -46,14 +46,14 @@ function parent(): ParentQuestionContext {
     conversation: "User chose blue.",
     model: { provider: "faux", id: "model" } as ParentQuestionContext["model"],
     thinkingLevel: "low",
-    modelRegistry: { runtime: { id: "runtime" } } as ParentQuestionContext["modelRegistry"],
+    modelRegistry: { runtime: { id: "runtime" } } as unknown as ParentQuestionContext["modelRegistry"],
   };
 }
 
-function helperSession(decision: { status: "answered"; answer: string } | { status: "needs_user" }) {
+function helperSession(decision: { status: "answered"; answer: string } | { status: "unanswered" }) {
   const session = {
     prompt: vi.fn(async () => {}),
-    subscribe: vi.fn(() => () => {}),
+    subscribe: vi.fn<(listener: (event: unknown) => void) => () => void>(() => () => {}),
     abort: vi.fn(async () => {}),
     dispose: vi.fn(),
   };
@@ -77,7 +77,7 @@ beforeEach(() => {
 });
 
 describe("ask_parent_question helper", () => {
-  it("asks the user without exposing parent context when inheritance is disabled", async () => {
+  it("returns unavailable without exposing parent context when inheritance is disabled", async () => {
     const listeners = new Map<string, Array<(payload: unknown) => void>>();
     const events = {
       on(channel: string, listener: (payload: unknown) => void) {
@@ -100,10 +100,9 @@ describe("ask_parent_question helper", () => {
     const result = await tool.execute("question-1", { question: "Which color?" }, undefined, undefined, {});
 
     expect(result.details).toEqual({
-      status: "answered",
-      source: "user",
+      status: "unavailable",
       question: "Which color?",
-      answer: "user answer",
+      message: "Parent context is unavailable.",
     });
     expect(mocks.createAgentSession).not.toHaveBeenCalled();
   });
@@ -205,7 +204,7 @@ describe("ask_parent_question helper", () => {
     expect(providerSchema).toMatchObject({
       type: "object",
       properties: {
-        status: { anyOf: [{ const: "answered" }, { const: "needs_user" }] },
+        status: { anyOf: [{ const: "answered" }, { const: "unanswered" }] },
         answer: { type: "string" },
       },
       required: ["status"],
@@ -220,8 +219,8 @@ describe("ask_parent_question helper", () => {
     )).resolves.toMatchObject({ isError: true });
   });
 
-  it("falls back to the user when the helper decides it needs user input", async () => {
-    helperSession({ status: "needs_user" });
+  it("returns unavailable when the helper cannot answer from parent context", async () => {
+    helperSession({ status: "unanswered" });
     const emitted: string[] = [];
     const listeners = new Map<string, Array<(payload: unknown) => void>>();
     const events = {
@@ -243,12 +242,11 @@ describe("ask_parent_question helper", () => {
     const result = await tool.execute("question-1", { question: "Which color?" }, undefined, undefined, {});
 
     expect(result.details).toEqual({
-      status: "answered",
-      source: "user",
+      status: "unavailable",
       question: "Which color?",
-      answer: "user answer",
+      message: "Parent context does not directly answer the question.",
     });
-    expect(emitted).toEqual(["ask-user-question:rpc:ping", "ask-user-question:rpc:ask"]);
+    expect(emitted).toEqual([]);
   });
 
   it("skips the helper model when inherited parent context is empty", async () => {
@@ -270,7 +268,11 @@ describe("ask_parent_question helper", () => {
 
     const result = await tool.execute("question-1", { question: "Which color?" }, undefined, undefined, {});
 
-    expect(result.details).toMatchObject({ status: "answered", source: "user" });
+    expect(result.details).toEqual({
+      status: "unavailable",
+      question: "Which color?",
+      message: "Parent context is unavailable.",
+    });
     expect(mocks.createAgentSession).not.toHaveBeenCalled();
   });
 

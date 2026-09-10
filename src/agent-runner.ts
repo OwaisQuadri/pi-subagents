@@ -24,6 +24,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { ASK_PARENT_QUESTION_TOOL_NAME, captureParentQuestionContext, createAskParentQuestionTool } from "./ask-parent-question.js";
+import { ASK_USER_QUESTION_TOOL_NAME, createAskUserQuestionTool } from "./ask-user-question.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -1190,7 +1191,13 @@ export async function runAgent(
         ),
       ]
     : [];
-  const parentQuestionToolNames = new Set(parentQuestionTools.map(tool => tool.name));
+  const userQuestionTools = !options.isolated && !disallowedSet?.has(ASK_USER_QUESTION_TOOL_NAME)
+    ? [createAskUserQuestionTool(options.pi)]
+    : [];
+  const questionToolNames = new Set([
+    ...parentQuestionTools.map(tool => tool.name),
+    ...userQuestionTools.map(tool => tool.name),
+  ]);
   // Re-admitted together at every gate below. Kept as one set so a new injected
   // tool cannot be added to some of the three gates and forgotten at the rest.
   //
@@ -1202,7 +1209,7 @@ export async function runAgent(
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
-    ...parentQuestionToolNames,
+    ...questionToolNames,
   ]);
 
   // As in Claude Code, refuse an agent whose `tools:` list resolved to nothing: with
@@ -1224,7 +1231,7 @@ export async function runAgent(
   if (
     (unrecognized.length > 0 || unmatched.length > 0) &&
     toolNames.every((n) => !BUILTIN_TOOL_NAMES.includes(n) || disallowedSet?.has(n)) &&
-    readmitToolNames.size === 0 &&
+    [...readmitToolNames].every((name) => questionToolNames.has(name)) &&
     !extensionToolsPossible
   ) {
     const reasons = [
@@ -1283,7 +1290,7 @@ export async function runAgent(
       // satisfy it would make the request unsatisfiable by construction rather
       // than merely restricted.
       ...structuredToolNames,
-      ...parentQuestionToolNames,
+      ...questionToolNames,
     ];
   } else {
     // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
@@ -1348,7 +1355,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...structuredTools, ...parentQuestionTools],
+    customTools: [...nestedTools, ...structuredTools, ...parentQuestionTools, ...userQuestionTools],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
