@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Child `ask_parent_question` tool** resolves answers directly determined by the direct-parent conversation when `inherit_context` permits access. Other questions use the in-process `ask-user-question` service; isolated and denylisted children do not receive the tool.
+- **Separate child question tools** keep `ask_parent_question` limited to facts directly determined by permitted parent context and return `unavailable` otherwise. Explicit `ask_user_question` calls the existing root dialog service and preserves all selected answers; isolated children receive neither tool and each tool has its own denylist entry.
 - **Cross-extension session model overrides** force the resolved model and thinking level for later new subagents through `subagents:rpc:model_override`. The in-memory policy applies uniformly to top-level, workflow, nested, scheduled, and RPC spawns, can exclude agent types, and is cleared explicitly or on extension shutdown; resumed children keep their existing session model.
 - **Tool calls keep their live and final output in one durable conversation-viewer block** ([#277](https://github.com/tintinweb/pi-subagents/issues/277)). Each call renders bounded, terminal-sanitized arguments and output under one indent. Results pair by tool-call identifier when parallel calls complete out of order or when a user reopens history. Compact blocks show an omission line, three visual output lines, and a separate expansion hint. `ctrl+o` toggles every block and keeps bottom-follow on the newest output. After a manual scroll, the viewer keeps the inspected call in place.
 
