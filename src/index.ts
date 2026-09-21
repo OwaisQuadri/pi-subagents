@@ -34,7 +34,6 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { SessionModelOverride } from "./session-model-override.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
@@ -587,8 +586,6 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Background completion: route through group join or send individual nudge
-  const sessionModelOverride = new SessionModelOverride();
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
@@ -663,12 +660,8 @@ export default function (pi: ExtensionAPI) {
       compactionCount: record.compactionCount,
     });
   }, (_record, usage) => {
-    // Every assistant message from every agent — nested included, exactly once.
-    // Parked here until a tool result can carry it back to the parent session;
-    // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
-    // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
-  }, sessionModelOverride);
+  });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -844,7 +837,6 @@ export default function (pi: ExtensionAPI) {
             return true;
           },
         },
-        sessionModelOverride,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -1639,12 +1631,12 @@ Terse command-style prompts produce shallow, generic work.
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to inherit the current parent model.',
         }),
       ),
       thinking: Type.Optional(
         Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit the current parent thinking level.`,
         }),
       ),
       max_turns: Type.Optional(
@@ -1838,13 +1830,11 @@ Terse command-style prompts produce shallow, generic work.
         defaultRunInBackground: getBackgroundByDefault(),
       });
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
       let model = ctx.model;
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
+          return textResult(resolved);
         } else {
           model = resolved;
         }
@@ -1881,34 +1871,12 @@ Terse command-style prompts produce shallow, generic work.
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
       };
 
-      // Unconditional, not "only when it differs from the parent": a thinking
-      // level reads as a property of a model, and an agent that inherited the
-      // parent's model used to show the level with nothing to attach it to.
-      // This is the pre-session snapshot — agent-manager overwrites it with the
-      // effective values the moment a session reports them.
       const { modelName, modelId } = model ? describeModel(model) : { modelName: undefined, modelId: undefined };
-      // What the caller SPELLED, kept only if it names a different model than the
-      // one that won. Model input is fuzzy — `"haiku"` and
-      // `"anthropic/claude-haiku-4-5"` are the same model — so comparing the two
-      // strings would disclose an override that never happened. A spelling that
-      // resolves to nothing is still worth disclosing: it cannot have taken effect.
-      const askedModel = ((asked: string | undefined) => {
-        if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
-        if (typeof resolvedAsked === "string") return asked;
-        return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
-      })(resolvedConfig.overridden?.model);
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
         modelId,
         thinking,
-        // Only set where the agent file outranked the caller, so the surfaces can
-        // disclose a parameter that was accepted but could not take effect (#182).
-        requestedThinking: resolvedConfig.overridden?.thinking,
-        requestedModel: askedModel,
-        // Explicit value only — the default fallback would just add noise.
-        // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
         isolated,
         inheritContext,

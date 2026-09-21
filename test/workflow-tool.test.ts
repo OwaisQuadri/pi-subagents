@@ -263,8 +263,6 @@ describe("createWorkflowHost — spawn mapping", () => {
   });
 
   it("leaves thinkingLevel unset when no effort was asked for", async () => {
-    // The agent definition's `thinking` resolves it downstream; sending
-    // `undefined` explicitly would be the same, but sending a default would not.
     const stub = stubManager();
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
@@ -396,19 +394,17 @@ describe("createWorkflowHost — scopeModels", () => {
     expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(ALLOWED);
   });
 
-  it("warns but still spawns when the agent file pinned the out-of-scope model", async () => {
-    // User-authored config, not a choice the script made — the model folds into
-    // `modelInput`, so keying `callerSupplied` off it would wrongly hard-error.
+  it("ignores an out-of-scope definition pin and uses the parent", async () => {
     setScopeModelsEnabled(true);
     const stub = stubManager();
-    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx({ model: ALLOWED }), manager: stub.manager });
 
     const result = await host.spawnAgent(request({ agentType: "pinned" }));
 
     expect(result.ok).toBe(true);
     expect(stub.spawnAndWait).toHaveBeenCalledTimes(1);
-    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(BLOCKED);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("out-of-scope model"), "warning");
+    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(ALLOWED);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("warns but still spawns on an inherited parent model", async () => {
@@ -430,10 +426,10 @@ describe("createWorkflowHost — scopeModels", () => {
     );
   });
 
-  it("toasts a repeated warning once, not once per child of a fan-out", async () => {
+  it("toasts a repeated parent warning once, not once per child of a fan-out", async () => {
     setScopeModelsEnabled(true);
     const stub = stubManager();
-    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx({ model: BLOCKED }), manager: stub.manager });
 
     for (let i = 0; i < 3; i++) {
       const spawned = await host.spawnAgent(request({ agentId: `wf-agent-${i}`, agentType: "pinned" }));

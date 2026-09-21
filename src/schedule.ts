@@ -229,17 +229,19 @@ export class SubagentScheduler {
 
     store.update(id, { lastStatus: "running" });
 
-    // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
-    let resolvedModel: any | undefined;
-    if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
-    }
-
     let agentId: string;
     try {
+      // Resolve the model at fire time — registry contents may have changed since
+      // the job was created (auth added/removed). An explicit model that no longer
+      // resolves is an error, like it is for the Agent tool and workflows: the job
+      // must not silently run on a model its owner never chose for it. A job with
+      // no model inherits the parent's current selection in `spawn`.
+      let resolvedModel: any | undefined;
+      if (job.model) {
+        const resolved = resolveModel(job.model, ctx.modelRegistry);
+        if (typeof resolved === "string") throw new Error(resolved);
+        resolvedModel = resolved;
+      }
       // Re-resolve at fire time against the registry as it stands. This does not
       // reload from disk (the scheduler has no reason to rebuild process-global
       // state from a timer), so it catches changes that went through /agents or

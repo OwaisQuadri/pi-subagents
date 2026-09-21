@@ -241,14 +241,16 @@ Each non-isolated worker also receives two separate tools, `ask_parent_question`
 | `label` | string | Display name in the progress tree. Also the handle `resume` addresses |
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
-| `model` | string | `provider/modelId`, or fuzzy like `haiku` |
-| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
+| `model` | string | Explicit user choice: `provider/modelId` or a fuzzy name. Omit to inherit the current parent model |
+| `effort` | string | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omit to inherit the current parent thinking level |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
+
+Definition and registry pins do not select the child model or thinking level. Each new dispatch uses the current parent selection, including later calls through the same workflow host. Explicit values apply only to their own invocation.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
 

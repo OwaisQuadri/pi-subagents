@@ -869,13 +869,14 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
-
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  const model = options.model ?? (options.resumeSessionFile
+    ? resolveDefaultModel(ctx.model, ctx.modelRegistry, agentConfig?.model)
+    : ctx.model);
+  // `||` and not `??`: an empty string is an omitted field and must inherit, the
+  // same way an empty `model` does. "off" is non-empty and stays explicit.
+  const thinkingLevel = (options.thinkingLevel || undefined) ?? (options.resumeSessionFile
+    ? agentConfig?.thinking
+    : ctx.thinkingLevel ?? options.pi.getThinkingLevel?.());
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)

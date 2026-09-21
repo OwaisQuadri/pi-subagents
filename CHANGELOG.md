@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Separate child question tools** keep `ask_parent_question` limited to facts directly determined by permitted parent context and return `unavailable` otherwise. Explicit `ask_user_question` calls the existing root dialog service and preserves all selected answers; isolated children receive neither tool and each tool has its own denylist entry.
-- **Cross-extension session model overrides** force the resolved model and thinking level for later new subagents through `subagents:rpc:model_override`. The in-memory policy applies uniformly to top-level, workflow, nested, scheduled, and RPC spawns, can exclude agent types, and is cleared explicitly or on extension shutdown; resumed children keep their existing session model.
 - **Tool calls keep their live and final output in one durable conversation-viewer block** ([#277](https://github.com/tintinweb/pi-subagents/issues/277)). Each call renders bounded, terminal-sanitized arguments and output under one indent. Results pair by tool-call identifier when parallel calls complete out of order or when a user reopens history. Compact blocks show an omission line, three visual output lines, and a separate expansion hint. `ctrl+o` toggles every block and keeps bottom-follow on the newest output. After a manual scroll, the viewer keeps the inspected call in place.
 
 ### Changed
@@ -26,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selector `[pi-subagents]` is unaffected and remains the documented way to select it).
   A config that selected this extension as `extensions: ["src"]` or `tools: ext:src`
   must switch to the package name.
+- **BREAKING: new children always inherit the parent's current model and thinking level.** Both values are captured together when the child is dispatched, so a queued child keeps the pair the user had selected. Agent-file `model:` and `thinking:` fields no longer select either value for a new child; pass `model` or `thinking` on the invocation to choose something else for that child only. A scheduled job whose explicit model no longer resolves now fails with an error instead of running on the parent's model.
 
 ### Fixed
 

@@ -1,6 +1,6 @@
 # Driving subagents from another extension
 
-Another pi extension can spawn a subagent, listen for subagent completion, read the result, stop the run, or force later new children onto one model and thinking level — all over the `pi.events` bus, without importing this package directly. Five request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, `subagents:rpc:model_override`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
+Another pi extension can spawn a subagent, listen for completion, read the result, or stop the run through the `pi.events` bus. It does not need to import this package. Four active request/reply channels and one retired channel (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, `subagents:rpc:model_override`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
 
 The thing worth understanding up front is that **the bus is in-process.** Every "RPC" call here is a synchronous `pi.events.emit` into the same event loop, and every reply comes back the same way. An explicit child `ask_user_question` call probes `ask-user-question:rpc:ping` synchronously, then calls `ask-user-question:rpc:ask`. That service is external to this extension and must advertise version `1`. **Its ping handler must emit the reply synchronously**; the client treats an asynchronous reply as unavailable. That single fact explains most of what follows: why `signal` and the `on*` callbacks work on a spawn payload at all, why a `consume` fired inside a `subagents:completed` handler lands *before* the notification decision has been made, and why none of this survives a real process boundary.
 
@@ -88,20 +88,9 @@ One of these already shipped as a bug in this project's own README example, so i
 
 ## Session model override
 
-`subagents:rpc:model_override` owns a session-local forced model policy. Send an activation payload with all of `requestId`, `model`, and `thinkingLevel`; `excludedAgentTypes` is optional. `model` is resolved and checked against `scopeModels` through the active session's `ctx.modelRegistry` before the policy changes, so an unavailable or out-of-scope model returns the same hard error as a spawn override and leaves the prior policy in place. `thinkingLevel` must be one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. `excludedAgentTypes`, when present, must be an array of non-empty strings and is matched case-insensitively against agent types.
+`subagents:rpc:model_override` is retired. Requests return `{ success: false, error }` with a retirement message. They do not change later children. The rejection handler remains so older callers receive a reply.
 
-```ts
-pi.events.emit("subagents:rpc:model_override", {
-  requestId: crypto.randomUUID(),
-  model: "openai-codex/gpt-5.5",
-  thinkingLevel: "high",
-  excludedAgentTypes: ["Explore"],
-});
-```
-
-A successful activation replies `{ success: true }` on `subagents:rpc:model_override:reply:<requestId>`. It becomes the final policy after normal caller, agent-file, and workflow resolution for every **new** top-level `Agent`, workflow `agent()`, nested `Agent`, scheduled agent, and `subagents:rpc:spawn` agent. Excluded types keep their normal route. The policy is applied at the manager's common spawn funnel, so those surfaces cannot diverge. It never changes a running agent or a resumed child, whose existing session retains its model.
-
-Clear it with exactly `{ requestId, clear: true }`. Activation payloads with unknown fields, missing or malformed values, an unresolvable model, or a clear payload with any other field reply `{ success: false, error }` and leave the existing policy unchanged. The policy is only held in this extension activation's memory: it is not written to settings, schedules, transcripts, or session entries and does not survive extension shutdown.
+New children inherit the current parent model and thinking level. To use a user-selected alternative for one spawn, pass `options.model` or `options.thinkingLevel` to `subagents:rpc:spawn`. Definition and registry pins do not select the child model or thinking level. In-memory resumes reuse the existing child session. File-based resumes retain their previous model and thinking resolution.
 
 ## Errors
 

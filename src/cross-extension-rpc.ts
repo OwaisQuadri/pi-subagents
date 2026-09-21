@@ -16,7 +16,6 @@
 import { isTopLevelAgent } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
-import type { SessionModelOverride } from "./session-model-override.js";
 import type { AgentRecord } from "./types.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
@@ -56,10 +55,9 @@ export interface SpawnCapable {
 
 export interface RpcDeps {
   events: EventBus;
-  pi: unknown;                    // passed through to manager.spawn
-  getCtx: () => unknown | undefined;  // returns current ExtensionContext
+  pi: unknown;
+  getCtx: () => unknown | undefined;
   manager: SpawnCapable;
-  sessionModelOverride: SessionModelOverride;
 }
 
 export interface RpcHandle {
@@ -94,12 +92,8 @@ function handleRpc<P extends { requestId: string }>(
   });
 }
 
-/**
- * Register ping, spawn, stop, and consume RPC handlers on the event bus.
- * Returns unsub functions for cleanup.
- */
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
-  const { events, pi, getCtx, manager, sessionModelOverride } = deps;
+  const { events, pi, getCtx, manager } = deps;
 
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
     return { version: PROTOCOL_VERSION };
@@ -169,26 +163,8 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   );
 
   const unsubModelOverride = handleRpc<{ requestId: string; [key: string]: unknown }>(
-    events, SESSION_MODEL_OVERRIDE_CHANNEL, (params) => {
-      const ctx = getCtx();
-      if (!ctx) throw new Error("No active session");
-      const { requestId: _requestId, ...request } = params;
-      const { modelRegistry, cwd } = ctx as { modelRegistry?: ModelRegistry; cwd?: string };
-      const validateModel = modelRegistry
-        ? (model: { provider: string; id: string }, modelInput: string) => {
-            const verdict = checkModelScope({
-              model,
-              cwd: cwd ?? process.cwd(),
-              modelRegistry,
-              callerSupplied: true,
-              agentLabel: "session model override",
-              modelInput,
-            });
-            return verdict.kind === "error" ? { success: false, error: verdict.message } : { success: true };
-          }
-        : undefined;
-      const result = sessionModelOverride.update(request, modelRegistry, validateModel);
-      if (!result.success) throw new Error(result.error);
+    events, SESSION_MODEL_OVERRIDE_CHANNEL, () => {
+      throw new Error("Session model overrides are retired. Select the parent model and thinking level, or pass explicit spawn options.");
     },
   );
 
