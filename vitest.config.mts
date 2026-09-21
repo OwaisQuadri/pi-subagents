@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   // The print-mode e2e suite (test/subagents-print-mode-e2e.test.ts) drives REAL
@@ -13,6 +13,10 @@ export default defineConfig({
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
+    // `.context/` holds ignored task evidence, including symlinks into other
+    // repositories whose test files are not vitest suites. Collecting them fails
+    // the run with "No test suite found".
+    exclude: [...configDefaults.exclude, ".context/**"],
     // Local reporting only — deliberately no `thresholds`, and not wired into
     // CI. src/index.ts is mostly the /agents wizard, which is TUI flow with
     // almost no logic and is not worth a fake-TUI harness; any global floor

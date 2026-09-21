@@ -19,7 +19,7 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 
 describe("resolveAgentInvocationConfig", () => {
-  it("prefers agent config over tool-call params for locked fields", () => {
+  it("uses explicit model and thinking while preserving other locked fields", () => {
     const resolved = resolveAgentInvocationConfig(
       makeConfig({
         model: "provider/config-model",
@@ -41,9 +41,9 @@ describe("resolveAgentInvocationConfig", () => {
       },
     );
 
-    expect(resolved.modelInput).toBe("provider/config-model");
-    expect(resolved.modelFromParams).toBe(false);
-    expect(resolved.thinking).toBe("high");
+    expect(resolved.modelInput).toBe("provider/param-model");
+    expect(resolved.modelFromParams).toBe(true);
+    expect(resolved.thinking).toBe("minimal");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
     expect(resolved.runInBackground).toBe(false);
@@ -149,45 +149,25 @@ describe("resolveJoinMode", () => {
   });
 });
 
-describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
-  it("records the caller's values when the agent file outranks them", () => {
+describe("resolveAgentInvocationConfig — parent selection", () => {
+  it("ignores pins when the call supplies no selection", () => {
+    const resolved = resolveAgentInvocationConfig(
+      makeConfig({ model: "provider/config-model", thinking: "low" }), {},
+    );
+    expect(resolved.modelInput).toBeUndefined();
+    expect(resolved.thinking).toBeUndefined();
+    expect(resolved.modelFromParams).toBe(false);
+    expect(resolved).not.toHaveProperty("overridden");
+  });
+
+  it("keeps each explicit choice without override bookkeeping", () => {
     const resolved = resolveAgentInvocationConfig(
       makeConfig({ model: "provider/config-model", thinking: "low" }),
-      { model: "provider/param-model", thinking: "max" },
+      { model: "provider/param-model", thinking: "off" },
     );
-
-    expect(resolved.overridden).toEqual({ thinking: "max", model: "provider/param-model" });
-  });
-
-  it("records nothing when the caller got what they asked for", () => {
-    const resolved = resolveAgentInvocationConfig(
-      makeConfig({ model: "provider/same", thinking: "high" }),
-      { model: "provider/same", thinking: "high" },
-    );
-
-    expect(resolved.overridden).toBeUndefined();
-  });
-
-  it("records nothing when only one side named a value", () => {
-    // Config-only is the agent's own default, not an override; param-only won
-    // outright. Neither is a request that went unhonored.
-    expect(resolveAgentInvocationConfig(
-      makeConfig({ model: "provider/config-model", thinking: "low" }),
-      {},
-    ).overridden).toBeUndefined();
-
-    expect(resolveAgentInvocationConfig(
-      makeConfig(),
-      { model: "provider/param-model", thinking: "max" },
-    ).overridden).toBeUndefined();
-  });
-
-  it("records each field independently", () => {
-    const resolved = resolveAgentInvocationConfig(
-      makeConfig({ thinking: "low" }),
-      { model: "provider/param-model", thinking: "max" },
-    );
-
-    expect(resolved.overridden).toEqual({ thinking: "max", model: undefined });
+    expect(resolved.modelInput).toBe("provider/param-model");
+    expect(resolved.thinking).toBe("off");
+    expect(resolved.modelFromParams).toBe(true);
+    expect(resolved).not.toHaveProperty("overridden");
   });
 });

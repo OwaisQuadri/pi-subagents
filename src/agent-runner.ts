@@ -1162,16 +1162,17 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
+  // Resolve model: explicit option > parent model; a file-based resume keeps config.model > parent model.
+  const model = options.model ?? (options.resumeSessionFile
+    ? resolveDefaultModel(ctx.model, ctx.modelRegistry, agentConfig?.model)
+    : ctx.model);
 
-  // Resolve thinking level: explicit option > agent config > parent session level.
-  // Without the parent step, an unset level falls through to pi's
-  // defaultThinkingLevel (e.g. "max") instead of matching the spawning session.
-  // Same idiom as mention-clone.ts.
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking ?? ctx.thinkingLevel;
+  // Resolve thinking level: a non-empty explicit option > parent session level; a file-based
+  // resume keeps agent config > parent. Without the parent step, an unset level falls through
+  // to pi's defaultThinkingLevel (e.g. "max") instead of matching the spawning session.
+  const thinkingLevel = (options.thinkingLevel || undefined) ?? (options.resumeSessionFile
+    ? agentConfig?.thinking ?? ctx.thinkingLevel
+    : ctx.thinkingLevel ?? options.pi.getThinkingLevel?.());
 
   // The `agent({ schema })` contract: this child reports its answer by calling
   // StructuredOutput, and `structuredJson` below is what the caller reads. The

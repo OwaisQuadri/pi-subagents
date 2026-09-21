@@ -44,7 +44,7 @@ function makeCtx(cwd: string) {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
-    model: undefined,
+    model: MODELS[0],
     modelRegistry: {
       find: (provider: string, id: string) => MODELS.find(model => model.provider === provider && model.id === id),
       getAvailable: () => MODELS,
@@ -92,7 +92,7 @@ describe("agentOverrides wiring", () => {
     vi.clearAllMocks();
   });
 
-  it("uses an Explore model override without changing Explore's read-only tools", async () => {
+  it("ignores an Explore model pin without changing Explore's read-only tools", async () => {
     const { pi, tools } = makePi();
     subagentsExtension(pi as never);
     const agent = tools.get("Agent");
@@ -106,7 +106,7 @@ describe("agentOverrides wiring", () => {
       makeCtx(cwd),
     );
 
-    expect(vi.mocked(runAgent).mock.lastCall?.[3]?.model).toEqual(MODELS[1]);
+    expect(vi.mocked(runAgent).mock.lastCall?.[3]?.model).toEqual(MODELS[0]);
     expect(getAgentConfig("Explore")?.builtinToolNames).toEqual(["read", "bash", "grep", "find", "ls"]);
   });
 });
