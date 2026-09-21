@@ -296,6 +296,23 @@ describe("SubagentScheduler — fire path", () => {
     );
   });
 
+  it("refuses at fire time when the job's explicit model no longer resolves", () => {
+    // No silent substitute: a job pinned to a model must not run on another one.
+    const job = scheduler.addJob({
+      name: "model-gone", description: "vanished model", schedule: "+1s",
+      subagent_type: "general-purpose", prompt: "run", model: "fixture/removed-since",
+    });
+
+    vi.advanceTimersByTime(2_000);
+
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(store.get(job.id)?.lastStatus).toBe("error");
+    expect(pi.events.emit).toHaveBeenCalledWith(
+      "subagents:scheduled",
+      expect.objectContaining({ type: "error", error: expect.stringContaining("removed-since") }),
+    );
+  });
+
   it("one-shot fires once and auto-disables", async () => {
     const job = scheduler.addJob({
       name: "soon", description: "once", schedule: "+1s",

@@ -197,29 +197,18 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
-      // Same precedence as the Agent tool: the caller's model wins, the agent
-      // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
-      const modelInput = request.model ?? config?.model;
+      const modelInput = request.model;
       if (modelInput !== undefined) {
         const resolved = resolveModel(modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
+          return { ok: false, error: resolved };
         } else {
           model = resolved;
         }
       }
 
-      // Same scopeModels policy as the Agent tool and the nested delegation
-      // tools: a script's `agent({ model })` is a runtime LLM choice, and the
-      // script is written by the model, so it must not reach a model the user's
-      // enabledModels list excludes. `callerSupplied` keys off `request.model`
-      // and NOT `modelInput` — the latter has already absorbed the agent file's
-      // own `model:`, which is user-authored config and so earns the
-      // warn-and-proceed branch rather than a refusal.
       const scopeVerdict = checkModelScope({
         model,
         cwd: ctx.cwd,
@@ -298,29 +287,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           request.prompt,
           {
             description: request.label,
-            // The stamp is what keeps this child out of the session's
-            // `maxConcurrent` pool — see `occupiesPoolSlot`. The run already
-            // bounds how many of its agents run at once, and counting them
-            // twice would let one fan-out starve everything else the user is
-            // doing. No `bypassQueue` needed: an agent outside the pool is
-            // never queued behind it.
             ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
             ...(model !== undefined ? { model } : {}),
-            // Validated worker-side against the same list pi accepts, so the
-            // cast asserts what the boundary has already checked. Left unset,
-            // the agent definition's `thinking` (then the parent's) still wins —
-            // same precedence as `model` above.
             ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
-            // Seeded with the REQUEST, not the outcome. The manager overwrites
-            // the effective half at session creation; without a seed there is
-            // nothing for it to compare against, so a level pi clamped would be
-            // indistinguishable from one that was honoured.
-            //
-            // Only the level. #182's other half — a caller parameter an agent
-            // file outranked — cannot arise here: this path resolves
-            // `request.model ?? config?.model`, so the script always wins and
-            // therefore always got what it asked for. Seeding a `requestedModel`
-            // would describe a precedence this path does not have.
             invocation: {
               ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
             },
