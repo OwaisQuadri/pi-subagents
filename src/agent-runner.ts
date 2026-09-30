@@ -1176,7 +1176,7 @@ export async function runAgent(
   const historyFallbackStartIndex = session.messages.length;
   let structuredRetried = false;
   try {
-    await session.prompt(effectivePrompt);
+    if (!options.signal?.aborted) await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -1274,7 +1274,7 @@ export async function resumeAgent(
     : () => {};
 
   try {
-    await session.prompt(prompt);
+    if (!options.signal?.aborted) await session.prompt(prompt);
   } finally {
     collector.unsubscribe();
     unsubEvents();
