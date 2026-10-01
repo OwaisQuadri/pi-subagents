@@ -16,7 +16,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
+import * as piAi from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { responderContext } from "./helpers/pi-ai.js";
 import {
   agentCall,
   agentToolCalls,
@@ -42,6 +44,31 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     await run?.dispose();
     run = undefined;
     for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("resolves effective faux responder tools and prompt without changing the transcript", () => {
+    const read = { name: "read", description: "old read", parameters: { type: "object" } };
+    const write = { name: "write", description: "write", parameters: { type: "object" } };
+    const replacement = { ...read, description: "new read" };
+    const messages = [
+      { role: "system", content: "BASE", toolsAdded: [read, write],
+        sections: { retained: "OLD", deleted: "DELETE ME" }, timestamp: 0 },
+      { role: "system", content: "APPENDED", toolsRemoved: [{ name: "write" }, { name: "read" }],
+        sections: { retained: "UPDATED", deleted: null }, timestamp: 1 },
+      { role: "system", content: "", toolsAdded: [replacement], timestamp: 2 },
+    ];
+    const isTranscript = "getCurrentTools" in piAi;
+    const context = {
+      messages,
+      ...(!isTranscript && { tools: [replacement], systemPrompt: "BASE\n\nAPPENDED\n\nUPDATED" }),
+    } as unknown as Context;
+    const effective = responderContext(context);
+    expect(effective.tools).toEqual([replacement]);
+    expect(effective.systemPrompt).toBe("BASE\n\nAPPENDED\n\nUPDATED");
+    expect(effective.messages).toBe(context.messages);
+    expect(context.tools).toEqual(isTranscript ? undefined : [replacement]);
+    const legacy = { messages: [], tools: [], systemPrompt: "EXPLICIT" };
+    expect(responderContext(legacy)).toEqual(legacy);
   });
 
   // The one assumption the model/thinking display rests on, checked against a

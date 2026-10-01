@@ -1,7 +1,17 @@
-/**
- * pi-ai.ts — single import point for the two test helpers that pi-ai ≥0.80
- * exports only from the `/compat` subpath (all lived on the package root in
- * ≤0.75.x). Upstream deletes `/compat` with its coding-agent ModelManager
- * migration; the replacement then is `fauxProvider()` + `createModels()`.
- */
+import type { Context, Tool } from "@earendil-works/pi-ai";
+import * as piAi from "@earendil-works/pi-ai";
+
 export { getModel, registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+
+const transcript = piAi as typeof piAi & {
+  getCurrentTools?: (messages: Context["messages"]) => Tool[];
+  getCurrentSystemPrompt?: (messages: Context["messages"]) => string;
+};
+
+export function responderContext(context: Context): Context {
+  return {
+    ...context,
+    tools: context.tools ?? transcript.getCurrentTools?.(context.messages),
+    systemPrompt: context.systemPrompt ?? transcript.getCurrentSystemPrompt?.(context.messages),
+  };
+}
