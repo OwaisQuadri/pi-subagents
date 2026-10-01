@@ -174,6 +174,18 @@ export type MentionResolution =
 /** Which concurrency pool a run is charged to. */
 export type Pool = "background" | "foreground";
 
+export type RunActivity = {
+  version: 1;
+  rootSessionId: string;
+  agentId: string;
+  runId: string;
+  parentAgentId?: string;
+  workflowId?: string;
+} & (
+  | { transition: "started"; status?: never }
+  | { transition: "completed" | "failed" | "stopped"; status: "completed" | "steered" | "aborted" | "stopped" | "error" }
+);
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;

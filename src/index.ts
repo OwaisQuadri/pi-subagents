@@ -598,7 +598,9 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  const manager = new AgentManager((record) => {
+  const manager = new AgentManager((record, activity, isPresentation = true) => {
+    if (activity) pi.events.emit("subagents:run-activity", activity);
+    if (!isPresentation) return;
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -638,11 +640,10 @@ export default function (pi: ExtensionAPI) {
     if (result === 'pass') {
       sendIndividualNudge(record);
     }
-    // 'held' → do nothing, group will fire later
-    // 'delivered' → group callback already fired
     widget.update();
-  }, undefined, (record) => {
-    if (!isTopLevelAgent(record)) return;
+  }, undefined, (record, activity, isPresentation = true) => {
+    if (activity) pi.events.emit("subagents:run-activity", activity);
+    if (!isPresentation || !isTopLevelAgent(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -710,7 +711,7 @@ export default function (pi: ExtensionAPI) {
   }, (record, message) => {
     if (!isTopLevelAgent(record)) return;
     pi.events.emit("subagents:steered", { id: record.id, message });
-  });
+  }, true);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
