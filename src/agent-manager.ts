@@ -1070,17 +1070,7 @@ export class AgentManager {
       if (i === -1) return;
       const [next] = this.queue.splice(i, 1);
       const record = this.agents.get(next.id);
-      // Stale entries (aborted while queued) are not started — but are still
-      // released, since nothing else will.
-      if (!record || record.status !== "queued") { next.release(); continue; }
-      // Detached, and never rejects: a late failure (e.g. strict worktree
-      // isolation) lands on the record inside `launch`, exactly as the
-      // synchronous throw did here before, and draining continues either way.
-      //
-      // The release waits for that startup to SETTLE rather than firing here.
-      // Startup is async now, so a release at drain time would wake a blocked
-      // `spawnAndWait` while `record.promise` was still undefined, and it would
-      // read a perfectly healthy agent as one that never ran.
+      if (record?.status !== "queued") { next.release(); continue; }
       void next.start().then(() => next.release(), () => next.release());
     }
   }

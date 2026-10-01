@@ -64,8 +64,11 @@
 import type { Model } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
+  convertToLlm,
   createAgentSession,
+  DefaultResourceLoader,
   type ExtensionContext,
+  getAgentDir,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -103,7 +106,7 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
   let spawned = false;
   const cloneAgentTool: ToolDefinition = {
     ...agentTool,
-    execute: (_cloneToolCallId, params, signal, onUpdate, _cloneCtx) => {
+    execute: (_cloneToolCallId, params, signal, onUpdate, cloneCtx) => {
       // One spawn per mention. The clone has a single tool and every reason to
       // stop after using it, but a model that decides to "also" launch a second
       // agent would do it where nobody can see and nobody asked.
@@ -125,7 +128,7 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        { ...cloneCtx, ...ctx },
       );
     },
   };
@@ -142,47 +145,40 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
       ctx.sessionManager.getEntries(),
       ctx.sessionManager.getLeafId(),
     );
-    // Pi 0.82.0 added this; below it the field is absent and the clone takes
-    // the settings level instead, which is what a session that never ran
-    // `/think` is on anyway. Same shim shape as `modelRuntime` below.
     const thinkingLevel = (ctx as { thinkingLevel?: ThinkingLevel }).thinkingLevel;
-    const created = await runInChildSessionContext(() =>
-      createAgentSession({
+    const systemPrompt = ctx.getSystemPrompt?.();
+    const created = await runInChildSessionContext(async () => {
+      const sessionManager = SessionManager.inMemory(ctx.cwd);
+      // The loader copies the live prompt; parent transcript system entries
+      // carry tool declarations that must not enter this Agent-only session.
+      for (const historyMessage of convertToLlm(
+        conversation.messages.filter(({ role }) => !["system"].includes(role)),
+      )) {
+        sessionManager.appendMessage(historyMessage);
+      }
+      const resourceLoader = systemPrompt
+        ? new DefaultResourceLoader({
+            cwd: ctx.cwd,
+            agentDir: getAgentDir(),
+            systemPromptOverride: () => systemPrompt,
+            appendSystemPromptOverride: () => [],
+          })
+        : undefined;
+      await resourceLoader?.reload();
+      return createAgentSession({
+        ...(resourceLoader && { resourceLoader }),
         cwd: ctx.cwd,
-        // Nothing about the copy is worth persisting, and an in-memory manager
-        // is also what keeps the real session untouched.
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager,
         model: ctx.model as Model<never> | undefined,
         ...(thinkingLevel && { thinkingLevel }),
         modelRegistry: ctx.modelRegistry,
         ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
-        // An allowlist naming exactly the clone's own tool. NOT `noTools:
-        // "all"`, whose doc comment ("start with no tools enabled") reads like
-        // it spares custom tools and does not: it resolves to an EMPTY
-        // allowlist, and `isAllowedTool` then drops every tool from the
-        // registry — the custom one included. The clone would be prompted with
-        // nothing to call, answer in prose, and every mention would fall
-        // through to the direct start with a warning. Same idiom as
-        // agent-runner's `tools: sessionTools` beside its nested `customTools`.
         tools: [cloneAgentTool.name],
         customTools: [cloneAgentTool],
-      } as Parameters<typeof createAgentSession>[0]),
-    );
+      } as Parameters<typeof createAgentSession>[0]);
+    });
     session = created.session;
 
-    // The clone rebuilds a system prompt from cwd and agentDir, which is close
-    // but not the live one — extensions contribute to it per turn. Copy the
-    // real thing, so the copy reasons under the instructions the user's model
-    // is actually working under.
-    const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
-
-    // The conversation itself. Pushed rather than assigned so the array the
-    // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
-
-    // User text first, reminder after — the order Claude Code's attachment
-    // renderer produces, where the reminder trails the message it is about.
     await session.prompt(`${message}\n\n${agentMentionReminder(type)}`);
   } catch (err) {
     return { spawned, error: err instanceof Error ? err.message : String(err) };
