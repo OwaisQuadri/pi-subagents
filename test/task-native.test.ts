@@ -330,6 +330,16 @@ describe.skipIf(!taskHelper())(taskHelperTitle("native task identity with the ta
     expect(saved).toEqual(["task-A", "task-B"]);
   });
 
+  it("shows the task checkout under ~ rather than the home path in bind and status notices", async () => {
+    await command(`task bind task-A --base ${base}`);
+    await command("task status");
+    const notices = vi.mocked(context.ui.notify).mock.calls.slice(-2).map(([message]) => String(message));
+    for (const notice of notices) {
+      expect(notice).toMatch(/ at ~\/storage\/[^;]+\/checkout; base /);
+      expect(notice).not.toContain(process.env.HOME!);
+    }
+  });
+
   it("binds, persists, restores only typed explicit entries and clears on unbind/switch", async () => {
     await command(`task bind task-A --base ${base}`);
     expect(context.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("task-A"), "info");

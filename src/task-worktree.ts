@@ -99,6 +99,11 @@ function exactKeys(value: Record<string, unknown>, required: string[], optional:
   }
 }
 
+export function homeRelativePath(path: string): string {
+  const home = homedir().replace(/\/+$/, "");
+  return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+}
+
 export function validateTaskAccess(value: unknown): TaskAccess {
   if (value !== "write" && value !== "read-stable") throw new Error('task_access must be "write" or "read-stable"');
   return value;
