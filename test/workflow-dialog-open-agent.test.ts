@@ -1,18 +1,8 @@
-/**
- * workflow-dialog-open-agent.test.ts — the inspector's `c` key, end to end.
- *
- * `workflow-dialog.test.ts` proves the key raises the action and the footer
- * advertises it; this proves the half only the real extension can: that a
- * child's manager record id actually reaches the row (runtime → host →
- * progress entry), that `c` opens THAT record's conversation as a second
- * overlay, and that the dialog hides itself underneath rather than leaving its
- * frame peeking around the viewer.
- *
- * Without the id on the row there is nothing to open, so the run's agents were
- * the one part of the fleet with no way to read what they did.
- */
-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -90,10 +80,11 @@ describe("the inspector opens a workflow agent's conversation", () => {
     hermetic.restore();
   });
 
-  /** Boot the extension and start a one-agent run in the background. */
   async function bootWithChild() {
     const booted = makePi();
+    wiringTasks(booted.pi, ["dialog-workflow"]);
     subagentsExtension(booted.pi);
+    await booted.lifecycle.get("session_start")({}, ctx({ cwd: hermetic.dir }));
     const command = booted.commands.get("agents");
     if (!command) throw new Error("the extension did not register /agents");
     await booted.tools.get("SubagentWorkflow").execute(

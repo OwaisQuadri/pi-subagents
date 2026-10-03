@@ -19,6 +19,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -52,6 +56,7 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
   return { pi, tools, lifecycle, busHandlers };
 }
 
@@ -139,7 +144,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     }
 
     // spawn no longer hits the "No active session" trap — currentCtx is set.
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any); // never resolves
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal)); // never resolves
     const requestId = "req-142";
     await busHandlers.get("subagents:rpc:spawn")!({
       requestId,
@@ -163,7 +168,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
 
     await lifecycle.get("session_start")({}, activeCtx);
 
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any); // keep agent running
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal)); // keep agent running
     try {
       await busHandlers.get("subagents:rpc:spawn")!({
         requestId: "req-widget",
@@ -196,7 +201,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options: any) => {
       onToolActivity = options.onToolActivity;
       options.onSessionCreated?.({ subscribe: () => vi.fn() });
-      return new Promise(() => {}) as any;
+      return heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal);
     });
     subagentsExtension(pi);
 

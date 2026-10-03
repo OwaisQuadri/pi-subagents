@@ -13,6 +13,10 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -38,6 +42,7 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
   return { pi, tools, lifecycle };
 }
 
@@ -150,7 +155,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     // Previously the note was computed after spawnAndWait returned, so only a
     // foreground caller ever saw it (#183).
     const { tools } = boot();
-    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
+    vi.mocked(runAgent).mockReturnValue(heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }));
 
     const result = await tools.get("Agent").execute(
       "tc-3",

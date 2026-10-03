@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
 - **Question tools** — every non-isolated child can call `ask_parent_question` to resolve facts directly established by its permitted parent conversation, or explicitly call `ask_user_question` for a human decision. Each tool respects its own denylist entry; parent questions never open a user dialog
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
-- **Scripted workflows** — a `SubagentWorkflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/agents → Workflows` or by selecting the run in FleetView. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. On by default, but it stands down for company: if another extension already provides a `Workflow` or `SubagentWorkflow` tool, this one warns and disables itself for the session rather than offering the model two orchestrators. Pin it either way with `"workflowsEnabled"` in `subagents.json` or `/agents → Settings → Workflows`. A script written for Claude Code's `Workflow` tool runs here unchanged: same globals, `schema` returns a validated object exactly as it does there, `budget` is present and always reports no token target (pi has no such directive) so its `budget.total`-guarded patterns still take the branch they were written for, and nested `workflow()` composes saved workflows one level deep. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
+- **Scripted workflows**: `SubagentWorkflow` runs deterministic JavaScript with `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, `args` and a pure-literal `meta` block. `pipeline()` overlaps stages; `parallel()` waits for all results. Runs continue in the background with a live card and an inspector at `/agents → Workflows` and in FleetView. Gates verify work under held task claims; `resume` keeps the child's context. The worker's `node:vm` context rejects clock reads, randomness and code generation. Workflows default to on but yield to another extension's workflow tool unless `workflowsEnabled` pins the setting. The runtime retains Claude Code globals, structured results, one-level nesting and `budget` with no token target. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes detached by default and notifies you on completion, just like a fresh spawn; pass `run_in_background: false` to block and get the result inline
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
-- **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
+- **Task-owned checkouts**: explicit task bindings, exclusive writer claims and shared stable-reader claims. Working bytes remain in the task checkout after each attempt; completion does not commit or remove it.
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
@@ -51,6 +51,8 @@ npm ci && npm run bundle   # builds dist/index.js, the entry pi loads
 pi -e .
 ```
 
+Managed execution also requires `worktree-hygiene` on PATH, with the task authority version-1 protocol. Bind an initialized task before dispatch; see [Task-owned checkouts](#worktree-isolation).
+
 Requires pi **0.85.1 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0), pi-tui's `stripTerminalSequences` (0.84.0), and native between-turn compaction (0.85.1). The `peerDependencies` range declares it, so npm flags an older pi at install time.
 
 ### Other hosts
@@ -63,7 +65,7 @@ Third-party adapters report running it elsewhere. These are maintained independe
 
 ## Quick Start
 
-The parent agent spawns sub-agents using the `Agent` tool:
+Bind an existing initialized task with `/agents task bind <task_id>`. To initialize a new task, add `--base <full commit object ID>`. The parent agent then spawns sub-agents using the `Agent` tool:
 
 ```
 Agent({
@@ -228,7 +230,9 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
-By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled boxes:
+Foreground and background agents stream their conversations to JSON-lines transcripts by default. Files live at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output`, with owner-only `0700` directories that a reboot clears. Set `output_transcript: false` on a custom agent to suppress its transcript. Set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the project. Frontmatter overrides the project default.
+
+Transcript settings do not change `persist_session`, task-owned working bytes or durable `memory:` files. Background completion notifications render as styled boxes:
 
 ```
 ✓ Find auth files completed
@@ -310,18 +314,18 @@ All fields are optional — sensible defaults for everything.
 | `skills` | `true` | `true` inherits the parent's skills; `false` inherits none. A comma-separated list preloads **only** those skills into the system prompt and does not inherit the rest (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
-| `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
+| `isolation` | unset | Ignored legacy option, accepted for compatibility: every agent runs in its claimed task checkout, `worktree` creates no copy and `off` bypasses nothing. `none`, `no`, and `false` mean `off` |
 | `model` | inherit parent | Legacy metadata; ignored for new child model selection. Use an explicit invocation value for a user-selected alternative |
 | `thinking` | inherit parent | Legacy metadata; ignored for new child thinking selection. Pi clamps the inherited or explicit level to model support |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
-| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
-| `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
+| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session` and `memory:` |
+| `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override) is listed separately, so it shows as a root instead of nesting |
 | `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
-| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
+| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Unrelated to the ignored `isolation` field |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
 New children inherit the current parent model and thinking level unless the invocation supplies explicit user choices. Definition and registry pins do not select either value. This applies to foreground, background, nested, workflow, and programmatic spawns. In-memory resumes reuse the existing child session. File-based resumes retain their previous model and thinking resolution; the new parent fallback applies only to new children.
@@ -342,7 +346,7 @@ allowed_subagents: support-file-finder, support-callsite-tracer   # or `all`
 ---
 ```
 
-**The allowlist is a privilege boundary, not just a routing hint.** A child runs with *its own* `tools:`, `extensions:`, and `isolated:` — the parent's restrictions are not inherited — so delegation grants the parent the union of what the listed agents can do. The read-only agent above can write and run commands through any listed agent that can, and `all` reaches every enabled agent including `general-purpose`. Choose the list as carefully as you would choose `tools:` itself; that is the main reason this is default-off.
+**The allowlist is a privilege boundary, not just a routing hint.** A child runs with *its own* `tools:`, `extensions:`, and `isolated:` — the parent's restrictions are not inherited — so delegation grants the parent the union of what the listed agents can do. The role's `tools:` list alone does not restrict its delegates. With a writer claim, the agent above can delegate writes and commands to a listed agent with those tools, on a separate initialized task: a nested `Agent` call must pass its own distinct `task_id`, because the agent above already holds its own task. A nested call without one, or with the parent's own `task_id`, is refused before launch. `all` reaches every enabled agent including `general-purpose`. `task_access: "read-stable"` denies nested delegation, mutation tools, shell commands and unknown extension writers, regardless of the role's tool list. Choose the list as carefully as you would choose `tools:` itself; that is the main reason this is default-off.
 
 `allowed_subagents` is runtime-enforced. A comma-separated list restricts nesting to those types; `all` (or `"*"` / `true`, matching how `extensions:` and `skills:` take booleans) allows any enabled agent; omitted, empty, `none`, or `false` means no nested tools are injected at all. Unknown, disabled, and out-of-list types are rejected rather than falling back — regardless of the project's [fallback agent](#persistent-settings) setting, so a configured fallback can never hand a nested caller an agent outside its allowlist — and a nested `model:` is validated against [Model Scope](#model-scope) exactly like a top-level spawn. Result, resume, and steering operations are ownership-scoped, so a parent can control only its own children. Nested records remain internal to that parent and do not appear in top-level tools, lifecycle events, or agent UI — so when a parent finishes, is stopped, or ends a resumed turn, its nested children are stopped with it. They do write their own `.output` transcript (subject to the same `output_transcript` gate), filed under the root session's directory alongside their ancestors', so a nested run can still be inspected after the fact. Their token usage is folded into every ancestor's totals up to the top-level agent (lifecycle events, completion notifications, `/agents`), so nested spend stays attributable at any depth even though the children themselves stay hidden. A nested result that ends `stopped`, `aborted`, or `steered` is labelled as partial, the same guarantee top-level results carry.
 
@@ -419,12 +423,18 @@ Launch a sub-agent.
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
-| `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
+| `isolation` | `"off"` \| `"worktree"` | no | Ignored legacy option, accepted for compatibility; the agent always runs in its claimed task checkout. Absent from the schema when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `task_id` | string | no | Existing initialized task ID. Required unless an explicit session binding supplies it |
+| `task_access` | `"write"` or `"read-stable"` | no | Defaults to captured access, otherwise write. Stable readers cannot mutate or run shell commands |
 
 ### `SubagentWorkflow`
 
-Run a deterministic script that orchestrates many subagents. Returns a task id immediately; the run continues in the background and notifies on completion.
+Run a deterministic script that orchestrates many subagents. Returns a workflow run ID immediately; the run continues in the background and notifies after owned work settles.
+
+A workflow captures the session's task binding at launch. `agent()` accepts public `task_id` and `task_access` fields, never an internal snapshot or claim token. Independent parallel writers need distinct initialized task IDs. Read-only fan-out can share a task with `task_access: "read-stable"`; competing writers fail with `TaskBusy`. Retry and resume keep the child's original snapshot, even after a parent rebind.
+
+The helper runs gates in the verified child checkout under the held claim. Commands have a ten-minute deadline and bounded stdout/stderr evidence tails. A failed gate leaves the child resumable; resume runs the retained gate once under a fresh claim. Abort, unawaited launches, session switch and shutdown wait for child, command and claim settlement. Uncertain settlement is an error, not a quiet success.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -432,10 +442,12 @@ Run a deterministic script that orchestrates many subagents. Returns a task id i
 | `scriptPath` | string | no | Path to a script file. Takes precedence over `script` and `name` |
 | `name` | string | no | A saved workflow — `<name>.js` in `.pi/workflows/`, `.agents/workflows/` or `<agent dir>/workflows/`, carrying an `export const meta` declaration |
 | `args` | any | no | Passed through to the script as the `args` global, verbatim |
-| `resumeFromRunId` | string | no | Replay an earlier run in this session — its unchanged leading `agent()` calls return their recorded results instead of spawning |
+| `resumeFromRunId` | string | no | Re-run an earlier script in this session. Managed task checkouts execute live because journals do not prove unchanged working bytes |
 | `title` / `description` | string | no | Accepted and ignored, as in Claude Code — a workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`. Each invocation's script is persisted to the session directory and its path returned, so iterating means editing that file and re-running rather than resending the source. A saved workflow reports its own file instead, so the same loop works on it — project `.pi/workflows/` shadows a same-named global one. Those directories are ordinary folders that may hold other scripts, so only files carrying the `export const meta = { name, description }` declaration are listed or resolved; naming anything else reports that it is not a workflow rather than running it. The check is a regex over the source — nothing in the file is executed to make it, and even a real parse evaluates only the `meta` object literal, in an empty `node:vm` context with a 100ms bound.
+
+Bind the task with `--access read-stable` for this read-only fan-out. Each child shares a stable-reader claim and cannot mutate or run shell commands.
 
 ```js
 export const meta = {
@@ -663,9 +675,9 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 
 **Remember agents** (`rememberAgents`, default `true`): whether subagents persist their pi session, which is what lets [`@handle`](#agent-mentions) reopen an agent's conversation after its in-memory record has been evicted. Two visible consequences of the default: top-level subagents write a session file, and they nest under the session that spawned them in pi's `/resume`. Agents spawned by another agent are excluded — they get no handle, so nothing could reopen their transcript. A custom agent's `persist_session` frontmatter overrides this per agent, in both directions. Toggle via `/agents → Settings → Remember agents`; with it off, handles expire with their record (roughly ten minutes past completion) and `@explore` then starts a fresh agent rather than resuming — the behaviour before this setting existed.
 
-**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
+**Output transcript** (`outputTranscript`, default `true`): the project/global default for each subagent's `.output` transcript. Toggle it via `/agents → Settings → Output transcript`. Set `false` in `subagents.json` to make transcripts opt-in for the project. A custom agent's `output_transcript` frontmatter overrides this setting at spawn time. The setting governs transcripts, not `persist_session`, task-owned working bytes or memory files.
 
-**Worktree isolation** (`worktreeIsolation`, default `true`): whether `isolation: "worktree"` may create a worktree at all. Toggle via `/agents → Settings → Worktree isolation`, or set `false` in `subagents.json` on a repo where a copy costs too much time or disk. Off, the `Agent` tool's `isolation` parameter is dropped from the schema entirely and the bullet describing it leaves the tool description with it — nothing to pass, and no context spent describing it — and worktrees are refused on every other path too (agent files, scheduled jobs, cross-extension RPC). The `/agents` agent-file generator stops offering the `isolation:` frontmatter field too, so a generated agent can't bake in a request that would be refused. A requested worktree is downgraded to a normal run rather than failing the call, since declining one is the point; there is deliberately no note on the result, which is exactly why the prose has to go when the parameter does. The refusal applies immediately; the parameter and its prose appear or disappear on the next pi session. See [Turning worktrees off](#turning-worktrees-off).
+**Worktree isolation** (`worktreeIsolation`, default `true`): legacy schema setting. Turning it off removes the ignored `isolation` parameter from the `Agent` and nested tools at registration; it does not bypass mandatory task claims or run agents in the parent checkout. See [Turning worktrees off](#turning-worktrees-off).
 
 **Report usage to session** (`reportUsage`, default `false`): whether subagent spend is added to *this* session's own totals. Subagents run in their own pi sessions, so by default pi's footer, statusline and `/cost` count only what the main model spent — a session that delegated most of its work reads as nearly free. Turn it on and each `Agent` / `get_subagent_result` / `steer_subagent` result carries the spend accumulated since the last one, which pi folds into `getSessionStats()`; `/cost` attributes it to the **Tools/summaries** bucket. Toggle via `/agents → Settings → Report usage to session`; applied live.
 
@@ -828,7 +840,7 @@ pi.events.emit("subagents:rpc:spawn", {
   requestId,
   type: "general-purpose",
   prompt: "Do something useful",
-  options: { description: "My task", isBackground: true },
+  options: { description: "My task", isBackground: true, task_id: "initialized-task" },
 });
 ```
 
@@ -836,7 +848,7 @@ pi.events.emit("subagents:rpc:spawn", {
 
 `options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context. Resolution is fuzzy, so a bare `"sonnet"` can land on a provider you never named: with [Model Scope](#model-scope) on, an override that resolves outside `enabledModels` is refused with an error envelope listing the allowed models, exactly as a caller-supplied `Agent({ model })` is. `null` means unset — the agent inherits, same as omitting the field.
 
-`options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. On session end, worktree registrations are pruned in every repo that received one; only a hard crash can leave a stale entry (then: `git worktree prune` in the target repo). Agents with `memory:` keep reading/writing the parent project's memory.
+`options.cwd` selects the repository for an explicit task when no captured snapshot supplies it. It must be an existing absolute directory; `null` means unset. Tools use the helper-verified task checkout, while config loads from the trusted parent root. A captured task snapshot preserves its original repository, base and configuration root. Bus callers cannot forge snapshots or claim tokens.
 
 ### Stop
 
@@ -891,34 +903,31 @@ The `disallowed_tools` field is respected when determining write capability — 
 
 ## Worktree Isolation
 
-Set `isolation: worktree` to run an agent in a temporary git worktree:
+Managed agents use task-owned checkouts. The helper verifies task identity, generation, immutable base and checkout before each attempt. An exclusive writer claim lasts through child tools, nested children and workflow gates. Shared `read-stable` claims exclude writers and deny mutations and shell commands.
 
-```
-Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
-```
+| Command | Result |
+|---|---|
+| `/agents task bind <task_id>` | Bind an existing initialized task |
+| `/agents task bind <task_id> --base <full commit object ID>` | Initialize and bind a task at that exact base |
+| `/agents task bind <task_id> --access read-stable` | Bind an existing task for stable reads |
+| `/agents task status` | Show the captured identity, access, base and checkout |
+| `/agents task unbind` | Clear the binding without changing existing workers |
+| `/agents task finish <new absolute preservation destination>` | Preserve and finish the bound task, without cleanup |
+| `/agents task abandon <new absolute preservation destination>` | Preserve and abandon the bound task, without cleanup |
 
-The agent gets a full, isolated copy of the repository. The worktree directory is removed on completion either way — what differs is whether a branch is left behind:
-- **No changes:** worktree is cleaned up automatically, no branch
-- **Changes made:** changes are committed to a new branch (`pi-agent-<id>`), and the result names the branch and the `git merge` command for it. The branch is the only artifact — the worktree path is gone, so nothing points into it
-- **Agent committed its own work:** the branch is created at the agent's HEAD, preserving its commits (uncommitted leftovers are committed on top first)
+Managed dispatch now requires an initialized task ID or an explicit binding, even with legacy isolation disabled. Existing conversations without a recorded task snapshot cannot reopen as managed attempts. Keep legacy checkouts, transcripts and working files; this extension does not adopt or delete them. Initialize a task at an explicit full base, then transfer needed working files into its checkout under a writer claim.
 
-The agent's system prompt names the worktree as an isolated copy and tells it to work only there, even if other instructions name the main checkout — otherwise an inherited parent prompt or a task prompt mentioning the project path walks it straight back out of the copy. This is a directive, not a sandbox: an agent with shell access can still `cd` out, so don't rely on `isolation` alone to protect the main checkout.
+There is no automatic base refresh, commit or checkout removal on agent completion. Later attempts reuse the retained working bytes. Explicit finish or abandon requires a new preservation destination outside task storage. This extension exposes no cleanup command.
 
-The automatic preservation commit uses `--no-verify`, so local pre-commit hooks can't block it — the commit is local-only and never pushed, and pre-push/server-side hooks still apply.
+A managed `bash` call and a workflow gate run through the same shell as Pi's own `bash` tool: `/bin/bash -c` by default, or the `shellPath` setting from the child's config root. A nested `Agent` call needs its own distinct initialized `task_id`; the agent above already holds its own task.
 
-If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` call fails with a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
+Each helper control request (claim, verify, release, cancel, finish) has a fixed two-minute deadline, and so does the wait for the helper to exit after its input closes. A command run with a timeout gets that timeout plus two minutes; a command run without one stays unbounded and is cancelled before release. A missed deadline is an uncertain settlement error that keeps all task data. The helper is never killed.
 
-A worktree is a *copy*, so the agent cannot see uncommitted or staged changes in the main checkout. Never use it to review a working-tree or staged diff: the agent finds an empty `git diff` and reports nothing wrong.
+A settlement error (a failed settlement hook or gate, a child, or an uncertain release) is reported once. The first `waitForAll`, session switch or shutdown after it rejects, keeping the records and the task binding. Later calls do not report it again; a new failure is reported again. The failed record stays listed with its error and its token-free recovery descriptor. A verified resume clears it; otherwise a later successful switch or shutdown clears the in-memory state. The helper's durable recovery state on disk stays authoritative.
 
 ### Turning worktrees off
 
-Three levers, from narrowest to broadest:
-
-- **Per call** — omit `isolation`, or pass `isolation: "off"`. The explicit value exists because some models fill every optional parameter they are offered; with `worktree` as the only legal value they had no way to decline one (#231, #184).
-- **Per agent** — `isolation: off` in an agent file. Frontmatter is authoritative, so this refuses a worktree even when the caller passes `isolation: "worktree"` — the only way to override a caller.
-- **Per project** — `"worktreeIsolation": false` in `subagents.json`. The `Agent` tool's `isolation` parameter disappears from the schema entirely, along with the usage-note bullet that describes it (so it costs the model no context and cannot be passed), and worktree creation is refused on every other path too: agent files, scheduled jobs, and cross-extension RPC. The `/agents` generator also stops offering `isolation:` when writing a new agent file. Use it on a repo large enough that a copy costs real time and disk. The schema and the description are both built at tool registration, so they appear or disappear in the next pi session; the refusal itself takes effect immediately.
-
-  Schema and prose are gated together on purpose. Leaving the bullet in would teach the model to pass a field that is no longer declared — accepted silently, then dropped — and since a refused worktree carries no note on the result, the model would have every reason to go on reporting a `pi-agent-*` branch that was never created. A custom tool description should use the `{{isolationGuideline}}` placeholder rather than hardcoding the bullet, for the same reason.
+The `isolation` parameter is ignored, and `worktreeIsolation: false` only removes it from the tool schemas: neither bypasses task ownership. Every managed attempt still requires an explicit initialized task ID or a captured binding. No failure authorizes fallback to the parent checkout, legacy allocation, forced recovery or removal of unknown data.
 
 ## Skill Preloading
 
@@ -973,6 +982,16 @@ PI_OM_TEST_ROOT="<memory-package>" npx vitest run test/e2e/memory-compaction.e2e
 
 The test uses Pi 0.85.1 with a scripted provider; it needs no network access or provider credentials. It checks final-answer retention for Agent and workflow runs through memory compaction, plus provider-failure and explicit-cancellation controls. Without `PI_OM_TEST_ROOT`, the general `npm test` suite skips this integration suite; other package tests still run.
 
+## Testing with the task helper
+
+The suites that drive a real `worktree-hygiene` task helper read its absolute path from `PI_SUBAGENTS_TASK_HELPER`:
+
+```sh
+PI_SUBAGENTS_TASK_HELPER="<absolute path to worktree-hygiene>" npm run check
+```
+
+When the variable is unset, those suites skip and print the reason, naming the variable; every other test still runs. CI does not build the helper, so it runs them skipped. When the variable is set but the file is missing or not executable, the suites fail instead of skipping. Fixtures live in fresh temporary directories under the OS temp root.
+
 ## Architecture
 
 ```
@@ -1024,7 +1043,7 @@ src/
   memory.ts           # Persistent agent memory (resolve, read, build prompt blocks)
   skill-loader.ts     # Preload skills (Pi-standard + Agent Skills spec layouts)
   output-file.ts      # Streaming output file transcripts for agent sessions
-  worktree.ts         # Git worktree isolation (create, cleanup, prune)
+  worktree.ts         # Legacy worktreeIsolation setting (gates the ignored isolation param)
   prompts.ts          # Config-driven system prompt builder
   context.ts          # Parent conversation context for inherit_context
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)

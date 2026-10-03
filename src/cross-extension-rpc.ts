@@ -1,19 +1,5 @@
-/**
- * Cross-extension RPC handlers for the subagents extension.
- *
- * Exposes ping, spawn, stop, and consume RPCs over the pi.events event bus,
- * using per-request scoped reply channels.
- *
- * Reply envelope follows pi-mono convention:
- *   success → { success: true, data?: T }
- *   error   → { success: false, error: string }
- *
- * @see docs/rpc.md — the caller-facing integration reference: spawn options
- * (including the fields spawnTopLevel strips), every error string, the
- * completion-notification race, and what protocol version 2 does not promise.
- */
-
 import { isTopLevelAgent } from "./agent-manager.js";
+import { stripTaskCapabilities } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
@@ -104,13 +90,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
 
-      // Cross-extension RPC callers (e.g. pi-tasks TaskExecute) naturally
-      // forward serializable values, so options.model can be a string like
-      // "openai-codex/gpt-5.5". Resolve it to a real Model instance here
-      // — same pattern the scheduler path already uses — so the spawned
-      // agent's auth lookup doesn't crash with "No API key found for
-      // undefined".
-      let normalizedOptions = options ?? {};
+      let normalizedOptions = stripTaskCapabilities(options ?? {}) as typeof options;
       // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.
@@ -154,9 +134,9 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       }
 
       const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
-      // With isolation: "worktree" the agent starts asynchronously — wait for
-      // it, so a strict-isolation failure is still an error envelope rather
-      // than an id for an agent that never ran.
+      // The agent starts asynchronously once its task is claimed — wait for
+      // it, so a startup failure (such as TaskBusy) is still an error envelope
+      // rather than an id for an agent that never ran.
       await manager.awaitStartup(id);
       return { id };
     },

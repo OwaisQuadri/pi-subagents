@@ -27,6 +27,9 @@ import {
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
+import { taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
+
+const TASK_BINARY = taskHelper();
 
 // Real pi-mono: loader, dynamic extension import, three live sessions.
 vi.setConfig({ testTimeout: 60_000 });
@@ -36,7 +39,7 @@ const LIVE = /^(1|true|yes)$/i.test(process.env.PI_E2E_LIVE ?? "");
 /** How long each child holds the model call — long enough to overlap detectably. */
 const CHILD_HOLD_MS = 120;
 
-describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => {
+describe.skipIf(LIVE || !TASK_BINARY)(taskHelperTitle("maxConcurrentForeground e2e (real pi agent loop)"), () => {
   let run: PrintModeRun | undefined;
   const tmpDirs: string[] = [];
 
@@ -68,6 +71,7 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
     const order: string[] = [];
 
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-binding", "sdk-alpha", "sdk-beta"] },
       prompt: "Delegate two independent jobs and report both.",
       cwd: projectDir(settings),
       live: false, // scripted on purpose: a real model may not emit both calls
@@ -81,8 +85,8 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
           // TWO tool calls, ONE assistant message — exactly what the Agent tool
           // description tells the model to send for parallel work.
           return [
-            agentCall({ prompt: "JOB-ALPHA", description: "alpha", run_in_background: false }),
-            agentCall({ prompt: "JOB-BETA", description: "beta", run_in_background: false }),
+            agentCall({ task_id: "sdk-alpha", prompt: "JOB-ALPHA", description: "alpha", run_in_background: false }),
+            agentCall({ task_id: "sdk-beta", prompt: "JOB-BETA", description: "beta", run_in_background: false }),
           ];
         }
 

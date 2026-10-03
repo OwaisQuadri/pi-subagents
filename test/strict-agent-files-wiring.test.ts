@@ -12,12 +12,17 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
+
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 
 function makePi() {
   const tools = new Map<string, any>();
-  return {
+  const pi = {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
@@ -29,6 +34,8 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["strict-binding", "strict-native"]);
+  return pi;
 }
 
 const BROKEN = "---\nname: broken\ndescription: Use this: that\n---\n\nBroken.\n";
@@ -121,7 +128,8 @@ describe("strictAgentFiles gates extension activation", () => {
       getSystemPrompt: vi.fn(() => "parent"),
     } as any;
 
-    const result = await agentTool.execute("call-1", { subagent_type: "nope", prompt: "x" }, undefined, vi.fn(), uiCtx);
+    declareTask(cwd, "strict-native");
+    const result = await agentTool.execute("call-1", { task_id: "strict-native", subagent_type: "nope", prompt: "x" }, undefined, vi.fn(), uiCtx);
     expect(JSON.stringify(result)).not.toContain("Nested mappings");
   });
 });

@@ -1,5 +1,24 @@
 import { Type } from "@sinclair/typebox";
+import { type TaskAccess, validateTaskAccess, validateTaskId } from "./task-worktree.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+
+export const taskParams = {
+  task_id: Type.Optional(Type.String({ description: "Explicit initialized task ID. Omit only with an explicit session task binding.", minLength: 1 })),
+  task_access: Type.Optional(Type.Union([Type.Literal("write"), Type.Literal("read-stable")], { description: "Task access. Defaults to the captured binding access, otherwise write. Stable readers cannot mutate or run shell commands." })),
+};
+
+export function resolveTaskInvocation(params: { task_id?: unknown; task_access?: unknown }): { task_id?: string; task_access?: TaskAccess } {
+  return {
+    task_id: params.task_id === undefined ? undefined : validateTaskId(params.task_id),
+    task_access: params.task_access === undefined ? undefined : validateTaskAccess(params.task_access),
+  };
+}
+
+export function stripTaskCapabilities(options: Record<string, unknown>): Record<string, unknown> {
+  const safe: Record<string, unknown> = { ...options, ...resolveTaskInvocation(options) };
+  for (const key of ["taskSnapshot", "taskClaimHolder", "token", "taskAuthorityFixture", "onBeforeTaskSettlement", "configCwd"]) delete safe[key];
+  return safe;
+}
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -29,7 +48,7 @@ const isolationParamShape = {
   isolation: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
       description:
-        'Isolation mode. Default "off". "off" runs the agent in the current checkout, the same as omitting the field. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo (a copy cannot see uncommitted or staged changes in the main checkout).',
+        'Ignored legacy option, accepted for compatibility. Every agent runs in its claimed task checkout: "worktree" creates no copy and "off" bypasses nothing. Omit it.',
     }),
   ),
 };
@@ -55,6 +74,8 @@ export function isolationParam(enabled: boolean): Partial<typeof isolationParamS
 }
 
 interface AgentInvocationParams {
+  task_id?: unknown;
+  task_access?: unknown;
   model?: string;
   thinking?: string;
   max_turns?: number;
@@ -98,6 +119,8 @@ export function resolveAgentInvocationConfig(
   params: AgentInvocationParams,
   opts?: ResolveOptions,
 ): {
+  task_id?: string;
+  task_access?: TaskAccess;
   modelInput?: string;
   modelFromParams: boolean;
   thinking?: ThinkingLevel;
@@ -114,6 +137,7 @@ export function resolveAgentInvocationConfig(
   const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
 
   return {
+    ...resolveTaskInvocation(params),
     modelInput: params.model,
     modelFromParams: params.model != null,
     thinking: params.thinking as ThinkingLevel | undefined,

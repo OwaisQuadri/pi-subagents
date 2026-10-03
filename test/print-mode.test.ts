@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -82,7 +86,8 @@ describe("print mode background notifications", () => {
     });
 
     const { pi, tools, handlers } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     vi.useFakeTimers();
 
     const agentTool = tools.get("Agent");

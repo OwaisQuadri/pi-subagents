@@ -2,6 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -103,7 +107,8 @@ describe("output_transcript agent wiring", () => {
   it("creates no transcript when a custom agent sets output_transcript false", async () => {
     writeFileSync(join(agentDir, "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\n---\n\nKeep data in memory.`);
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
 
     await tools.get("Agent").execute(
       "tool-call",
@@ -122,7 +127,8 @@ describe("output_transcript agent wiring", () => {
   it("also suppresses the background transcript", async () => {
     writeFileSync(join(agentDir, "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\nrun_in_background: true\n---\n\nKeep data in memory.`);
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
 
     await tools.get("Agent").execute(
       "tool-call",
@@ -140,7 +146,8 @@ describe("output_transcript agent wiring", () => {
 
   it("keeps transcript creation as the default", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
 
     await tools.get("Agent").execute(
       "tool-call",
@@ -160,7 +167,8 @@ describe("output_transcript agent wiring", () => {
     // A plain default agent (no frontmatter) inherits the project default.
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false }));
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
 
     await tools.get("Agent").execute(
       "tool-call",
@@ -180,7 +188,8 @@ describe("output_transcript agent wiring", () => {
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false }));
     writeFileSync(join(agentDir, "agents", "audited.md"), `---\ndescription: Always keeps a transcript\noutput_transcript: true\n---\n\nWrite a transcript regardless of the project default.`);
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
 
     await tools.get("Agent").execute(
       "tool-call",

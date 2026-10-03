@@ -29,6 +29,8 @@ The receiver changes only the child's transient `SettingsManager` compaction set
 
 `subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:698-721`), which deletes internal-only fields first, and then `spawnResolved` (`src/index.ts:666-696`) overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.
 
+Every managed spawn requires an explicit initialized task ID or a captured session binding. The public fields are `task_id` and `task_access`. The bus strips claim tokens and internal snapshots. Claims last through actual worker and command settlement, not just a stopped display status. The task checkout and working bytes remain after completion, with no automatic commit or removal.
+
 **Honoured** — set these and they take effect:
 
 | Field | Type | Notes |
@@ -43,16 +45,19 @@ The receiver changes only the child's transient `SettingsManager` compaction set
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
-| `isolation` | `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion |
-| `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
+| `task_id` | string | Existing initialized task ID. Omit only with an explicit session binding |
+| `task_access` | `"write"` or `"read-stable"` | Defaults to captured access, otherwise write. Stable readers cannot mutate or run shell commands |
+| `isolation` | `"worktree"` | Ignored legacy option, accepted for compatibility. Creates no per-agent checkout and does not bypass task ownership |
+| `cwd` | absolute path | Repository used to resolve an explicit task when no snapshot supplies it. Tools use the helper-verified task checkout; config loads from the trusted parent root |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
 | `signal` | AbortSignal | Aborting it stops the subagent |
-| `onSpawned` / `onQueued` / `onCompaction` / `onBeforeWorktreeCleanup` | functions | Fire as documented on `SpawnOptions` |
+| `onSpawned` / `onQueued` / `onCompaction` | functions | Fire as documented on `SpawnOptions` |
 
 **Silently stripped** — set these and nothing happens, with no error and no note. Each deletion is a deliberate guard, and the reasons are worth knowing because they say what the surface refuses to let a caller forge:
 
 | Field | Why it is taken away |
 |---|---|
+| `taskSnapshot`, `taskClaimHolder`, `token`, `taskAuthorityFixture`, `onBeforeTaskSettlement` | Internal task capabilities and settlement authority |
 | `parentAgentId` | Ownership. A forged parent hides your agent under someone else's nested tools |
 | `workflowId` | A forged value would hide an RPC-spawned agent inside someone else's workflow — and take it out of the concurrency pool with it |
 | `depth`, `maxSubagentDepth` | The nesting cap is inherited, not declared |
@@ -66,7 +71,7 @@ The receiver changes only the child's transient `SettingsManager` compaction set
 
 Four things that are not obvious from the tables:
 
-- **Nothing is required at runtime.** `description` is non-optional in TypeScript and never validated. A spawn with no `options` at all is legal and is what `test/cross-extension-rpc.test.ts:81-94` pins.
+- **Managed spawns require task identity.** The RPC envelope can omit options. The manager refuses spawns without an explicit task ID or captured binding.
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
@@ -78,8 +83,8 @@ One of these already shipped as a bug in this project's own README example, so i
 | You might write | What it does | What you meant |
 |---|---|---|
 | `run_in_background` | Forwarded verbatim and ignored — it is the [`Agent`](../README.md#agent) *tool's* parameter name | `isBackground` |
-| `isolated: true` | Disables extensions, skills and nested tools | `isolation: "worktree"` for a git worktree |
-| `isolation: "worktree"` | Creates a git worktree | `isolated: true` to strip capabilities |
+| `isolated: true` | Disables extensions, skills and nested tools | `task_id` for a task-owned checkout |
+| `isolation: "worktree"` | Ignored; does not bypass mandatory task ownership | `isolated: true` to strip capabilities |
 | `configCwd` | Stripped | `cwd` |
 | `max_turns` / `thinking` / `inherit_context` | Ignored — tool and frontmatter spellings | `maxTurns` / `thinkingLevel` / `inheritContext` |
 | `memory` | Nothing. **There is no such option** | Memory scope comes only from the agent definition's frontmatter |
@@ -108,16 +113,24 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `SpawnOptions.cwd must be an absolute path: "<value>"` | `src/agent-manager.ts:85` |
 | `SpawnOptions.cwd does not exist: "<cwd>"` | `src/agent-manager.ts:91` |
 | `SpawnOptions.cwd is not a directory: "<cwd>"` | `src/agent-manager.ts:94` |
-| `Cannot run with isolation: "worktree" — not a git repo, no commits yet, or 'git worktree add' failed.` | `src/agent-manager.ts:716-719`, surfaced through `awaitStartup` |
-| git plumbing failures | `src/worktree.ts:76` |
+| `Explicit task_id or a captured task binding is required; use /agents task bind` | `src/agent-manager.ts` — rejected before child launch |
+| `Task binding initialization requires an explicitly resolved full base_oid, not HEAD or a ref` | `src/agent-manager.ts` — initialization never resolves a moving ref implicitly |
+| Invalid `task_id`, `task_access` or recorded snapshot | `src/task-worktree.ts` — identity validation |
+| Helper startup, protocol or connection failure | `src/task-worktree.ts` — no allocation or parent-checkout fallback |
+| `TaskBusy` | Task authority — conflicting writer or stable-reader claims |
+| `IdentityMismatch` | Task authority — repository, generation, immutable base or checkout verification failed |
+| `RecoveryRequired` / `UnknownUse` | Task authority — uncertain ownership or settlement; data remains retained |
+| `InvalidRequest` / `UnsafePath` / `NotPreserved` / `HelperError` | Task authority — missing initialized task, invalid request, unsafe path, absent preservation or helper operation failure |
 | `Agent not found` | stop — `src/cross-extension-rpc.ts:170` |
 | `Agent is owned by another agent or workflow` | stop — `:178` |
 | `Agent is not running` | stop — `:182`. The record exists, so it has already settled |
 | `Agent not found or still running` | consume — `:193` |
 
+For migration, initialize and bind a task at an explicit full commit object ID before dispatch. Preserve legacy checkouts, working files and transcripts; no automatic adoption, removal or recovery runs. A legacy conversation without a recorded task snapshot cannot reopen as a managed attempt. Transfer needed working files into an initialized task checkout under a writer claim. Treat identity and recovery errors as failures, not permission to retry in the parent checkout.
+
 Three things the table cannot show:
 
-- **The failure that is not an error.** With `worktreeIsolation` off project-wide, `isolation: "worktree"` is dropped at `src/agent-manager.ts:712` with no error, no note on the record, and a success envelope on the wire. Your agent runs in the main tree. If you asked for isolation because two agents were going to write the same files, they now collide and nothing told you.
+- **Legacy isolation settings do not bypass claims.** Independent parallel writers need distinct initialized task IDs. Same-task contention returns `TaskBusy`; missing identity, helper failure and uncertain settlement never authorize a parent-checkout fallback.
 - **`data` is omitted** when a handler returns nothing, so a successful stop or consume reply is a bare `{ success: true }` and `reply.data.anything` throws.
 - **`requestId` is not validated.** It is interpolated straight into the reply channel, so a caller that omits it gets its reply on the literal channel `subagents:rpc:spawn:reply:undefined` — where every other caller that omitted it is also listening. Send one, and send a unique one.
 
@@ -160,7 +173,7 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 
 | Member | Signature | Notes |
 |---|---|---|
-| `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
+| `waitForAll()` | `() => Promise<void>` | Waits for actual manager attempt settlement, including tools and claims. Covers all manager agents, not the workflow worker thread. Rejects once for each settlement error not yet reported; the failed record stays listed with its error, and a later call does not reject again for it |
 | `hasRunning()` | `() => boolean` | |
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |

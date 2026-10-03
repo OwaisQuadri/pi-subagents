@@ -11,6 +11,10 @@
  * without throwing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -51,6 +55,7 @@ describe("reporting subagent usage back to the parent session", () => {
   function boot(settings: Record<string, unknown>) {
     hermetic = hermeticDir({ settings });
     const { pi, tools, lifecycle } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
     return { pi, tools, lifecycle };
   }
@@ -216,6 +221,7 @@ describe("reporting subagent usage back to the parent session", () => {
         // manager and the id of the agent that owns the child.
         const { manager, parentAgentId } = opts.nestedRuntime;
         const childId = manager.spawn(pi, ctx(), "general-purpose", "sub", {
+          taskSnapshot: declareTask(process.cwd(), "usage-child"),
           description: "nested",
           isBackground: false,
           parentAgentId,

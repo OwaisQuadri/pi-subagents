@@ -26,6 +26,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
 import { runPrintMode, toolCallsNamed, toolResultsNamed } from "../helpers/print-mode-runner.js";
+import { taskHelper, taskHelperTitle } from "../helpers/task-fixture.js";
+
+const TASK_BINARY = taskHelper();
 
 /**
  * A project directory with workflows switched on.
@@ -78,13 +81,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 20_000): Promise<bo
 }
 
 describe("Workflow end to end", () => {
-  it("runs a real script whose agents reach real sessions with the script's prompts", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("runs a real script whose agents reach real sessions with the script's prompts"), async () => {
     const script = [
       'export const meta = { name: "e2e-fanout", description: "spawn two agents", phases: [{ title: "Work" }] };',
       'phase("Work");',
       "const results = await parallel([",
-      '  () => agent("FIRST-TASK-MARKER", { label: "one" }),',
-      '  () => agent("SECOND-TASK-MARKER", { label: "two" }),',
+      '  () => agent("FIRST-TASK-MARKER", { label: "one", task_id: "e2e-one" }),',
+      '  () => agent("SECOND-TASK-MARKER", { label: "two", task_id: "e2e-two" }),',
       "]);",
       'log("collected " + results.length);',
       "return results;",
@@ -99,6 +102,7 @@ describe("Workflow end to end", () => {
     const run = await runPrintMode({
       prompt: "run the workflow",
       cwd,
+      taskFixture: { binary: TASK_BINARY, task_ids: ["e2e-workflow", "e2e-one", "e2e-two"] },
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
@@ -128,10 +132,9 @@ describe("Workflow end to end", () => {
 
       expect(sawBoth, `child prompts seen: ${childPrompts.length}`).toBe(true);
       await run.manager?.waitForAll();
+      expect(await waitFor(() => journalsFor(run.parentSession.sessionManager.getCwd()).flatMap(readJournal).length === 2)).toBe(true);
 
-      // The journal is what makes `resumeFromRunId` cheap, and it is only real
-      // if a real run writes it — both agents, keyed and answered, on disk.
-      const journals = journalsFor(cwd);
+      const journals = journalsFor(run.parentSession.sessionManager.getCwd());
       expect(journals, "a real run must leave a journal beside its script").toHaveLength(1);
       const recorded = readJournal(journals[0]);
       expect(recorded).toHaveLength(2);
@@ -151,7 +154,7 @@ describe("Workflow end to end", () => {
     }
   }, 90_000);
 
-  it("runs a saved workflow by name, with schema and a nested child, end to end", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("runs a saved workflow by name, with schema and a nested child, end to end"), async () => {
     // The point of the compatibility work, exercised the way a real script
     // does it: a saved workflow invoked by `name`, calling another saved
     // workflow inline, whose agent answers through StructuredOutput. Every
@@ -183,6 +186,7 @@ describe("Workflow end to end", () => {
     const run = await runPrintMode({
       prompt: "run the saved workflow",
       cwd,
+      taskFixture: { binary: TASK_BINARY, task_ids: ["e2e-workflow"] },
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
@@ -210,10 +214,9 @@ describe("Workflow end to end", () => {
       );
       expect(sawNested, `child prompts seen: ${childPrompts.length}`).toBe(true);
       await run.manager?.waitForAll();
+      expect(await waitFor(() => journalsFor(run.parentSession.sessionManager.getCwd()).flatMap(readJournal).length === 1)).toBe(true);
 
-      // The nested child's agent is journaled as this run's own — one run, one
-      // counter — which is the whole claim of same-worker nesting.
-      const journals = journalsFor(cwd);
+      const journals = journalsFor(run.parentSession.sessionManager.getCwd());
       expect(journals).toHaveLength(1);
       const recorded = readJournal(journals[0]);
       expect(recorded).toHaveLength(1);

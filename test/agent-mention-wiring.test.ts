@@ -14,6 +14,10 @@
 import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -25,6 +29,7 @@ vi.mock("../src/agent-runner.js", async () => {
 // when it comes back empty. mention-clone.test.ts covers the clone itself.
 vi.mock("../src/mention-clone.js", () => ({ runMentionClone: vi.fn() }));
 
+import { AgentManager } from "../src/agent-manager.js";
 import { getDefaultMaxTurns, resumeAgent, runAgent, setDefaultMaxTurns } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { runMentionClone } from "../src/mention-clone.js";
@@ -68,10 +73,7 @@ function fakeSession(overrides: Record<string, unknown> = {}) {
 /** A runAgent that never settles, so the agent stays "running". */
 function heldRun(session: any) {
   vi.mocked(runAgent).mockImplementation(
-    (_ctx: any, _type: any, _prompt: any, opts: any) =>
-      new Promise(() => {
-        opts.onSessionCreated?.(session);
-      }) as any,
+    (_ctx: any, _type: any, _prompt: any, opts: any) => heldWorker({ responseText: "held", session, aborted: false, steered: false }, () => opts.onSessionCreated?.(session), opts.signal),
   );
 }
 
@@ -89,7 +91,7 @@ function finishedRun(session: any) {
 /** Boot the real extension. `outputTranscript: false` keeps the run off disk. */
 function boot(settings: Record<string, unknown> = {}) {
   hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
-  const b = makePi();
+  const b = makePi(); wiringTasks(b.pi, ["mention-binding", "mention-first", "mention-second", "mention-third"]);
   subagentsExtension(b.pi);
   booted = b.lifecycle;
   return b;
@@ -164,8 +166,8 @@ describe("messaging a running agent", () => {
     const first = fakeSession();
     const second = fakeSession();
     vi.mocked(runAgent)
-      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => new Promise(() => o.onSessionCreated?.(first)) as any)
-      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => new Promise(() => o.onSessionCreated?.(second)) as any);
+      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => heldWorker({ responseText: "held", session: first, aborted: false, steered: false }, () => o.onSessionCreated?.(first), o.signal) as any)
+      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => heldWorker({ responseText: "held", session: second, aborted: false, steered: false }, () => o.onSessionCreated?.(second), o.signal) as any);
 
     await spawnBackground(tools);
     await spawnBackground(tools);
@@ -210,7 +212,7 @@ describe("messaging a finished agent", () => {
       settings: { outputTranscript: true },
       agentFiles: { quiet: "---\ndescription: writes no transcript\noutput_transcript: false\n---\nbody" },
     });
-    const b = makePi();
+    const b = makePi(); wiringTasks(b.pi, ["mention-binding", "mention-first", "mention-second", "mention-third"]);
     subagentsExtension(b.pi);
     booted = b.lifecycle;
     finishedRun(fakeSession());
@@ -590,7 +592,7 @@ describe("letting a clone of the conversation start the agent", () => {
       expect.objectContaining({
         type: "Plan",
         message: "sketch the migration",
-        agentTool: tools.get("Agent"),
+        agentTool: expect.objectContaining({ parameters: tools.get("Agent").parameters, renderCall: tools.get("Agent").renderCall, renderResult: tools.get("Agent").renderResult }),
       }),
     );
   });
@@ -625,6 +627,24 @@ describe("letting a clone of the conversation start the agent", () => {
     // The clone's turn happens first, so the agent does not exist yet. `direct`
     // mode's "Started @explore" is the contrast: there, it does.
     expect(uiCtx.ui.notify).toHaveBeenCalledWith("Prompting @explore…", "info");
+  });
+
+  it("hands the clone's spawn the snapshot captured at mention time, even after a rebind", async () => {
+    const { commands, lifecycle } = boot();
+    heldRun(fakeSession());
+    const spawn = vi.spyOn(AgentManager.prototype, "spawn");
+    const uiCtx = ctx();
+    vi.mocked(runMentionClone).mockImplementation(async ({ agentTool, ctx: mentionCtx }) => {
+      await commands.get("agents").handler("task bind mention-first", uiCtx);
+      await agentTool.execute(undefined as never, { prompt: "go", description: "clone spawn", subagent_type: "Explore", run_in_background: true }, undefined, undefined, mentionCtx);
+      return { spawned: true };
+    });
+
+    await lifecycle.get("input")({ type: "input", text: "@explore find the flaky test", source: "interactive" }, uiCtx);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalled());
+
+    expect(spawn.mock.calls[0][4]).toMatchObject({ task_id: "mention-binding", taskSnapshot: expect.objectContaining({ task_id: "mention-binding" }) });
+    expect(spawn.mock.contexts[0].getTaskBinding()?.task_id).toBe("mention-first");
   });
 
   it("starts the agent directly when the clone cannot", async () => {
@@ -974,8 +994,8 @@ describe("@agent-<type> — Claude Code's manual spelling", () => {
     const literal = fakeSession();
     const plain = fakeSession();
     vi.mocked(runAgent)
-      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => new Promise(() => o.onSessionCreated?.(plain)) as any)
-      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => new Promise(() => o.onSessionCreated?.(literal)) as any);
+      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => heldWorker({ responseText: "held", session: plain, aborted: false, steered: false }, () => o.onSessionCreated?.(plain), o.signal) as any)
+      .mockImplementationOnce((_c: any, _t: any, _p: any, o: any) => heldWorker({ responseText: "held", session: literal, aborted: false, steered: false }, () => o.onSessionCreated?.(literal), o.signal) as any);
 
     await spawnBackground(tools); // plain Explore → @explore
     await tools.get("Agent").execute(
@@ -1126,7 +1146,7 @@ describe("resuming an evicted agent by name", () => {
       settings: { outputTranscript: false },
       agentFiles: { scout: "---\ndescription: scouts\n---\nbody" },
     });
-    const b = makePi();
+    const b = makePi(); wiringTasks(b.pi, ["mention-binding", "mention-first", "mention-second", "mention-third"]);
     subagentsExtension(b.pi);
     booted = b.lifecycle;
     finishedRun(fakeSession());
@@ -1157,7 +1177,7 @@ describe("resuming an evicted agent by name", () => {
       settings: { outputTranscript: false },
       agentFiles: { scout: "---\ndescription: scouts\nenabled: false\n---\nbody" },
     });
-    const b = makePi();
+    const b = makePi(); wiringTasks(b.pi, ["mention-binding", "mention-first", "mention-second", "mention-third"]);
     subagentsExtension(b.pi);
     booted = b.lifecycle;
     // Spawn while it is still enabled, then disable, mention, re-enable.

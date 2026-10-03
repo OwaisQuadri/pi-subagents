@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { validateTaskSnapshot } from "./task-worktree.js";
 import type { ScheduledSubagent, ScheduleStoreData } from "./types.js";
 
 const LOCK_RETRY_MS = 50;
@@ -70,14 +71,20 @@ export class ScheduleStore {
     mkdirSync(dirname(this.filePath), { recursive: true });
   }
 
-  /** Load from disk into the in-memory cache. Silent on parse errors. */
   private load(): void {
     if (!existsSync(this.filePath)) return;
-    try {
-      const data: ScheduleStoreData = JSON.parse(readFileSync(this.filePath, "utf-8"));
-      this.jobs.clear();
-      for (const j of data.jobs ?? []) this.jobs.set(j.id, j);
-    } catch { /* corrupt — start fresh, next save rewrites */ }
+    let data: ScheduleStoreData;
+    try { data = JSON.parse(readFileSync(this.filePath, "utf-8")); }
+    catch { return; }
+    if (data.version !== 1 || !Array.isArray(data.jobs)) throw new Error("Invalid scheduled job store schema");
+    const jobs = new Map<string, ScheduledSubagent>();
+    for (const job of data.jobs) {
+      if (!job || typeof job.id !== "string" || !job.id || typeof job.name !== "string" || typeof job.prompt !== "string" ||
+          typeof job.subagent_type !== "string" || typeof job.schedule !== "string" || typeof job.enabled !== "boolean" ||
+          !["cron", "once", "interval"].includes(job.scheduleType)) throw new Error("Invalid scheduled job schema");
+      jobs.set(job.id, { ...job, taskSnapshot: job.taskSnapshot === undefined ? undefined : validateTaskSnapshot(job.taskSnapshot) });
+    }
+    this.jobs = jobs;
   }
 
   /** Atomic write via temp file + rename (POSIX-atomic). */

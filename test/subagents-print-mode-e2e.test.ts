@@ -29,6 +29,9 @@ import {
   routeBySession,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
+import { taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
+
+const TASK_BINARY = taskHelper();
 
 // Real pi-mono (loader + dynamic extension import + two live sessions) — a cold
 // run under full-suite CPU contention can exceed vitest's 5s default.
@@ -77,8 +80,9 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
   // onto the record. Every unit test in that area stubs the session, so nothing
   // else would notice pi moving or renaming either getter — the display would
   // just quietly go blank, which is the bug this whole area exists to fix.
-  it("records the model and thinking level the child session actually resolved", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("records the model and thinking level the child session actually resolved"), async () => {
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate the greeting to a subagent.",
       respond: routeBySession({
         parentInitial: agentCall({
@@ -108,8 +112,9 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(invocation?.thinking).not.toBe("");
   });
 
-  it("spawns a FOREGROUND subagent and routes its real output back to the parent", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("spawns a FOREGROUND subagent and routes its real output back to the parent"), async () => {
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate the greeting to a subagent.",
       respond: routeBySession({
         parentInitial: agentCall({
@@ -146,7 +151,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(run.modelCalls).toBeGreaterThanOrEqual(3);
   });
 
-  it("the hold condition is load-bearing: it keeps a BACKGROUND child alive (vs abandoned without it)", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("the hold condition is load-bearing: it keeps a BACKGROUND child alive (vs abandoned without it)"), async () => {
     // The child takes a beat to "think" (a real delay in its faux turn). That
     // delay is what makes the contrast causal and deterministic:
     //   - WITHOUT the hold, the parent's turn ends and the runner tears down
@@ -172,13 +177,13 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     // Control: no hold → the child hasn't run by the time the parent turn ends.
     // `modelCalls` is snapshotted at that moment (it's a plain number on the
     // result), so draining afterwards to tear down cleanly doesn't change it.
-    const noHold = await runPrintMode({ prompt: "go", hold: false, respond });
+    const noHold = await runPrintMode({ taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] }, prompt: "go", hold: false, respond });
     const abandonedCalls = noHold.modelCalls;
     await noHold.manager?.waitForAll(); // let the orphan finish before dispose (avoids stale-ctx)
     await noHold.dispose();
 
     // Subject: hold on → child runs to completion before the parent finishes.
-    run = await runPrintMode({ prompt: "go", hold: true, respond });
+    run = await runPrintMode({ taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] }, prompt: "go", hold: true, respond });
 
     // Background spawn returns its envelope synchronously either way.
     expect(agentToolResults(run.parentSession)[0]).toMatch(/background/i);
@@ -188,7 +193,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(run.modelCalls).toBeGreaterThanOrEqual(3);
   });
 
-  it("spawns a FRONTMATTER-defined (.pi/agents/*.md) agent and its prompt reaches the child", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("spawns a FRONTMATTER-defined (.pi/agents/*.md) agent and its prompt reaches the child"), async () => {
     // A project agent whose body is a distinctive system prompt. Proving the
     // child SAW it proves the full chain: the extension discovers the .md from
     // process.cwd(), parses its frontmatter, and runAgent's buildAgentPrompt
@@ -203,6 +208,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     );
 
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate to the echo-spy agent.",
       cwd, // runner chdir's here so the extension discovers echo-spy.md
       respond: routeBySession({
@@ -227,7 +233,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(toolResults[0]).not.toMatch(/Unknown agent type/i);
   });
 
-  it("spawns a FRONTMATTER-defined (.agents/agents/*.md) agent and its prompt reaches the child", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("spawns a FRONTMATTER-defined (.agents/agents/*.md) agent and its prompt reaches the child"), async () => {
     const MARKER = "SPYMARKER_AGENTS_FRONTMATTER_REACHED_CHILD";
     const cwd = mkdtempSync(join(tmpdir(), "subagents-agents-fm-"));
     tmpDirs.push(cwd);
@@ -238,6 +244,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     );
 
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate to the agents-spy agent.",
       cwd,
       respond: routeBySession({
@@ -260,7 +267,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(toolResults[0]).not.toMatch(/Unknown agent type/i);
   });
 
-  it("a colored agent's name badge never reaches print-mode text", async () => {
+  it.skipIf(!TASK_BINARY)(taskHelperTitle("a colored agent's name badge never reaches print-mode text"), async () => {
     // Badges are a TUI concern: print mode renders no tool components, and the text the
     // model and `pi -p` see is built from plain display names. An escape sequence here
     // would mean color leaking into transcripts, headless output and the parent prompt.
@@ -273,6 +280,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     );
 
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate to the painted agent.",
       cwd,
       respond: routeBySession({

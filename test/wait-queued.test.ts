@@ -11,6 +11,10 @@
  * call returns the final result.
  */
 import { describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, fixturePromise, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -64,7 +68,7 @@ function deferredRuns() {
   const resolvers: Array<(v: any) => void> = [];
   vi.mocked(runAgent).mockImplementation(
     () =>
-      new Promise((resolve) => {
+      fixturePromise((resolve) => {
         resolvers.push(() =>
           resolve({
             responseText: "THE-RESULT-PAYLOAD",
@@ -93,6 +97,7 @@ async function spawnBackground(tools: Map<string, any>): Promise<{ id: string; q
 describe("get_subagent_result wait:true on a queued agent", () => {
   it("waits through queue start and returns the result (no 'still running')", async () => {
     const { pi, tools, lifecycle } = makePi();
+    wiringTasks(pi, ["queue-binding", "queue-A", "queue-B", "queue-C", "queue-D", "queue-E", "queue-F", "queue-G", "queue-H", "queue-I", "queue-J", "queue-K", "queue-L", "queue-M", "queue-N", "queue-O", "queue-P", "queue-Q", "queue-R", "queue-S", "queue-T"]);
     subagentsExtension(pi);
 
     const resolvers = deferredRuns();
@@ -131,13 +136,14 @@ describe("get_subagent_result wait:true on a queued agent", () => {
 
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
+    wiringTasks(pi, ["queue-binding", "queue-A", "queue-B", "queue-C", "queue-D", "queue-E", "queue-F", "queue-G", "queue-H", "queue-I", "queue-J", "queue-K", "queue-L", "queue-M", "queue-N", "queue-O", "queue-P", "queue-Q", "queue-R", "queue-S", "queue-T"]);
     subagentsExtension(pi);
 
     let resolveRun: (() => void) | undefined;
     let childSignal: AbortSignal | undefined;
     vi.mocked(runAgent).mockImplementation(
       (_ctx, _type, _prompt, options) =>
-        new Promise((resolve) => {
+        fixturePromise((resolve) => {
           childSignal = options.signal;
           resolveRun = () => resolve({
             responseText: "THE-RESULT-PAYLOAD",
@@ -186,6 +192,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
 
   it("aborts a queued result wait before the agent starts", async () => {
     const { pi, tools, lifecycle } = makePi();
+    wiringTasks(pi, ["queue-binding", "queue-A", "queue-B", "queue-C", "queue-D", "queue-E", "queue-F", "queue-G", "queue-H", "queue-I", "queue-J", "queue-K", "queue-L", "queue-M", "queue-N", "queue-O", "queue-P", "queue-Q", "queue-R", "queue-S", "queue-T"]);
     subagentsExtension(pi);
 
     const resolvers = deferredRuns();

@@ -18,6 +18,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      # Helper-backed suites skip here on purpose: CI builds no worktree-hygiene
+      # helper, so PI_SUBAGENTS_TASK_HELPER stays unset (README, "Testing with the task helper").
       - run: npm run test
       - uses: oven-sh/setup-bun@v2
       - run: npm run bundle

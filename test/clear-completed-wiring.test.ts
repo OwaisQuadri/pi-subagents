@@ -16,6 +16,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -126,7 +130,8 @@ describe("issue #108: unread completed background agents survive session events"
 
   it("session_before_switch (user switches sessions) does NOT wipe the unread result", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
 
     // The exact #108 trigger: a session switch fires before the LLM read the result.
@@ -142,7 +147,8 @@ describe("issue #108: unread completed background agents survive session events"
 
   it("session_start (/resume) does NOT wipe the unread result", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
 
     await lifecycle.get("session_start")?.({}, ctx());
@@ -157,7 +163,8 @@ describe("issue #108: unread completed background agents survive session events"
 
   it("once read, a session switch DOES evict it — the fix stays surgical, no leak", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
 
     // LLM reads the result → resultConsumed=true.

@@ -130,7 +130,7 @@ describe("toolDescriptionMode", () => {
       "run_in_background",
       "resume",
       "steer_subagent",
-      'isolation: "worktree"',
+      "isolation is ignored",
       ".pi/agents/",
       "self-contained",
     ]) {
@@ -220,7 +220,7 @@ describe("toolDescriptionMode", () => {
       writeFileSync(join(tmpDir, ".pi", "agent-tool-description.md"), "RULES:{{isolationGuideline}}\nEND");
     });
     const desc: string = tools.get("Agent").description;
-    expect(desc).toContain('RULES:\n- Use isolation: "worktree"');
+    expect(desc).toContain("RULES:\n- isolation is an ignored legacy option");
   });
 
   it("{{isolationGuideline}} expands to the empty string when worktree isolation is disabled", () => {
@@ -312,7 +312,7 @@ describe("toolDescriptionMode", () => {
     it("advertises `isolation` in schema and prose by default", () => {
       const tools = setup();
       expect(props(tools)).toContain("isolation");
-      expect(tools.get("Agent").description).toContain('Use isolation: "worktree"');
+      expect(tools.get("Agent").description).toContain("isolation is an ignored legacy option");
     });
 
     it("drops both when worktree isolation is disabled", () => {
@@ -326,7 +326,7 @@ describe("toolDescriptionMode", () => {
 
     it("drops the compact description's bullet too", () => {
       const enabled = setup({ toolDescriptionMode: "compact" });
-      expect(enabled.get("Agent").description).toContain('isolation: "worktree"');
+      expect(enabled.get("Agent").description).toContain("isolation is ignored");
     });
 
     it("compact mode says nothing about isolation when disabled", () => {

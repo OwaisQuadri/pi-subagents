@@ -1,20 +1,6 @@
-/**
- * runtime.ts — the host half of a workflow run.
- *
- * Owns the worker lifecycle, the RPC bridge, the concurrency semaphore, the
- * per-run caps, and the progress log. The script's only route to an agent is a
- * `call` message landing here, which is what makes the caps and the abort story
- * enforceable at all: a script cannot go around them because it has nothing to
- * go around them *with*.
- *
- * Spawning is injected rather than imported. `AgentManager` is a large, stateful
- * dependency and wiring it in directly would make every test here an integration
- * test; a {@link WorkflowHost} stub is a dozen lines. The adapter that binds this
- * to the real manager lives at the call site.
- */
-
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import type { TaskSnapshot } from "../task-worktree.js";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
@@ -49,9 +35,10 @@ export function workflowConcurrency(cpuCount: number = cpus().length): number {
   return Math.max(1, Math.min(16, cpuCount - 2));
 }
 
-/** One agent the script asked for. `agentId` is the handle for {@link WorkflowHost.abortAgent}. */
 export interface WorkflowSpawnRequest {
   agentId: string;
+  task_id?: string;
+  task_access?: "write" | "read-stable";
   /** Position in the run, and the progress entry's stable identity. */
   index: number;
   prompt: string;
@@ -97,69 +84,25 @@ export interface WorkflowSpawnRequest {
     requestedThinking?: string;
     requestedModel?: string;
   }): void;
-  /**
-   * Compiled from the script's `agent({ schema })`.
-   *
-   * The host must give the child a `StructuredOutput` tool built from it and
-   * return the validated payload as JSON text. Compiled rather than raw so the
-   * runtime can re-check the answer without re-parsing the schema per call.
-   */
+
   schema?: CompiledSchema;
   phaseIndex?: number;
   phaseTitle?: string;
-  /**
-   * The `gate` command this agent is being spawned under, when it has one.
-   *
-   * Passed down rather than run purely from here because an isolated child's
-   * worktree is destroyed as part of its own settle: a host that can reach
-   * inside that settle runs the gate there, against the tree the child wrote,
-   * and reports the outcome back as {@link WorkflowSpawnResult.gate}. A host
-   * that ignores this leaves the gate to {@link applyGate}, which then runs it
-   * itself — so exactly one execution either way.
-   */
+
   gate?: string;
 }
 
 export interface WorkflowSpawnResult {
+  taskSnapshot?: TaskSnapshot;
   ok: boolean;
-  /** The agent's answer. Present when `ok`. */
   text?: string;
-  /** Why it failed. Present when not `ok`. */
   error?: string;
-  /** The user dismissed it rather than it failing; renders as skipped. */
   skipped?: boolean;
   tokens?: number;
-  /**
-   * Output tokens only, for the script's `budget.spent()`.
-   *
-   * Separate from {@link tokens}, which is the lifetime total. Claude Code's
-   * budget counts output, and a fan-out's re-sent input would swamp it.
-   */
   outputTokens?: number;
-  /** Whether the child needed an extra prompt to produce its structured answer. */
   structuredRetried?: boolean;
   toolCalls?: number;
-  /**
-   * Where the child actually ran.
-   *
-   * Only meaningful for `isolation: "worktree"`, and the whole reason it exists:
-   * a gate has to run against the tree the child edited, not the main one, or it
-   * verifies the wrong working copy. Left unset, a gate runs wherever the host
-   * runs commands by default.
-   *
-   * Usually unset for a worktree child even so: the copy is removed during the
-   * child's own settle, so it no longer exists by the time this is read. That
-   * is what {@link gate} is for.
-   */
   cwd?: string;
-  /**
-   * The outcome of this agent's `gate`, when the host already ran it.
-   *
-   * Set only by a host that ran the command itself — inside the child's
-   * worktree, while that directory still existed. Its presence is what tells
-   * {@link applyGate} the command has already been executed; the pass/fail
-   * decision and the error shaping still happen there, in one place.
-   */
   gate?: WorkflowGateResult;
 }
 
@@ -182,6 +125,8 @@ export type WorkflowScriptSource =
   | { ok: false; message: string };
 
 export interface WorkflowHost {
+  settle?(): Promise<void>;
+  journalContext?(input: JournalKeyInput): { identity?: TaskSnapshot; reuse?: { effect: "pure"; immutableInput: string } };
   spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
   /** Called for every in-flight agent when the run aborts. */
   abortAgent(agentId: string): void;
@@ -430,6 +375,8 @@ class Semaphore {
 
 interface AgentCallPayload {
   prompt: string;
+  task_id?: string;
+  task_access?: "write" | "read-stable";
   label?: string;
   model?: string;
   agentType?: string;
@@ -479,29 +426,6 @@ interface CompletedChild {
   isolation?: "worktree";
 }
 
-/**
- * Turn a failing gate into a failing agent.
- *
- * Deliberately no new state, no new entry type: a gated agent whose command
- * fails is *a failed agent*, so the card, the dialog and `agent()`'s `null`
- * return all handle it with the code they already have. The command output
- * becomes the error, because that is the thing worth reading.
- *
- * The single place that decides whether a gate passed. The command may have
- * been run by the host instead (inside a worktree that no longer exists by
- * now), but only ever by one of the two: a host that ran it says so with
- * `result.gate`, and this then shapes that outcome rather than running it
- * again.
- */
-/**
- * Hold a schema'd result to its schema, host-side.
- *
- * The child's own tool already validated whatever it passed, so this normally
- * agrees. It exists for the cases where nothing did: a host that ignores
- * `schema` entirely, a replayed journal entry from before the schema changed,
- * or a payload that reached us some other way. The script asked for a shape;
- * exactly one place should be able to promise it.
- */
 function applySchema(result: WorkflowSpawnResult, compiled: CompiledSchema): WorkflowSpawnResult {
   let parsed: unknown;
   try {
@@ -593,7 +517,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   const semaphore = new Semaphore(options.concurrency ?? workflowConcurrency());
 
   const progress: WorkflowEntry[] = [];
-  const inflight = new Set<string>();
+  const inflight = new Map<string, number>();
+  const operations = new Set<Promise<void>>();
   /** Label → the child that ran under it, last one wins. The `resume` handle. */
   const completedByLabel = new Map<string, CompletedChild>();
   /**
@@ -705,11 +630,11 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     },
   });
 
-  /** The journal entry to reuse at `index`, or undefined to run it live. */
-  function replayAt(index: number, key: string): WorkflowJournalEntry | undefined {
+  function replayAt(index: number, key: string, reuse: WorkflowJournalEntry["reuse"]): WorkflowJournalEntry | undefined {
     if (!prefixIntact) return undefined;
     const entry = journalEntries[index];
-    if (entry === undefined || entry.index !== index || entry.key !== key || !entry.ok) {
+    if (reuse === undefined || entry?.reuse?.effect !== "pure" || entry.reuse.immutableInput !== reuse.immutableInput ||
+        entry.index !== index || entry.key !== key || !entry.ok) {
       prefixIntact = false;
       return undefined;
     }
@@ -748,18 +673,22 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       if (settled) return;
       settled = true;
       options.signal?.removeEventListener("abort", onAbort);
-      // Symmetric with `semaphore.drain()` below: everything parked is woken so
-      // it observes the settle and unwinds. Nothing depends on it — the run's
-      // promise resolves either way — it just does not leave live-agent
-      // bookkeeping behind for a run that is over.
       releasePause();
-      for (const agentId of inflight) host.abortAgent(agentId);
+      for (const agentId of inflight.keys()) host.abortAgent(agentId);
       inflight.clear();
       semaphore.drain();
-      // Resolve only once the thread is actually down, so a caller that awaits
-      // runWorkflow() is guaranteed not to be leaking one.
-      const settle = () => resolve({ ...result, meta, progress, agentCount, replayedCount });
-      void worker.terminate().then(settle, settle);
+      void (async () => {
+        try {
+          await worker.terminate();
+          const attempts = await Promise.allSettled(operations);
+          await host.settle?.();
+          const failed = attempts.find(attempt => attempt.status === "rejected");
+          if (failed?.status === "rejected") throw failed.reason;
+          resolve({ ...result, meta, progress, agentCount, replayedCount });
+        } catch (error) {
+          resolve({ status: "failed", error: `Workflow settlement failed: ${error instanceof Error ? error.message : String(error)}`, meta, progress, agentCount, replayedCount });
+        }
+      })();
     };
 
     function onAbort() {
@@ -881,7 +810,13 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         ...payload,
         schema: payload.schema !== undefined ? JSON.stringify(payload.schema) : undefined,
       };
-      let replayed = replayAt(index, journalKey(keyInput));
+      const qualification = host.journalContext?.(keyInput);
+      keyInput.identity = qualification?.identity;
+      const reuse = payload.gate === undefined && payload.resume === undefined && payload.task_access !== "write" &&
+          qualification?.identity?.access !== "write" && qualification?.reuse?.immutableInput.trim()
+        ? qualification.reuse : undefined;
+      keyInput.reuse = reuse;
+      let replayed = replayAt(index, journalKey(keyInput), reuse);
       // A replayed answer still has to satisfy the schema. The key covers a
       // schema that *changed*, but not a journal that was hand-edited, and not
       // the empty text a torn entry leaves behind — either would hand the
@@ -916,7 +851,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         // Re-recorded so this run's journal is complete on its own terms: a
         // resume of a resume must not have to walk back through a chain of
         // earlier files to find the prefix.
-        recordJournal?.({ index, key: replayed.key, ok: true, text: replayedText });
+        recordJournal?.({ index, key: replayed.key, ok: true, text: replayedText, reuse });
         respond(callId, true, replayedText);
         return;
       }
@@ -1001,16 +936,11 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             if (info.thinking !== undefined) base.thinking = info.thinking;
             if (info.requestedThinking !== undefined) base.requestedThinking = info.requestedThinking;
             if (info.requestedModel !== undefined) base.requestedModel = info.requestedModel;
-            // `base.state` is still "start", so emitting after the row reached a
-            // terminal state would revert it to running under last-write-wins.
-            // Not reachable from this repo's host, which reports during startup
-            // — but this is the host boundary, and every other promise it makes
-            // is checked rather than trusted.
-            if (!inflight.has(agentId)) return;
+            if (!live.started) return;
             emit([{ ...base, queuedAt, startedAt, ...attemptMark, lastProgressAt: Date.now() }]);
           };
           live.started = true;
-          inflight.add(agentId);
+          inflight.set(agentId, (inflight.get(agentId) ?? 0) + 1);
 
           let result: WorkflowSpawnResult;
           try {
@@ -1020,6 +950,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                 : await host.spawnAgent({
                     agentId,
                     index,
+                    ...(payload.task_id !== undefined ? { task_id: payload.task_id } : {}),
+                    ...(payload.task_access !== undefined ? { task_access: payload.task_access } : {}),
                     prompt: payload.prompt,
                     label,
                     agentType,
@@ -1055,14 +987,16 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
               if (compiledSchema !== undefined && result.ok) {
                 result = applySchema(result, compiledSchema);
               }
-              if (result.ok && payload.gate !== undefined && runGate !== undefined) {
-                result = await applyGate(result, payload.gate, agentId, runGate);
+              if (result.ok && (payload.gate !== undefined || result.gate !== undefined) && runGate !== undefined) {
+                result = await applyGate(result, payload.gate ?? "retained child gate", agentId, runGate);
               }
             }
           } catch (error) {
             result = { ok: false, error: error instanceof Error ? error.message : String(error) };
           } finally {
-            inflight.delete(agentId);
+            const remaining = (inflight.get(agentId) ?? 0) - 1;
+            if (remaining > 0) inflight.set(agentId, remaining);
+            else inflight.delete(agentId);
             live.started = false;
             semaphore.release();
           }
@@ -1099,7 +1033,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           if (result.ok) {
             const text = result.text ?? "";
             emit([{ ...common, state: "done", resultPreview: preview(text) }]);
-            recordJournal?.({ index, key, ok: true, text, ...resumeMark });
+            recordJournal?.({ index, key: result.taskSnapshot === undefined ? key : journalKey({ ...keyInput, identity: result.taskSnapshot }), ok: true, text, ...(reuse !== undefined ? { reuse } : {}), ...resumeMark });
             respond(callId, true, text);
             return;
           }
@@ -1182,7 +1116,14 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             respond(message.callId, false, undefined, `Unknown workflow host method "${message.method}".`, true);
             break;
           }
-          void handleAgent(message.callId, message.payload as AgentCallPayload);
+          {
+            const operation = handleAgent(message.callId, message.payload as AgentCallPayload);
+            operations.add(operation);
+            void operation.then(() => operations.delete(operation), error => {
+              operations.delete(operation);
+              finish({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+            });
+          }
           break;
         case "complete": {
           // The script is done, so every launch it made should have been

@@ -22,6 +22,7 @@ function makeMockManager() {
   const spawnFn = vi.fn(() => "agent-" + Math.random().toString(36).slice(2, 10));
   return {
     spawn: spawnFn,
+    getTaskBinding: () => ({ repository: "/tmp", task_id: "explicit-schedule-fixture", generation: 1, repository_id: "fixture", base_oid: "a".repeat(40), checkout: "/tmp", access: "write", configCwd: "/tmp" }),
     awaitStartup: vi.fn(async () => {}),
     getRecord: vi.fn(() => ({ promise: Promise.resolve("done") })),
   } as any;
@@ -41,8 +42,8 @@ function makeMockCtx() {
   } as any;
 }
 
-describe("SubagentScheduler — static format parsers", () => {
-  it("parseRelativeTime accepts +Ns/Nm/Nh/Nd and rejects bare numbers", () => {
+describe("SubagentScheduler — static format parsers", async () => {
+  it("parseRelativeTime accepts +Ns/Nm/Nh/Nd and rejects bare numbers", async () => {
     const before = Date.now();
     const iso = SubagentScheduler.parseRelativeTime("+10s");
     expect(iso).not.toBeNull();
@@ -60,7 +61,7 @@ describe("SubagentScheduler — static format parsers", () => {
     expect(SubagentScheduler.parseRelativeTime("hello")).toBeNull();
   });
 
-  it("parseInterval converts unit-suffixed strings to milliseconds", () => {
+  it("parseInterval converts unit-suffixed strings to milliseconds", async () => {
     expect(SubagentScheduler.parseInterval("10s")).toBe(10_000);
     expect(SubagentScheduler.parseInterval("5m")).toBe(300_000);
     expect(SubagentScheduler.parseInterval("1h")).toBe(3_600_000);
@@ -71,14 +72,14 @@ describe("SubagentScheduler — static format parsers", () => {
     expect(SubagentScheduler.parseInterval("five-minutes")).toBeNull();
   });
 
-  it("validateCronExpression rejects non-6-field expressions", () => {
+  it("validateCronExpression rejects non-6-field expressions", async () => {
     expect(SubagentScheduler.validateCronExpression("* * * * *").valid).toBe(false);  // 5 fields
     expect(SubagentScheduler.validateCronExpression("0 0 9 * * 1").valid).toBe(true);
     expect(SubagentScheduler.validateCronExpression("0 0 9 * * *").valid).toBe(true);
     expect(SubagentScheduler.validateCronExpression("not-a-cron").valid).toBe(false);
   });
 
-  it("detectSchedule tags type and normalizes input", () => {
+  it("detectSchedule tags type and normalizes input", async () => {
     expect(SubagentScheduler.detectSchedule("+10m").type).toBe("once");
     expect(SubagentScheduler.detectSchedule("5m").type).toBe("interval");
     expect(SubagentScheduler.detectSchedule("5m").intervalMs).toBe(300_000);
@@ -93,7 +94,7 @@ describe("SubagentScheduler — static format parsers", () => {
   });
 });
 
-describe("SubagentScheduler — lifecycle", () => {
+describe("SubagentScheduler — lifecycle", async () => {
   let tmp: string;
   let store: ScheduleStore;
   let scheduler: SubagentScheduler;
@@ -116,14 +117,14 @@ describe("SubagentScheduler — lifecycle", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("isActive() reports start/stop state", () => {
+  it("isActive() reports start/stop state", async () => {
     expect(scheduler.isActive()).toBe(true);
     scheduler.stop();
     expect(scheduler.isActive()).toBe(false);
   });
 
-  it("addJob persists, arms, and emits added event", () => {
-    const job = scheduler.addJob({
+  it("addJob persists, arms, and emits added event", async () => {
+    const job = await scheduler.addJob({
       name: "j1",
       description: "test",
       schedule: "1h",
@@ -135,22 +136,22 @@ describe("SubagentScheduler — lifecycle", () => {
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({ type: "added" }));
   });
 
-  it("addJob rejects duplicate names", () => {
-    scheduler.addJob({ name: "j1", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p" });
-    expect(() => scheduler.addJob({
+  it("addJob rejects duplicate names", async () => {
+    await scheduler.addJob({ name: "j1", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p" });
+    await expect(scheduler.addJob({
       name: "j1", description: "y", schedule: "2h", subagent_type: "general-purpose", prompt: "p2",
-    })).toThrow(/already exists/);
+    })).rejects.toThrow(/already exists/);
   });
 
-  it("removeJob clears the job and emits removed", () => {
-    const job = scheduler.addJob({ name: "j1", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p" });
+  it("removeJob clears the job and emits removed", async () => {
+    const job = await scheduler.addJob({ name: "j1", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p" });
     expect(scheduler.removeJob(job.id)).toBe(true);
     expect(scheduler.list()).toEqual([]);
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({ type: "removed", jobId: job.id }));
   });
 
-  it("updateJob({enabled: false}) unschedules but keeps the record", () => {
-    const job = scheduler.addJob({ name: "j1", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p" });
+  it("updateJob({enabled: false}) unschedules but keeps the record", async () => {
+    const job = await scheduler.addJob({ name: "j1", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p" });
     scheduler.updateJob(job.id, { enabled: false });
     expect(scheduler.list()[0].enabled).toBe(false);
     expect(scheduler.getNextRun(job.id)).toBeUndefined();
@@ -159,9 +160,9 @@ describe("SubagentScheduler — lifecycle", () => {
   // Regression: getNextRun on a freshly-created interval used to return undefined
   // (the lastRun-based branch needs lastRun, which is undefined before first fire),
   // surfacing as "Next run: (unknown)" in the agent's create-response.
-  it("getNextRun returns an approximate future time for a fresh interval (no lastRun yet)", () => {
+  it("getNextRun returns an approximate future time for a fresh interval (no lastRun yet)", async () => {
     const before = Date.now();
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "fresh-interval", description: "x", schedule: "1h",
       subagent_type: "general-purpose", prompt: "p",
     });
@@ -174,8 +175,8 @@ describe("SubagentScheduler — lifecycle", () => {
   });
 
   // Once a fire happens and `lastRun` is set, getNextRun should pivot to it.
-  it("getNextRun uses lastRun when present for interval jobs", () => {
-    const job = scheduler.addJob({
+  it("getNextRun uses lastRun when present for interval jobs", async () => {
+    const job = await scheduler.addJob({
       name: "ran-once", description: "x", schedule: "1h",
       subagent_type: "general-purpose", prompt: "p",
     });
@@ -185,11 +186,11 @@ describe("SubagentScheduler — lifecycle", () => {
     expect(next).toBe(new Date(new Date(lastRun).getTime() + 3_600_000).toISOString());
   });
 
-  it("rejects past one-shot timestamps upfront — no record created", () => {
+  it("rejects past one-shot timestamps upfront — no record created", async () => {
     const past = new Date(Date.now() - 60_000).toISOString();
-    expect(() => scheduler.addJob({
+    await expect(scheduler.addJob({
       name: "past", description: "x", schedule: past, subagent_type: "general-purpose", prompt: "p",
-    })).toThrow(/in the past/);
+    })).rejects.toThrow(/in the past/);
     // No dead-on-arrival record left behind
     expect(scheduler.list()).toEqual([]);
   });
@@ -198,7 +199,7 @@ describe("SubagentScheduler — lifecycle", () => {
   // a once-job persisted with a future ISO whose time has now passed (process
   // restart after the trigger window). detectSchedule rejects past timestamps
   // at create time, so this is the only remaining production path.
-  it("disables a previously-enabled one-shot reloaded from disk past its time", () => {
+  it("disables a previously-enabled one-shot reloaded from disk past its time", async () => {
     const past = new Date(Date.now() - 60_000).toISOString();
     // Direct store insert bypasses addJob's upfront validation, mimicking a
     // record that was valid when written but is now stale on reload.
@@ -228,7 +229,7 @@ describe("SubagentScheduler — lifecycle", () => {
   });
 });
 
-describe("SubagentScheduler — fire path", () => {
+describe("SubagentScheduler — fire path", async () => {
   let tmp: string;
   let store: ScheduleStore;
   let scheduler: SubagentScheduler;
@@ -257,8 +258,8 @@ describe("SubagentScheduler — fire path", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("interval jobs fire repeatedly via setInterval", () => {
-    scheduler.addJob({
+  it("interval jobs fire repeatedly via setInterval", async () => {
+    await scheduler.addJob({
       name: "every-10s", description: "tick", schedule: "10s",
       subagent_type: "general-purpose", prompt: "tick",
     });
@@ -270,12 +271,12 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(3);
   });
 
-  it("refuses at fire time when the job's agent type no longer resolves", () => {
+  it("refuses at fire time when the job's agent type no longer resolves", async () => {
     // The registry is what production populates at activation; a job outliving
     // its agent must not silently run something else (#183).
     registerAgents(new Map());
     setFallbackSubagent(NO_FALLBACK);
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "gone", description: "vanished agent", schedule: "+1s",
       subagent_type: "deleted-since", prompt: "run",
     });
@@ -296,9 +297,9 @@ describe("SubagentScheduler — fire path", () => {
     );
   });
 
-  it("refuses at fire time when the job's explicit model no longer resolves", () => {
+  it("refuses at fire time when the job's explicit model no longer resolves", async () => {
     // No silent substitute: a job pinned to a model must not run on another one.
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "model-gone", description: "vanished model", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "run", model: "fixture/removed-since",
     });
@@ -314,7 +315,7 @@ describe("SubagentScheduler — fire path", () => {
   });
 
   it("one-shot fires once and auto-disables", async () => {
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "soon", description: "once", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "once",
     });
@@ -330,8 +331,8 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(1);
   });
 
-  it("fire passes bypassQueue: true to manager.spawn", () => {
-    scheduler.addJob({
+  it("fire passes bypassQueue: true to manager.spawn", async () => {
+    await scheduler.addJob({
       name: "every-1s", description: "x", schedule: "1s",
       subagent_type: "general-purpose", prompt: "x",
     });
@@ -343,12 +344,12 @@ describe("SubagentScheduler — fire path", () => {
     expect(optsArg.isBackground).toBe(true);
   });
 
-  it("fire passes the job's configuration as the invocation snapshot", () => {
+  it("fire passes the job's configuration as the invocation snapshot", async () => {
     // A scheduled run has no tool call to build one, so without this the
     // conversation viewer can say nothing about how the job was configured.
     // The model is left out on purpose: agent-manager fills in the effective one
     // once the session reports it.
-    scheduler.addJob({
+    await scheduler.addJob({
       name: "every-1s", description: "x", schedule: "1s",
       subagent_type: "general-purpose", prompt: "x",
       thinking: "high", max_turns: 12, isolated: true,
@@ -365,9 +366,9 @@ describe("SubagentScheduler — fire path", () => {
     });
   });
 
-  it("fire normalizes an unlimited turn budget out of the snapshot", () => {
+  it("fire normalizes an unlimited turn budget out of the snapshot", async () => {
     // 0 means unlimited; "max turns: 0" would read as a limit of none.
-    scheduler.addJob({
+    await scheduler.addJob({
       name: "unlimited", description: "x", schedule: "1s",
       subagent_type: "general-purpose", prompt: "x", max_turns: 0,
     });
@@ -376,8 +377,8 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn.mock.calls[0][4].invocation.maxTurns).toBeUndefined();
   });
 
-  it("disabled jobs do not fire", () => {
-    const job = scheduler.addJob({
+  it("disabled jobs do not fire", async () => {
+    const job = await scheduler.addJob({
       name: "off", description: "x", schedule: "1s",
       subagent_type: "general-purpose", prompt: "x",
     });
@@ -386,8 +387,8 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(0);
   });
 
-  it("emits fired event with agentId on successful spawn", () => {
-    scheduler.addJob({
+  it("emits fired event with agentId on successful spawn", async () => {
+    await scheduler.addJob({
       name: "fire-once", description: "x", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "x",
     });
@@ -399,7 +400,7 @@ describe("SubagentScheduler — fire path", () => {
 
   it("records lastStatus error and emits when manager.spawn throws", async () => {
     manager.spawn.mockImplementationOnce(() => { throw new Error("no slots"); });
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "boom", description: "x", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "x",
     });
@@ -417,7 +418,7 @@ describe("SubagentScheduler — fire path", () => {
     // — the repo copy is awaited. A failure there must be recorded as a failed
     // run, not as the success the missing run promise would otherwise imply.
     manager.awaitStartup.mockRejectedValueOnce(new Error('Cannot run with isolation: "worktree"'));
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "no-worktree", description: "x", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "x", isolation: "worktree",
     });
@@ -431,7 +432,7 @@ describe("SubagentScheduler — fire path", () => {
   // The real AgentManager's promise *always* resolves (its .catch returns ""),
   // so the schedule's success/error must be inferred from `record.status`,
   // not from promise resolution. These two tests model that contract.
-  describe("infers success vs error from record.status, not promise resolution", () => {
+  describe("infers success vs error from record.status, not promise resolution", async () => {
     type FakeRecord = { status: string; promise: Promise<string>; resolve: () => void };
 
     function installFaithfulMock(): Map<string, FakeRecord> {
@@ -449,7 +450,7 @@ describe("SubagentScheduler — fire path", () => {
 
     it("records lastStatus 'error' when the agent terminates with status='error'", async () => {
       const records = installFaithfulMock();
-      const job = scheduler.addJob({
+      const job = await scheduler.addJob({
         name: "fail-job", description: "x", schedule: "+1s",
         subagent_type: "general-purpose", prompt: "x",
       });
@@ -470,7 +471,7 @@ describe("SubagentScheduler — fire path", () => {
 
     it("records lastStatus 'success' when the agent terminates with status='completed'", async () => {
       const records = installFaithfulMock();
-      const job = scheduler.addJob({
+      const job = await scheduler.addJob({
         name: "ok-job", description: "x", schedule: "+1s",
         subagent_type: "general-purpose", prompt: "x",
       });
@@ -487,11 +488,11 @@ describe("SubagentScheduler — fire path", () => {
 
     it("treats aborted and stopped as errors (terminal failure states)", async () => {
       const records = installFaithfulMock();
-      const a = scheduler.addJob({
+      const a = await scheduler.addJob({
         name: "abort-job", description: "x", schedule: "+1s",
         subagent_type: "general-purpose", prompt: "x",
       });
-      const b = scheduler.addJob({
+      const b = await scheduler.addJob({
         name: "stop-job", description: "x", schedule: "+2s",
         subagent_type: "general-purpose", prompt: "x",
       });
@@ -511,15 +512,15 @@ describe("SubagentScheduler — fire path", () => {
   });
 });
 
-describe("SubagentScheduler — stopped state", () => {
-  it("throws on mutation when not started", () => {
+describe("SubagentScheduler — stopped state", async () => {
+  it("throws on mutation when not started", async () => {
     const scheduler = new SubagentScheduler();
-    expect(() => scheduler.addJob({
+    await expect(scheduler.addJob({
       name: "x", description: "x", schedule: "1h", subagent_type: "general-purpose", prompt: "p",
-    })).toThrow(/not started/);
+    })).rejects.toThrow(/not started/);
   });
 
-  it("list() returns empty array when not started", () => {
+  it("list() returns empty array when not started", async () => {
     const scheduler = new SubagentScheduler();
     expect(scheduler.list()).toEqual([]);
   });

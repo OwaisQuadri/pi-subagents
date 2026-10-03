@@ -9,6 +9,7 @@ import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { type TaskSnapshot, validateTaskSnapshot } from "./task-worktree.js";
 
 /**
  * Project/global default for writing a subagent's `.output` transcript; a custom
@@ -77,18 +78,19 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
 export function ensureOutputFile(path: string): void {
   try {
     appendFileSync(path, "", "utf-8");
-  } catch { /* ignore — streaming writes are best-effort too */ }
+  } catch {}
 }
 
-/** Write the initial user prompt entry. */
-export function writeInitialEntry(path: string, agentId: string, prompt: string, cwd: string): void {
+export function writeInitialEntry(path: string, agentId: string, prompt: string, cwd: string, taskSnapshot?: TaskSnapshot): void {
+  const task = taskSnapshot === undefined ? undefined : validateTaskSnapshot(taskSnapshot);
   const entry = {
+    taskSnapshot: task,
     isSidechain: true,
     agentId,
     type: "user",
     message: { role: "user", content: prompt },
     timestamp: new Date().toISOString(),
-    cwd,
+    cwd: task?.checkout ?? cwd,
   };
   writeFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
 }
@@ -103,7 +105,9 @@ export function streamToOutputFile(
   agentId: string,
   cwd: string,
   startIndex?: number,
+  taskSnapshot?: TaskSnapshot,
 ): () => void {
+  const task = taskSnapshot === undefined ? undefined : validateTaskSnapshot(taskSnapshot);
   // Index of the first message this stream is responsible for. A spawn writes
   // messages[0] as the initial prompt entry, so it starts at 1. A resume hands
   // in the session's length as of just before the run: the session already
@@ -121,7 +125,8 @@ export function streamToOutputFile(
         type: msg.role === "assistant" ? "assistant" : msg.role === "user" ? "user" : "toolResult",
         message: msg,
         timestamp: new Date().toISOString(),
-        cwd,
+        cwd: task?.checkout ?? cwd,
+        taskSnapshot: task,
       };
       try {
         appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
