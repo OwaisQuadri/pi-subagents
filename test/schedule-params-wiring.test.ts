@@ -30,7 +30,7 @@ const SESSION_ID = "sched-wiring-session";
 
 function bootedCtx() {
   return ctx({
-    sessionManager: { getSessionId: vi.fn(() => SESSION_ID), getBranch: vi.fn(() => []) },
+    sessionManager: { getSessionId: vi.fn(() => SESSION_ID), getBranch: vi.fn(() => [{ type: "custom", customType: "subagents:task-binding", data: { version: 1, snapshot: { repository: process.cwd(), task_id: "explicit-schedule-wiring-fixture", generation: 1, repository_id: "fixture", base_oid: "a".repeat(40), checkout: process.cwd(), access: "write", configCwd: process.cwd() } } }]) },
   });
 }
 

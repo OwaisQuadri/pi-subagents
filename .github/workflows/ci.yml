@@ -18,6 +18,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      # Helper-backed suites skip here on purpose: CI builds no worktree-hygiene
+      # helper, so PI_SUBAGENTS_TASK_HELPER stays unset (README, "Testing with the task helper").
       - run: npm run test
       # pi loads dist/index.js, built at install/publish time and never committed;
       # this proves the bundle still builds from src.

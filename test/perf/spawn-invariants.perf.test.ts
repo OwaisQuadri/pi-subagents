@@ -12,6 +12,10 @@
  * Counted, not timed, for the reasons in `render-invariants.perf.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "../helpers/task-fixture.js";
+
+vi.mock("../../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 let loads = 0;
 
@@ -64,6 +68,7 @@ function bootAgentTool() {
     },
   });
   const { pi, tools } = makePi();
+  wiringTasks(pi, ["perf-binding", "perf-A", "perf-B", "perf-C", "perf-D", "perf-E"]);
   subagentsExtension(pi);
   return tools.get("Agent");
 }

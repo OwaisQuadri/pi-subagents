@@ -16,6 +16,7 @@
 import { existsSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveSpawnType } from "./agent-types.js";
+import type { TaskSnapshot } from "./task-worktree.js";
 import type { AgentRecord, SubagentType } from "./types.js";
 
 /** `customType` of the session entry a finished top-level agent appends. */
@@ -42,6 +43,8 @@ export interface AgentRecordEntryData {
   alias?: string;
   /** Set when the agent's work lived in a worktree that is now gone — see {@link worktreeLost}. */
   worktreeLost?: boolean;
+  taskSnapshot?: TaskSnapshot;
+  cwd?: string;
 }
 
 /**
@@ -72,6 +75,8 @@ export function agentRecordEntryData(record: AgentRecord): AgentRecordEntryData 
     handle: record.handle,
     alias: record.alias,
     worktreeLost: worktreeLost(record) || undefined,
+    taskSnapshot: record.taskSnapshot,
+    cwd: record.taskSnapshot?.checkout,
   };
 }
 

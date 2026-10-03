@@ -447,7 +447,7 @@ memory: <"user" (global), "project" (per-project), or "local" (gitignored per-pr
       // session — the #231 pathology (models fill the fields they are shown)
       // one layer up. Built per invocation, so this read is live.
       isWorktreeIsolationEnabled()
-        ? `\nisolation: <"worktree" to run in isolated git worktree; "off" to refuse one even when the caller asks. Omit for normal>`
+        ? `\nisolation: <ignored legacy option; omit it>`
         : ""
     }
 ---

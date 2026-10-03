@@ -49,11 +49,13 @@ function stubHost(options?: {
   reply?: (request: WorkflowSpawnRequest) => Promise<WorkflowSpawnResult> | WorkflowSpawnResult;
   gate?: (command: string) => Promise<WorkflowGateResult> | WorkflowGateResult;
   resume?: (call: ResumeCall) => Promise<WorkflowSpawnResult> | WorkflowSpawnResult;
+  isHeld?: boolean;
 }): Stub {
   const calls: WorkflowSpawnRequest[] = [];
   const gateCalls: GateCall[] = [];
   const resumeCalls: ResumeCall[] = [];
   const aborted: string[] = [];
+  const releases = new Map<string, (result: WorkflowSpawnResult) => void>();
   return {
     calls,
     gateCalls,
@@ -62,10 +64,12 @@ function stubHost(options?: {
     host: {
       async spawnAgent(request) {
         calls.push(request);
+        if (options?.isHeld) return new Promise<WorkflowSpawnResult>(resolve => releases.set(request.agentId, resolve));
         return options?.reply ? await options.reply(request) : { ok: true, text: `ok:${request.prompt}` };
       },
       abortAgent(agentId) {
         aborted.push(agentId);
+        releases.get(agentId)?.({ ok: false, skipped: true });
       },
       async runGate(command, gateOptions) {
         gateCalls.push({ command, agentId: gateOptions.agentId, cwd: gateOptions.cwd });
@@ -463,7 +467,7 @@ describe("resume", () => {
 
 describe("unawaited launches", () => {
   it("fails the run and aborts the child when a launch is dropped", async () => {
-    const { host, aborted } = stubHost({ reply: () => new Promise<WorkflowSpawnResult>(() => {}) });
+    const { host, aborted } = stubHost({ isHeld: true });
 
     const result = await run(
       ['agent("scan the repo", { label: "scan" });', 'return "done";'].join("\n"),
@@ -477,13 +481,11 @@ describe("unawaited launches", () => {
       "workflow script completed with unawaited agent launch(es): 'scan'. Await or return each launch.",
     );
     expect(result.value).toBeUndefined();
-    // Failing fast rather than draining: a hung child that ignores the abort
-    // cannot wedge the run's completion forever.
     expect(aborted).toEqual(["wf-agent-0"]);
   });
 
   it("lists every dropped launch, in call order", async () => {
-    const { host } = stubHost({ reply: () => new Promise<WorkflowSpawnResult>(() => {}) });
+    const { host } = stubHost({ isHeld: true });
     const result = await run(
       [
         'agent("a", { label: "label-a" });',
@@ -536,10 +538,8 @@ describe("unawaited launches", () => {
   });
 
   it("does not report unawaited launches when the run was aborted", async () => {
-    // A killed run has in-flight agents by definition; calling that a script
-    // bug would blame the user for pressing stop.
     const controller = new AbortController();
-    const { host } = stubHost({ reply: () => new Promise<WorkflowSpawnResult>(() => {}) });
+    const { host } = stubHost({ isHeld: true });
 
     let started = () => {};
     const running = new Promise<void>(resolve => {

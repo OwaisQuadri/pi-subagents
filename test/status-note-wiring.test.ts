@@ -1,10 +1,8 @@
-/**
- * status-note-wiring.test.ts — proves the status note actually reaches the
- * PARENT through the real tool handlers, not just that getStatusNote() returns
- * a string. Drives the registered `Agent` / `get_subagent_result` tools and
- * inspects the text delivered back, for a turn-limit abort and a user stop.
- */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, fixturePromise, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -13,6 +11,8 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+
+beforeEach(() => { vi.mocked(runAgent).mockReset(); });
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -76,6 +76,7 @@ describe("status note reaches the parent through the real handlers", () => {
       steered: false,
     });
     const { pi, tools } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
 
     const res = await tools.get("Agent").execute(
@@ -109,9 +110,10 @@ describe("status note reaches the parent through the real handlers", () => {
     // distinct from a turn-limit "aborted", because the correct next action is
     // the opposite one.
     let finish: (v: any) => void = () => {};
-    vi.mocked(runAgent).mockReturnValue(new Promise((r) => { finish = r; }) as any);
+    vi.mocked(runAgent).mockReturnValue(fixturePromise((r) => { finish = r; }) as any);
 
     const { pi, tools } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
 
     const parent = new AbortController();
@@ -151,12 +153,14 @@ describe("status note reaches the parent through the real handlers", () => {
       steered: false,
     });
     const { pi, tools } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
     const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
 
     // External registry/RPC callers cannot mint internal ownership metadata.
+    declareTask("/tmp", "top-task");
     const topId = registry.spawn(pi, ctx(), "general-purpose", "top", {
-      description: "top-level owner",
+      description: "top-level owner", task_id: "top-task",
       isBackground: false,
       parentAgentId: "forged-parent",
       depth: 99,
@@ -175,6 +179,7 @@ describe("status note reaches the parent through the real handlers", () => {
     pi.appendEntry.mockClear();
     pi.sendMessage.mockClear();
     const id = rawManager.spawn(pi, ctx(), "general-purpose", "nested", {
+      taskSnapshot: declareTask("/tmp", "nested-task"),
       description: "nested child",
       isBackground: true,
       parentAgentId: topId,
@@ -201,8 +206,9 @@ describe("status note reaches the parent through the real handlers", () => {
 
   it("background user-stop → get_subagent_result flags STOPPED BY THE USER (not completed)", async () => {
     // A background agent that never settles on its own — only a stop ends it.
-    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
+    vi.mocked(runAgent).mockReturnValue(heldWorker({ responseText: "stopped", session: { dispose() {}, messages: [] } as any, aborted: false, steered: false }));
     const { pi, tools, eventHandlers, lifecycle } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
     await bind(lifecycle); // register RPC channels via session_start (#142)
 
@@ -251,6 +257,7 @@ describe("subagents:compacted", () => {
   it("emits the documented payload when a top-level agent's session compacts", async () => {
     runWithCompaction({ reason: "threshold", tokensBefore: 12345 });
     const { pi, tools } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
 
     await tools.get("Agent").execute(
@@ -276,6 +283,7 @@ describe("subagents:compacted", () => {
       return { responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false };
     });
     const { pi, tools } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
 
     await tools.get("Agent").execute(
@@ -295,6 +303,7 @@ describe("subagents:compacted", () => {
     // would spam the parent session's bus with ids no consumer can resolve.
     runWithCompaction({ reason: "threshold", tokensBefore: 999 });
     const { pi, tools } = makePi();
+    wiringTasks(pi, ["native-binding", "native-A", "native-B", "native-C"]);
     subagentsExtension(pi);
 
     await tools.get("Agent").execute(
@@ -307,6 +316,7 @@ describe("subagents:compacted", () => {
     pi.events.emit.mockClear();
 
     rawManager.spawn(pi, ctx(), "general-purpose", "nested", {
+      taskSnapshot: declareTask("/tmp", "nested-task"),
       description: "nested child",
       isBackground: true,
       parentAgentId: parentId,

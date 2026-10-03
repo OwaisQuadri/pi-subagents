@@ -30,6 +30,9 @@ import {
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
+import { taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
+
+const TASK_BINARY = taskHelper();
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -81,7 +84,7 @@ function writeAgents(cwd: string): void {
   );
 }
 
-describe("nested delegation e2e (real pi-mono, faux model)", () => {
+describe.skipIf(!TASK_BINARY)(taskHelperTitle("nested delegation e2e (real pi-mono, faux model)"), () => {
   let run: PrintModeRun | undefined;
   const tmpDirs: string[] = [];
 
@@ -127,7 +130,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
           return `orchestrator saw: ${inner}`;
         }
         return agentCall({
-          subagent_type: "worker",
+          task_id: "sdk-worker", subagent_type: "worker",
           description: "leaf work",
           prompt: "Do the leaf work.",
         });
@@ -157,6 +160,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
     };
 
     run = await runPrintMode({
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-owner", "sdk-worker"] },
       prompt: "Delegate the work.",
       cwd,
       respond,
@@ -182,7 +186,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
     const cwd = mkdtempSync(join(tmpdir(), "nested-e2e-bg-"));
     tmpDirs.push(cwd);
     writeAgents(cwd);
-    const transcriptRoot = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
+    let transcriptRoot = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
     rmSync(transcriptRoot, { recursive: true, force: true });
 
     const respond = (context: Context): FauxReply => {
@@ -204,7 +208,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
           return fauxToolCall("get_subagent_result", { agent_id: id, wait: true });
         }
         return agentCall({
-          subagent_type: "worker",
+          task_id: "sdk-worker", subagent_type: "worker",
           description: "leaf work",
           prompt: "Do the leaf work.",
           run_in_background: true,
@@ -223,12 +227,15 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
 
     try {
       run = await runPrintMode({
+        taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-owner", "sdk-worker"] },
         prompt: "Delegate the work.",
         cwd,
         respond,
         live: false,
         beforeRun: () => { registerAgents(loadCustomAgents(cwd)); },
       });
+
+      transcriptRoot = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(run.parentSession.sessionManager.getCwd()));
 
       // The background child ran and its output came back through the id the
       // spawn handed out — so it was never queued behind its waiting parent.

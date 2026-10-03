@@ -12,6 +12,10 @@
  * alone, and only the owner's shutdown releases it.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -41,6 +45,7 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
   return { pi, tools, lifecycle };
 }
 
@@ -59,7 +64,7 @@ function ctx() {
 const textOf = (r: any): string => r.content[0].text;
 
 async function spawnBackground(tools: Map<string, any>): Promise<string> {
-  vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any); // never resolves
+  vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal)); // never resolves
   const r = await tools.get("Agent").execute(
     "tc-spawn",
     { prompt: "go", description: "registry test agent", subagent_type: "general-purpose", run_in_background: true },
@@ -116,22 +121,24 @@ describe("Symbol.for manager registry across activations", () => {
 // issues to itself, and a forged value for each buys something real.
 describe("the registry spawn strips internal capabilities", () => {
   /** Boot a fresh owner and spawn through the registry with forged options. */
-  function forge(options: Record<string, unknown>) {
+  async function forge(options: Record<string, unknown>) {
     delete (globalThis as any)[MANAGER_KEY];
     const root = makePi();
     subagentsExtension(root.pi);
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
     const entry = (globalThis as any)[MANAGER_KEY];
+    declareTask(process.cwd(), "registry-worker");
     const id = entry.spawn(root.pi, ctx(), "general-purpose", "go", {
-      description: "forged", isBackground: true, ...options,
+      description: "forged", isBackground: true, task_id: "registry-worker", ...options,
     });
+    await vi.waitFor(() => expect(runAgent).toHaveBeenCalled());
     return { entry, id, root, runOpts: () => vi.mocked(runAgent).mock.calls[0][3] as any };
   }
 
   it("refuses a forged nesting, so the agent cannot hide under someone else's id", async () => {
     // A nested record is filtered out of every top-level surface and inherits
     // its parent's delegation budget.
-    const { entry, id, root } = forge({ parentAgentId: "victim-agent-id", depth: 9, maxSubagentDepth: 99 });
+    const { entry, id, root } = await forge({ parentAgentId: "victim-agent-id", depth: 9, maxSubagentDepth: 99 });
 
     expect(entry.getRecord(id)).toMatchObject({
       parentAgentId: undefined, depth: 1, maxSubagentDepth: undefined,
@@ -140,15 +147,15 @@ describe("the registry spawn strips internal capabilities", () => {
   });
 
   it("refuses a forged transcript directory and config root", async () => {
-    const { entry, id, root, runOpts } = forge({ rootSessionId: "../../elsewhere", configCwd: "/etc" });
+    const { entry, id, root, runOpts } = await forge({ rootSessionId: "../../elsewhere", configCwd: "/etc" });
 
     expect(entry.getRecord(id).rootSessionId).toBe("s1");
-    expect(runOpts().configCwd).toBeUndefined();
+    expect(runOpts().configCwd).toBe(process.cwd());
     await root.lifecycle.get("session_shutdown")?.();
   });
 
   it("refuses a forged session file, which would replay someone else's conversation", async () => {
-    const { root, runOpts } = forge({ resumeSessionFile: "/home/victim/.pi/agent/sessions/private.jsonl" });
+    const { root, runOpts } = await forge({ resumeSessionFile: "/home/victim/.pi/agent/sessions/private.jsonl" });
 
     expect(runOpts().resumeSessionFile).toBeUndefined();
     await root.lifecycle.get("session_shutdown")?.();
@@ -157,7 +164,7 @@ describe("the registry spawn strips internal capabilities", () => {
   it("refuses a forged reclaim and allocates a handle the ordinary way", async () => {
     // reclaim bypasses assignHandle, so a forged value could duplicate a live
     // agent's name and make `@handle` resolve to either of two records.
-    const { entry, id, root } = forge({ reclaim: { handle: "explore", alias: "auth-audit" } });
+    const { entry, id, root } = await forge({ reclaim: { handle: "explore", alias: "auth-audit" } });
 
     expect(entry.getRecord(id)).toMatchObject({ handle: "general-purpose", alias: undefined });
     await root.lifecycle.get("session_shutdown")?.();

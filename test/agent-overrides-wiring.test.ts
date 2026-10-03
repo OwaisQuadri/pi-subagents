@@ -2,6 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -94,7 +98,8 @@ describe("agentOverrides wiring", () => {
 
   it("ignores an Explore model pin without changing Explore's read-only tools", async () => {
     const { pi, tools } = makePi();
-    subagentsExtension(pi as never);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi as never);
     const agent = tools.get("Agent");
     if (!agent) throw new Error("Agent tool was not registered");
 

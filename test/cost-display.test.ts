@@ -10,6 +10,10 @@
  * number and is formatted at the end, not baked into the token string.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -43,7 +47,7 @@ describe("cost display", () => {
 
   function boot(settings: Record<string, unknown>) {
     hermetic = hermeticDir({ settings });
-    const { pi, tools, lifecycle } = makePi();
+    const { pi, tools, lifecycle } = makePi(); wiringTasks(pi, ["cost-binding", "cost-worker"]);
     subagentsExtension(pi);
     return { pi, tools, lifecycle };
   }

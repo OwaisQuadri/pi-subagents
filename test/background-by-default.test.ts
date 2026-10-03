@@ -16,6 +16,10 @@
  * parallel work once background became the default.
  */
 import { describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -42,6 +46,7 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["background-binding", "fanout-A", "fanout-B", "fanout-C", "fanout-D", "fanout-E", "fanout-F"]);
   return { pi, tools, lifecycle };
 }
 
@@ -108,7 +113,7 @@ describe("backgroundByDefault", () => {
     const { pi, tools } = makePi();
     subagentsExtension(pi);
     // Never settles — every agent stays occupying its slot for the whole test.
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
 
     const outs: string[] = [];
     for (let i = 0; i < 6; i++) outs.push(textOf(await spawn(tools)));

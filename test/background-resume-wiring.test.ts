@@ -9,6 +9,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -49,6 +53,7 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["resume-binding", "resume-worker"]);
   return { pi, tools, lifecycle, emitted };
 }
 
@@ -157,7 +162,7 @@ describe("Agent tool — background resume wiring", () => {
     let runSignal: AbortSignal | undefined;
     vi.mocked(resumeAgent).mockImplementation((_s: any, _p: any, opts: any) => {
       runSignal = opts.signal;
-      return new Promise(() => {}); // never settles — the run is still in flight
+      return heldWorker({ text: "stopped" }, undefined, opts.signal);
     });
 
     const toolAbort = new AbortController();
@@ -249,7 +254,7 @@ describe("Agent tool — background resume wiring", () => {
     const ctx = makeCtx(cwd);
     const id = await spawnSettled(tools, ctx);
 
-    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(resumeAgent).mockImplementation((_s, _p, options) => heldWorker({ text: "stopped" }, undefined, options.signal));
     vi.mocked(resumeAgent).mockClear();
 
     const params = { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: true };

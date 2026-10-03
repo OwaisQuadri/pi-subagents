@@ -18,6 +18,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -60,6 +64,7 @@ function makePi() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
   return { pi, lifecycle, bus };
 }
 
@@ -167,7 +172,7 @@ describe("subagents:rpc:consume", () => {
   });
 
   it("refuses to consume an agent that is still running", async () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
     const { bus } = await boot();
 
     const id = await spawnOverRpc(bus, "req-spawn-3");

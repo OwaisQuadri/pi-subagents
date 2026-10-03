@@ -1,5 +1,11 @@
+import type * as CodingAgent from "@earendil-works/pi-coding-agent";
 import type { CreateAgentSessionOptions, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
+
 import type { SettingsAppliers } from "../src/settings.js";
 import type { AgentConfig, ThinkingLevel } from "../src/types.js";
 
@@ -9,7 +15,8 @@ const { captures, definitions, execution } = vi.hoisted(() => ({
   definitions: new Map<string, AgentConfig>(),
 }));
 
-vi.mock("@earendil-works/pi-coding-agent", () => ({
+vi.mock("@earendil-works/pi-coding-agent", async importOriginal => ({
+  ...await importOriginal<typeof CodingAgent>(),
   VERSION: "0.85.1",
   createCodingTools: () => [{ name: "read" }, { name: "write" }],
   createReadOnlyTools: () => [{ name: "read" }],
@@ -54,7 +61,6 @@ vi.mock("../src/settings.js", () => ({
 vi.mock("../src/worktree.js", () => ({
   isWorktreeIsolationEnabled: () => false,
   setWorktreeIsolationEnabled: () => {},
-  pruneWorktrees: async () => {},
 }));
 
 import { AgentManager } from "../src/agent-manager.js";
@@ -92,6 +98,8 @@ beforeEach(() => {
   boot.pi.getThinkingLevel = vi.fn(() => "low");
   boot.pi.exec = vi.fn(() => { throw new Error("Process execution forbidden"); });
   vi.stubGlobal("fetch", () => { throw new Error("Network forbidden"); });
+  wiringTasks(boot.pi, ["manual-binding", "manual-A", "manual-B", "manual-C", "manual-D", "manual-E", "manual-F", "manual-G", "manual-H", "manual-I", "manual-J", "manual-K", "manual-L"]);
+  for (const task_id of ["manual-worker", "manual-later", "manual-resume", "manual-fill", "manual-queued", "manual-parent", "manual-child"]) declareTask(parent.cwd, task_id);
   extension(boot.pi);
   manager = new AgentManager();
 });
@@ -137,10 +145,10 @@ it.each([false, true])("manager runner inherits live parent settings without a t
     Object.assign(parent, { model, thinkingLevel });
     const count = captures.length;
     if (isBackground) {
-      manager.spawn(boot.pi, parent, "general-purpose", "test", { description: "test", isolated: true, isBackground });
+      manager.spawn(boot.pi, parent, "general-purpose", "test", { task_id: "manual-worker", description: "test", isolated: true, isBackground });
       await manager.waitForAll();
     } else {
-      await manager.spawnAndWait(boot.pi, parent, "general-purpose", "test", { description: "test", isolated: true });
+      await manager.spawnAndWait(boot.pi, parent, "general-purpose", "test", { task_id: "manual-worker", description: "test", isolated: true });
     }
     expect(captures[count].model).toBe(model);
     expect(captures[count].thinkingLevel).toBe(thinkingLevel);
@@ -176,6 +184,7 @@ it("uses the older Pi live thinking getter only when the context has no thinking
 it("registered background workflow constructs a child with current parent settings", async () => {
   pinDefinition();
   Object.assign(parent, { model: models[1], thinkingLevel: "off" });
+  await boot.lifecycle.get("session_start")({}, parent);
   await boot.tools.get("SubagentWorkflow").execute("workflow", {
     script: "export const meta = { name: 'test', description: 'test' }; return await agent('test');",
   }, undefined, undefined, parent);
@@ -190,7 +199,7 @@ it("registered background workflow constructs a child with current parent settin
 
 it("one workflow host reads parent changes between child dispatches", async () => {
   pinDefinition();
-  const host = createWorkflowHost({ pi: boot.pi, ctx: parent, manager, workflowId: "test" });
+  const host = createWorkflowHost({ pi: boot.pi, ctx: parent, manager, workflowId: "test", taskSnapshot: declareTask(parent.cwd, "manual-worker") });
   const spawn = host.spawnAgent.bind(host);
   host.spawnAgent = async request => {
     const result = await spawn(request);
@@ -211,7 +220,7 @@ it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("w
   pinDefinition();
   const result = await runWorkflow({
     script: `export const meta = { name: 'test', description: 'test' }; return await agent('test', { model: 'fixture/explicit', effort: '${effort}' });`,
-    host: createWorkflowHost({ pi: boot.pi, ctx: parent, manager, workflowId: "test" }),
+    host: createWorkflowHost({ pi: boot.pi, ctx: parent, manager, workflowId: "test", taskSnapshot: declareTask(parent.cwd, "manual-worker") }),
   });
   expect(result.status).toBe("completed");
   expect(result.value).not.toBeNull();
@@ -224,13 +233,13 @@ it.each([false, true])("nested tool inherits its immediate caller, not root or p
   pinDefinition();
   const nested = createNestedSubagentTools({
     manager, pi: boot.pi, parentAgentId: "owner", depth: 1, maxSubagentDepth: 2,
-    allowedSubagents: ["general-purpose"], configCwd: parent.cwd,
+    allowedSubagents: ["general-purpose"], configCwd: parent.cwd, taskSnapshot: declareTask(parent.cwd, "manual-parent"),
   }).find(tool => tool.name === "Agent")!;
   const caller = makeContext({ model: models[1], thinkingLevel: "off", modelRegistry: registry });
   for (const choices of [{}, { model: "fixture/explicit", thinking: "low" }, {}]) {
     const count = captures.length;
     await nested.execute("nested", {
-      subagent_type: "general-purpose", description: "nested", prompt: "test",
+      task_id: "manual-child", subagent_type: "general-purpose", description: "nested", prompt: "test",
       run_in_background: isBackground, isolated: true, ...choices,
     }, undefined, undefined, caller);
     await manager.waitForAll();
@@ -245,12 +254,12 @@ it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("n
   pinDefinition();
   const nested = createNestedSubagentTools({
     manager, pi: boot.pi, parentAgentId: "owner", depth: 1, maxSubagentDepth: 2,
-    allowedSubagents: ["general-purpose"], configCwd: parent.cwd,
+    allowedSubagents: ["general-purpose"], configCwd: parent.cwd, taskSnapshot: declareTask(parent.cwd, "manual-parent"),
   }).find(tool => tool.name === "Agent")!;
   for (const isBackground of [false, true]) {
     const count = captures.length;
     await nested.execute("nested", {
-      subagent_type: "general-purpose", description: "nested", prompt: "test",
+      task_id: "manual-child", subagent_type: "general-purpose", description: "nested", prompt: "test",
       run_in_background: isBackground, isolated: true, model: "fixture/explicit", thinking,
     }, undefined, undefined, parent);
     await manager.waitForAll();
@@ -265,14 +274,14 @@ it("runner injects nested tools without changing role permissions", async () => 
     builtinToolNames: ["read", "write"], disallowedTools: ["write"], allowedSubagents: ["Explore"],
   });
   registerAgents(definitions);
-  const { record } = await manager.spawnAndWait(boot.pi, parent, "general-purpose", "test", { description: "test" });
+  const { record } = await manager.spawnAndWait(boot.pi, parent, "general-purpose", "test", { task_id: "manual-worker", description: "test" });
   expect(record.status).toBe("completed");
   expect(captures[0].tools).toContain("read");
   expect(captures[0].tools).not.toContain("write");
   const nested = captures[0].customTools?.find((tool: ToolDefinition) => tool.name === "Agent");
   expect(nested).toBeDefined();
   const caller = makeContext({ model: models[1], thinkingLevel: "low", modelRegistry: registry });
-  await nested!.execute("nested", { subagent_type: "Explore", prompt: "test", description: "test", isolated: true }, undefined, undefined, caller);
+  await nested!.execute("nested", { task_id: "manual-child", subagent_type: "Explore", prompt: "test", description: "test", isolated: true }, undefined, undefined, caller);
   expect(captures).toHaveLength(2);
   expect(captures[1].model).toBe(models[1]);
   expect(captures[1].thinkingLevel).toBe("low");
@@ -282,13 +291,13 @@ it("runner injects nested tools without changing role permissions", async () => 
 it("parent changes affect later children but not an already running child", async () => {
   let release!: () => void;
   execution.pause = new Promise<void>(resolve => { release = resolve; });
-  const id = manager.spawn(boot.pi, parent, "general-purpose", "test", { description: "test", isolated: true });
+  const id = manager.spawn(boot.pi, parent, "general-purpose", "test", { task_id: "manual-worker", description: "test", isolated: true });
   try {
     await vi.waitFor(() => expect(manager.getRecord(id)?.session).toBeDefined());
     expect(manager.getRecord(id)?.status).toBe("running");
     Object.assign(parent, { model: models[1], thinkingLevel: "off" });
     execution.pause = undefined;
-    const { record } = await manager.spawnAndWait(boot.pi, parent, "general-purpose", "later", { description: "test", isolated: true });
+    const { record } = await manager.spawnAndWait(boot.pi, parent, "general-purpose", "later", { task_id: "manual-later", description: "test", isolated: true });
     expect(record.session?.model).toBe(models[1]);
     expect(record.session?.thinkingLevel).toBe("off");
     expect(manager.getRecord(id)?.session?.model).toBe(models[0]);
@@ -300,7 +309,7 @@ it("parent changes affect later children but not an already running child", asyn
 });
 
 it("resume keeps the existing child after the parent selection changes", async () => {
-  const { id, record } = await manager.spawnAndWait(boot.pi, parent, "general-purpose", "test", { description: "test", isolated: true });
+  const { id, record } = await manager.spawnAndWait(boot.pi, parent, "general-purpose", "test", { task_id: "manual-worker", description: "test", isolated: true });
   const session = record.session;
   Object.assign(parent, { model: models[1], thinkingLevel: "off" });
   const resumed = await manager.resume(id, "continue");
@@ -315,7 +324,7 @@ it.each([false, true])("file resume keeps its existing option resolution (defini
   if (isPinned) pinDefinition();
   Object.assign(parent, { model: models[1], thinkingLevel: "off" });
   await manager.spawnAndWait(boot.pi, parent, "general-purpose", "continue", {
-    description: "resume", isolated: true, resumeSessionFile: "/sessions/saved.jsonl",
+    task_id: "manual-resume", description: "resume", isolated: true, resumeSessionFile: "/sessions/saved.jsonl",
   });
   expect(captures[0].model).toBe(isPinned ? models[4] : models[1]);
   expect(captures[0].thinkingLevel).toBe(isPinned ? "medium" : undefined);
@@ -325,7 +334,7 @@ it.each([false, true])("file resume keeps its existing option resolution (defini
 it("file resume keeps explicit session options", async () => {
   pinDefinition();
   await manager.spawnAndWait(boot.pi, parent, "general-purpose", "continue", {
-    description: "resume", isolated: true, resumeSessionFile: "/sessions/saved.jsonl",
+    task_id: "manual-resume", description: "resume", isolated: true, resumeSessionFile: "/sessions/saved.jsonl",
     model: models[3], thinkingLevel: "off",
   });
   expect(captures[0].model).toBe(models[3]);
@@ -394,9 +403,9 @@ it("a queued direct spawn with no model keeps the model selected at dispatch", a
   let release!: () => void;
   execution.pause = new Promise<void>(resolve => { release = resolve; });
   try {
-    pool.spawn(boot.pi, parent, "general-purpose", "fill", { description: "fill", isolated: true, isBackground: true });
+    pool.spawn(boot.pi, parent, "general-purpose", "fill", { task_id: "manual-fill", description: "fill", isolated: true, isBackground: true });
     await vi.waitFor(() => expect(captures).toHaveLength(1));
-    pool.spawn(boot.pi, parent, "general-purpose", "queued", { description: "queued", isolated: true, isBackground: true });
+    pool.spawn(boot.pi, parent, "general-purpose", "queued", { task_id: "manual-queued", description: "queued", isolated: true, isBackground: true });
     expect(captures).toHaveLength(1);
     Object.assign(parent, { model: models[1], thinkingLevel: "off" });
     release();
@@ -414,10 +423,10 @@ it("a queued child with an empty thinking string keeps the level selected at dis
   let release!: () => void;
   execution.pause = new Promise<void>(resolve => { release = resolve; });
   try {
-    pool.spawn(boot.pi, parent, "general-purpose", "fill", { description: "fill", isolated: true, isBackground: true });
+    pool.spawn(boot.pi, parent, "general-purpose", "fill", { task_id: "manual-fill", description: "fill", isolated: true, isBackground: true });
     await vi.waitFor(() => expect(captures).toHaveLength(1));
     pool.spawn(boot.pi, parent, "general-purpose", "queued", {
-      description: "queued", isolated: true, isBackground: true, thinkingLevel: "" as never,
+      task_id: "manual-queued", description: "queued", isolated: true, isBackground: true, thinkingLevel: "" as never,
     });
     Object.assign(parent, { model: models[1], thinkingLevel: "off" });
     release();
@@ -432,7 +441,7 @@ it("a queued child with an empty thinking string keeps the level selected at dis
 it("a file resume with an empty thinking string falls through to its own resolution", async () => {
   pinDefinition();
   await manager.spawnAndWait(boot.pi, parent, "general-purpose", "continue", {
-    description: "resume", isolated: true, resumeSessionFile: "/sessions/saved.jsonl", thinkingLevel: "" as never,
+    task_id: "manual-resume", description: "resume", isolated: true, resumeSessionFile: "/sessions/saved.jsonl", thinkingLevel: "" as never,
   });
   expect(captures[0].thinkingLevel).toBe("medium");
 });

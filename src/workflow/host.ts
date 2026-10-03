@@ -1,124 +1,35 @@
-/**
- * host.ts — binds a workflow run to the real `AgentManager`.
- *
- * `runtime.ts` deliberately knows nothing about this extension: its only seam is
- * the injected {@link WorkflowHost}, which is what keeps the runtime's tests
- * free of sessions, models and git. This file is the other half of that seam —
- * everything the script can reach through `agent()`, `resume` and `gate` ends up
- * here, and nowhere else.
- *
- * Four mappings carry most of the weight:
- *
- *   - **ids.** The runtime hands out its own `wf-agent-N` handles before
- *     anything spawns, because it needs a stable progress-entry identity. The
- *     manager issues a different id when the child actually starts. `records`
- *     is the translation, and it is kept for the whole run rather than cleared
- *     on completion: `resume` reaches back to a child that has already
- *     finished.
- *   - **agent type and model.** Resolved through `resolveSpawnType` and
- *     `getAgentConfig` — the same dispatch the `Agent` tool uses — so a
- *     workflow and a tool call disagree about nothing.
- *   - **failure.** A strict worktree-isolation failure throws out of
- *     `spawnAndWait`; the script must see that as an agent that failed
- *     (`{ok: false}` → `null`), not as an unhandled rejection that takes the
- *     run down.
- *   - **when a `gate` runs.** For an isolated child it cannot wait until the
- *     spawn resolves: the manager commits the worktree to a branch and deletes
- *     the copy inside the child's own settle, so by then the only tree left to
- *     run `npm test` in is the main one — which would report on code the child
- *     never wrote. So the gate runs from `onBeforeWorktreeCleanup`, inside that
- *     settle, and the verdict travels back on the spawn result. `runGate` still
- *     exists for a child that had no worktree; the runtime uses whichever of
- *     the two happened, never both.
- */
-
-import { existsSync } from "node:fs";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentManager } from "../agent-manager.js";
+import { open } from "node:fs/promises";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { AgentManager, OnBeforeTaskSettlement } from "../agent-manager.js";
 import { reopenTarget, worktreeLost } from "../agent-record-entry.js";
 import type { ToolActivity } from "../agent-runner.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
+import { type TaskClaim, type TaskSnapshot, taskShellArgv, validateTaskAccess, validateTaskId, validateTaskSnapshot } from "../task-worktree.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnRequest, WorkflowSpawnResult } from "./runtime.js";
 import { resolveWorkflowSource } from "./saved.js";
 
-/**
- * Wall-clock bound on a `gate` command. Generous — a gate is routinely a test
- * suite — but not unbounded: `pi.exec` reports a timeout as `killed`, and a
- * gate that hangs forever would wedge the agent slot it is holding.
- */
 export const DEFAULT_GATE_TIMEOUT_MS = 10 * 60_000;
-
 export interface WorkflowHostOptions {
   pi: ExtensionAPI;
   ctx: ExtensionContext;
   manager: AgentManager;
-  /** The run's abort signal, so killing the workflow kills its children. */
+  taskSnapshot?: TaskSnapshot;
   signal?: AbortSignal;
-  /** Groups child transcripts under the parent session. */
   rootSessionId?: string;
-  /**
-   * The run id every child is stamped with.
-   *
-   * What makes them the workflow's rather than the session's: stamped children
-   * are filtered out of the fleet list, the widget, the `/agents` menus and
-   * `@handle` resolution, and they take no `maxConcurrent` slot. The run
-   * reports for them, and it has its own concurrency cap.
-   */
   workflowId?: string;
   gateTimeoutMs?: number;
 }
-
-/**
- * Where the child worked, when that directory still exists.
- *
- * The guard is not defensive padding. `cleanupWorktree` commits the child's
- * changes to a branch and *removes* the copy before `spawnAndWait` resolves, so
- * an isolated child's worktree is normally already gone by the time a result is
- * built. That is exactly why a gate cannot wait until here — it runs from
- * `onBeforeWorktreeCleanup` instead — and why this reports nothing rather than
- * a path that no longer exists: handing a stale path to a command would fail
- * every gated worktree agent with a spawn error instead of a test result.
- */
-function childCwd(record: AgentRecord): string | undefined {
-  // `path`, not `workPath`: a workflow spawn never passes a cwd, so the manager
-  // runs the child at the copied repo's root.
-  const path = record.worktree?.path;
-  return path !== undefined && existsSync(path) ? path : undefined;
-}
-
-/**
- * Whether the child itself succeeded — the same condition {@link toSpawnResult}
- * turns into `ok`, read from the live record so the pre-cleanup hook can tell a
- * finished child from a failed one before the result exists.
- */
-function succeeded(record: AgentRecord | undefined): boolean {
-  return record?.status === "completed" || record?.status === "steered";
-}
-
-/** Translate a settled record into what the script sees. */
-/**
- * The effective-configuration half of a record, in the runtime's pi-free shape.
- *
- * `AgentRecord.invocation` is the one authoritative place for it (#168); this
- * only renames the fields across the boundary. Returns undefined until the
- * child's session has reported a model, which is when any of it is knowable.
- */
+function isSucceeded(record: AgentRecord): boolean { return record.status === "completed" || record.status === "steered"; }
 function resolvedInfo(record: AgentRecord | undefined) {
   const invocation = record?.invocation;
   if (invocation?.modelName === undefined) return undefined;
-  return {
-    modelName: invocation.modelName,
-    modelId: invocation.modelId,
-    thinking: invocation.thinking,
-    requestedThinking: invocation.requestedThinking,
-    requestedModel: invocation.requestedModel,
-  };
+  return { modelName: invocation.modelName, modelId: invocation.modelId, thinking: invocation.thinking,
+    requestedThinking: invocation.requestedThinking, requestedModel: invocation.requestedModel };
 }
-
 type InvocationUsage = Required<Pick<WorkflowSpawnResult, "tokens" | "outputTokens" | "toolCalls">>;
 
 /**
@@ -129,20 +40,11 @@ type InvocationUsage = Required<Pick<WorkflowSpawnResult, "tokens" | "outputToke
 function usageSince(record: AgentRecord, baseline?: InvocationUsage): InvocationUsage {
   return {
     tokens: getLifetimeTotal(record.lifetimeUsage) - (baseline?.tokens ?? 0),
-    // Reported separately from `tokens`. The script's `budget` counts *output*
-    // tokens, as Claude Code's does — billing the input and cache reads a
-    // fan-out re-sends would over-report it by an order of magnitude and make
-    // the documented guards useless.
     outputTokens: (record.lifetimeUsage?.output ?? 0) - (baseline?.outputTokens ?? 0),
     toolCalls: record.toolUses - (baseline?.toolCalls ?? 0),
   };
 }
 
-/**
- * The manager hooks that forward a running child's counters to its row. Tools
- * count on completion, and tokens on finalized `message_end` usage — never on
- * streaming estimates.
- */
 function progressHooks(report: () => void) {
   return {
     onToolActivity: (activity: ToolActivity) => { if (activity.type === "end") report(); },
@@ -150,102 +52,143 @@ function progressHooks(report: () => void) {
   };
 }
 
-function toSpawnResult(record: AgentRecord, baseline?: InvocationUsage): WorkflowSpawnResult {
+function toSpawnResult(record: AgentRecord, gate?: WorkflowGateResult, baseline?: InvocationUsage): WorkflowSpawnResult {
   const { tokens, outputTokens, toolCalls } = usageSince(record, baseline);
-  const cwd = childCwd(record);
   const common = {
-    ...(tokens > 0 ? { tokens } : {}),
-    ...(outputTokens > 0 ? { outputTokens } : {}),
+    ...(tokens > 0 ? { tokens } : {}), ...(outputTokens > 0 ? { outputTokens } : {}),
     ...(toolCalls > 0 ? { toolCalls } : {}),
-    ...(cwd !== undefined ? { cwd } : {}),
+    ...(record.taskSnapshot !== undefined ? { cwd: record.taskSnapshot.checkout, taskSnapshot: record.taskSnapshot } : {}),
   };
-
-  if (succeeded(record)) {
-    return {
-      ...common,
-      ok: true,
-      // The schema'd payload when there is one: `result` is prose, and for a
-      // worktree child it has had the branch note appended, so it would not
-      // parse. A child asked for a schema that produced none never reaches
-      // here — `runAgent` reports that through `failure`.
-      text: record.structuredJson ?? record.result ?? "",
-      ...(record.structuredRetried ? { structuredRetried: true } : {}),
-    };
-  }
-  // "stopped" is someone reaching in and stopping this child — /agents, the
-  // fleet list, a workflow abort. That is the same thing the workflows dialog's
-  // skip action means, so it renders as skipped rather than failed.
-  if (record.status === "stopped") {
-    return { ...common, ok: false, skipped: true, error: record.error ?? "Stopped." };
-  }
+  // A stop while a finished child's gate runs keeps the child's own status (only
+  // running records stop) but cancels its verification: that is still a skip.
+  if (gate !== undefined && !gate.ok && record.abortController?.signal.aborted) return { ...common, ok: false, skipped: true, error: gate.output };
+  if (isSucceeded(record)) return { ...common, ok: true, text: record.structuredJson ?? record.result ?? "",
+    ...(record.structuredRetried ? { structuredRetried: true } : {}), ...(gate !== undefined ? { gate } : {}) };
+  if (record.status === "stopped") return { ...common, ok: false, skipped: true, error: record.error ?? "Stopped." };
   return { ...common, ok: false, error: record.error ?? `Agent ${record.status}.` };
 }
-
-/** Shell used to run a `gate` command, mirroring how a user would type it. */
-const GATE_SHELL: readonly [string, string] =
-  process.platform === "win32" ? ["cmd", "/c"] : ["sh", "-c"];
-
+async function evidenceTail(path: string): Promise<string> {
+  const file = await open(path, "r");
+  try {
+    const { size } = await file.stat(); const buffer = Buffer.alloc(12_800);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, Math.max(0, size - buffer.length));
+    const lines = buffer.subarray(0, bytesRead).toString("utf8").trim().split("\n");
+    return lines.slice(-500).join("\n") + (size > bytesRead || lines.length > 500 ? "\n[bounded tail; earlier bytes/lines omitted]" : "");
+  } finally { await file.close(); }
+}
 export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   const { pi, ctx, manager } = deps;
-  /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
+  const gateTimeoutMs = deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  if (!Number.isSafeInteger(gateTimeoutMs) || gateTimeoutMs <= 0 || gateTimeoutMs > DEFAULT_GATE_TIMEOUT_MS) throw new Error("Gate timeout must be a positive integer no greater than ten minutes");
+  const captured = deps.taskSnapshot === undefined ? undefined : validateTaskSnapshot(deps.taskSnapshot);
+  const repository = captured?.repository ?? ctx.cwd;
+  const configCwd = captured?.configCwd ?? ctx.cwd;
   const records = new Map<string, string>();
-  /**
-   * Manager record id → what reopening that child needs once the manager has
-   * evicted it, ten minutes after it finished. A long review or a merge queue
-   * outlasts that easily, and `resume` must still reach the child (#385).
-   * Lives exactly as long as the run, like `records`, so memory stays bounded
-   * by the run itself; the manager keeps no tombstone for an owned child.
-   */
-  const settled = new Map<string, Pick<AgentRecord, "type" | "description" | "sessionFile"> & { worktreeLost: boolean }>();
+  const snapshots = new Map<string, TaskSnapshot>();
+  const commands = new Map<string, string>();
+  const selections = new Map<string, { model: ExtensionContext["model"]; thinking?: ThinkingLevel }>();
+  const controllers = new Map<string, AbortController>();
+  const pending = new Set<Promise<WorkflowSpawnResult>>();
+  const settlementErrors: string[] = [];
+  const warnedScopeMessages = new Set<string>();
+  const settled = new Map<string, Pick<AgentRecord, "type" | "description" | "sessionFile" | "taskSnapshot"> & { worktreeLost: boolean }>();
   const remember = (record: AgentRecord): void => {
     settled.set(record.id, {
       type: record.type,
       description: record.description,
       sessionFile: record.sessionFile,
+      taskSnapshot: record.taskSnapshot,
       worktreeLost: worktreeLost(record),
     });
   };
-  /**
-   * scopeModels warnings already toasted, so a fan-out that pins one
-   * out-of-scope agent file raises one notification rather than one per child.
-   * Kept for the whole run: the same message is the same warning at agent 200
-   * as it was at agent 1.
-   */
-  const warnedScopeMessages = new Set<string>();
-
-  /**
-   * Run a gate command in `cwd`. The only place a gate is executed — `runGate`
-   * and the pre-cleanup hook both come through here — so "gate passed" is
-   * decided from one behaviour, whichever route the command took.
-   */
-  async function executeGate(command: string, cwd: string): Promise<WorkflowGateResult> {
-    const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
-      cwd,
-      timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
-      ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
-    });
-    const output = [result.stdout, result.stderr]
-      .map(stream => stream.trim())
-      .filter(Boolean)
-      .join("\n");
-    // `pi.exec` reports a timeout as `killed` with exit code 0, so the code
-    // alone would read a killed gate as a passing one.
-    if (result.killed) {
-      return { ok: false, output: output || `Gate command timed out: ${command}` };
-    }
-    return { ok: result.code === 0, output };
+  async function executeGate(command: string, claim: TaskClaim, record: AgentRecord): Promise<WorkflowGateResult> {
+    const shellPath = SettingsManager.create(claim.snapshot.configCwd, getAgentDir()).getShellPath();
+    const result = await claim.run({ argv: taskShellArgv(shellPath, command), cwd: claim.snapshot.checkout, env: {},
+      timeout_ms: gateTimeoutMs }, record.abortController?.signal);
+    const output = (await Promise.all([evidenceTail(result.stdout), evidenceTail(result.stderr)])).filter(Boolean).join("\n");
+    if (result.is_timed_out) return { ok: false, output: output || `Gate command timed out: ${command}` };
+    if (result.is_cancelled) return { ok: false, output: output || `Gate command cancelled: ${command}` };
+    if (result.is_disconnected || result.exit_code === null) return { ok: false, output: output || `Gate command did not settle successfully: ${command}` };
+    return { ok: result.exit_code === 0, output };
   }
-
-  /**
-   * Resume a child the manager has evicted: reopen its saved session under the
-   * same id, still owned by this run, as `Agent({ resume })` does for a
-   * top-level agent. The continuation runs under the agent type's current
-   * definition, like every reopen — the script's model, schema and isolation
-   * for the first run are not replayed.
-   */
+  function track(agentId: string, operation: (signal: AbortSignal) => Promise<WorkflowSpawnResult>): Promise<WorkflowSpawnResult> {
+    const controller = new AbortController(); controllers.set(agentId, controller);
+    const onAbort = () => controller.abort(); deps.signal?.addEventListener("abort", onAbort, { once: true });
+    if (deps.signal?.aborted) controller.abort();
+    const promise = operation(controller.signal).finally(() => {
+      deps.signal?.removeEventListener("abort", onAbort);
+      if (controllers.get(agentId) === controller) controllers.delete(agentId);
+      pending.delete(promise);
+    });
+    pending.add(promise); return promise;
+  }
+  function gateHook(command: string | undefined, report: (gate: WorkflowGateResult) => void): OnBeforeTaskSettlement {
+    return async (claim, record) => {
+      if (command === undefined || !isSucceeded(record)) return;
+      try { report(await executeGate(command, claim, record)); }
+      catch (error) { report({ ok: false, output: error instanceof Error ? error.message : String(error) }); }
+    };
+  }
+  async function spawn(request: WorkflowSpawnRequest, signal: AbortSignal): Promise<WorkflowSpawnResult> {
+    const dispatch = resolveSpawnType(request.agentType); if (!dispatch.ok) return { ok: false, error: dispatch.message };
+    let model = ctx.model; const config = getAgentConfig(dispatch.type);
+    if (request.model !== undefined) {
+      const resolved = resolveModel(request.model, ctx.modelRegistry);
+      if (typeof resolved === "string") return { ok: false, error: resolved }; model = resolved;
+    }
+    const scopeVerdict = checkModelScope({ model, cwd: captured?.configCwd ?? ctx.cwd, modelRegistry: ctx.modelRegistry,
+      callerSupplied: request.model !== undefined, agentLabel: config?.displayName ?? dispatch.type, modelInput: request.model });
+    if (scopeVerdict.kind === "error") return { ok: false, error: scopeVerdict.message };
+    if (scopeVerdict.kind === "warn" && !warnedScopeMessages.has(scopeVerdict.message)) {
+      warnedScopeMessages.add(scopeVerdict.message); ctx.ui.notify(scopeVerdict.message, "warning");
+    }
+    let gate: WorkflowGateResult | undefined; let spawnedId: string | undefined; let isSessionReady = false;
+    const reportResolved = () => {
+      if (!isSessionReady || spawnedId === undefined) return;
+      const info = resolvedInfo(manager.getRecord(spawnedId)); if (info !== undefined) request.onResolved?.(info);
+    };
+    const reportProgress = () => {
+      const record = spawnedId === undefined ? undefined : manager.getRecord(spawnedId);
+      if (record !== undefined) request.onProgress?.(usageSince(record));
+    };
+    try {
+      if (Object.hasOwn(request, "taskSnapshot")) throw new Error("Workflow taskSnapshot is an internal capability");
+      const task_id = request.task_id === undefined ? captured?.task_id : validateTaskId(request.task_id);
+      if (task_id === undefined) throw new Error("Workflow requires an explicit task_id or captured binding; use /agents task bind");
+      const access = request.task_access === undefined ? captured?.access ?? "write" : validateTaskAccess(request.task_access);
+      const prior = snapshots.get(request.agentId);
+      if (prior && (task_id !== prior.task_id || access !== prior.access)) throw new Error("Retry task fields differ from the original child snapshot");
+      const snapshot = prior ?? (task_id === captured?.task_id ? validateTaskSnapshot({ ...captured, access })
+        : await manager.captureTaskSnapshot(repository, task_id, { access, configCwd }));
+      snapshots.set(request.agentId, snapshot); if (request.gate !== undefined) commands.set(request.agentId, request.gate);
+      const selection = selections.get(request.agentId) ?? { model, thinking: request.effort as ThinkingLevel | undefined ?? ctx.thinkingLevel ?? pi.getThinkingLevel?.() };
+      selections.set(request.agentId, selection);
+      const { record } = await manager.spawnAndWait(pi, ctx, dispatch.type, request.prompt, {
+        description: request.label, taskSnapshot: snapshot, task_id, task_access: access,
+        ...(config?.isolated !== undefined ? { isolated: config.isolated } : {}),
+        ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
+        ...(selection.model !== undefined ? { model: selection.model } : {}), ...(selection.thinking !== undefined ? { thinkingLevel: selection.thinking } : {}),
+        invocation: { ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}) },
+        onSessionCreated: () => { isSessionReady = true; reportResolved(); },
+        ...progressHooks(reportProgress),
+        ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
+        signal,
+        ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
+        ...(request.gate === undefined ? {} : { onBeforeTaskSettlement: gateHook(request.gate, value => { gate = value; }) }),
+      }, id => { spawnedId = id; records.set(request.agentId, id); request.onResolved?.({ recordId: id }); reportResolved(); reportProgress(); });
+      remember(record);
+      return toSpawnResult(record, gate);
+    } catch (error) {
+      const record = spawnedId === undefined ? undefined : manager.getRecord(spawnedId);
+      if (record?.taskSettlementError) settlementErrors.push(record.taskSettlementError);
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   async function reopenAgent(
+    agentId: string,
     id: string,
     prompt: string,
+    signal: AbortSignal,
     onResolved: WorkflowSpawnRequest["onResolved"],
     onProgress: WorkflowSpawnRequest["onProgress"],
   ): Promise<WorkflowSpawnResult> {
@@ -253,239 +196,76 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
     if (kept === undefined) return { ok: false, error: `Agent ${id} cannot be resumed — it never finished a run to resume from.` };
     const reopen = reopenTarget(kept.type, kept.sessionFile, kept.worktreeLost);
     if (!reopen.ok) return { ok: false, error: `Agent ${id} cannot be resumed — ${reopen.reason}.` };
+    const snapshot = kept.taskSnapshot ?? snapshots.get(agentId);
+    if (snapshot === undefined) return { ok: false, error: `Agent ${id} cannot be resumed — it has no captured task snapshot.` };
     const config = getAgentConfig(reopen.type);
-    // A reclaimed record starts from zero, so its lifetime totals already are
-    // this continuation's — no baseline, unlike a resume of a live record.
     const reportProgress = () => {
       const record = manager.getRecord(id);
       if (record !== undefined) onProgress?.(usageSince(record));
     };
+    let gate: WorkflowGateResult | undefined;
     try {
-      const { record } = await manager.spawnAndWait(
-        pi,
-        ctx,
-        reopen.type,
-        prompt,
-        {
-          description: kept.description,
-          resumeSessionFile: reopen.sessionFile,
-          reclaim: { id },
-          ...(config?.isolated !== undefined ? { isolated: config.isolated } : {}),
-          ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
-          ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
-          ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
-          ...progressHooks(reportProgress),
-        },
-        () => { onResolved?.({ recordId: id }); reportProgress(); },
-      );
+      const { record } = await manager.spawnAndWait(pi, ctx, reopen.type, prompt, {
+        description: kept.description,
+        resumeSessionFile: reopen.sessionFile,
+        reclaim: { id },
+        taskSnapshot: snapshot, task_id: snapshot.task_id, task_access: snapshot.access,
+        ...(config?.isolated !== undefined ? { isolated: config.isolated } : {}),
+        ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
+        signal,
+        ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
+        ...progressHooks(reportProgress),
+        ...(commands.has(agentId) ? { onBeforeTaskSettlement: gateHook(commands.get(agentId), value => { gate = value; }) } : {}),
+      }, () => { onResolved?.({ recordId: id }); reportProgress(); });
       remember(record);
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record);
+      return toSpawnResult(record, gate);
     } catch (error) {
+      const record = manager.getRecord(id); if (record?.taskSettlementError) settlementErrors.push(record.taskSettlementError);
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
-
   return {
-    async spawnAgent(request) {
-      const dispatch = resolveSpawnType(request.agentType);
-      if (!dispatch.ok) return { ok: false, error: dispatch.message };
-
-      let model = ctx.model;
-      const config = getAgentConfig(dispatch.type);
-      const modelInput = request.model;
-      if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          return { ok: false, error: resolved };
-        } else {
-          model = resolved;
+    journalContext(input) {
+      const snapshot = input.task_id === undefined || input.task_id === captured?.task_id ? captured : undefined;
+      return { identity: snapshot === undefined ? undefined : { ...snapshot, access: input.task_access ?? snapshot.access } };
+    },
+    spawnAgent(request) { return track(request.agentId, signal => spawn(request, signal)); },
+    abortAgent(agentId) { controllers.get(agentId)?.abort(); const id = records.get(agentId); if (id !== undefined) manager.abort(id); },
+    async settle() {
+      const attempts = await Promise.allSettled(pending);
+      const errors = [...settlementErrors, ...attempts.filter(attempt => attempt.status === "rejected").map(attempt => String(attempt.reason))];
+      if (errors.length) throw new Error(`Workflow task settlement failed: ${errors.join("; ")}`);
+    },
+    resumeAgent(agentId, prompt, onResolved, onProgress) {
+      return track(agentId, async signal => {
+        const id = records.get(agentId); if (id === undefined) return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
+        let gate: WorkflowGateResult | undefined;
+        const previous = manager.getRecord(id);
+        const baseline = previous === undefined ? undefined : usageSince(previous);
+        try {
+          const record = await manager.resume(id, prompt, signal, {
+            onBeforeTaskSettlement: gateHook(commands.get(agentId), value => { gate = value; }),
+            ...progressHooks(() => {
+              const current = manager.getRecord(id);
+              if (current !== undefined) onProgress?.(usageSince(current, baseline));
+            }),
+          });
+          if (record === undefined) {
+            if (manager.getRecord(id) === undefined) return reopenAgent(agentId, id, prompt, signal, onResolved, onProgress);
+            return { ok: false, error: `Agent ${id} has no idle session left to resume.` };
+          }
+          remember(record);
+          onResolved?.({ recordId: id }); const info = resolvedInfo(record); if (info !== undefined) onResolved?.(info);
+          return toSpawnResult(record, gate, baseline);
+        } catch (error) {
+          const record = manager.getRecord(id); if (record?.taskSettlementError) settlementErrors.push(record.taskSettlementError);
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
         }
-      }
-
-      const scopeVerdict = checkModelScope({
-        model,
-        cwd: ctx.cwd,
-        modelRegistry: ctx.modelRegistry,
-        callerSupplied: request.model !== undefined,
-        agentLabel: config?.displayName ?? dispatch.type,
-        modelInput,
       });
-      // This agent's failure, not the run's — the same shape a bad agent type
-      // takes above. The script sees `null` and its siblings carry on, which is
-      // the difference between one refused model and a discarded fan-out.
-      if (scopeVerdict.kind === "error") return { ok: false, error: scopeVerdict.message };
-      if (scopeVerdict.kind === "warn" && !warnedScopeMessages.has(scopeVerdict.message)) {
-        warnedScopeMessages.add(scopeVerdict.message);
-        ctx.ui.notify(scopeVerdict.message, "warning");
-      }
-
-      /**
-       * The gate's verdict, set only if the hook below actually ran the command.
-       * Its presence is what stops the runtime running the gate a second time,
-       * so it is set on the failure route too — a gate we tried and could not
-       * complete is a failed gate, never an un-run one that then re-runs
-       * against the wrong tree.
-       */
-      let gate: WorkflowGateResult | undefined;
-      let spawnedId: string | undefined;
-
-      /**
-       * Hand the child's EFFECTIVE configuration back to the run.
-       *
-       * `AgentRecord.invocation` is the one authoritative place for it (#168),
-       * filled by the manager the moment the child's session exists — which is
-       * before this fires, so it is populated by the time we read it. Reading it
-       * rather than re-deriving "the session, else the request" is the whole
-       * point of that field existing.
-       */
-      let sessionReady = false;
-      const reportResolved = () => {
-        // Called from BOTH the session hook and the spawn hook, because their
-        // order is not guaranteed: the manager fires `onSpawned` after
-        // `runAgent` returns, but `runAgent` decides when its own
-        // `onSessionCreated` fires — synchronously, for a stub. Each fires once,
-        // so the first call finds a half missing and returns, and the second is
-        // the one that reports.
-        if (!sessionReady || spawnedId === undefined) return;
-        const info = resolvedInfo(manager.getRecord(spawnedId));
-        if (info !== undefined) request.onResolved?.(info);
-      };
-      const reportProgress = () => {
-        const record = spawnedId === undefined ? undefined : manager.getRecord(spawnedId);
-        if (record !== undefined) request.onProgress?.(usageSince(record));
-      };
-      const command = request.gate;
-      /**
-       * Verify the child's work while its worktree still exists.
-       *
-       * The manager destroys that copy inside the child's own settle, so this
-       * is the last (and only) moment at which `npm test` can mean "the code
-       * this child just wrote" rather than "whatever is in the main tree".
-       */
-      const onBeforeWorktreeCleanup =
-        command === undefined
-          ? undefined
-          : async (worktreePath: string): Promise<void> => {
-              // A failed child's gate is never consulted — the runtime reports
-              // the child's own failure — so running it would be pure cost.
-              if (spawnedId === undefined || !succeeded(manager.getRecord(spawnedId))) return;
-              try {
-                gate = await executeGate(command, worktreePath);
-              } catch (error) {
-                gate = { ok: false, output: error instanceof Error ? error.message : String(error) };
-              }
-            };
-
-      try {
-        const { record } = await manager.spawnAndWait(
-          pi,
-          ctx,
-          dispatch.type,
-          request.prompt,
-          {
-            description: request.label,
-            // Same as the Agent tool: `isolated` comes off the agent definition.
-            // Left out, a hermetic agent's script-spawned children loaded every
-            // host extension and picked up its MCP and web tools.
-            ...(config?.isolated !== undefined ? { isolated: config.isolated } : {}),
-            // The stamp is what keeps this child out of the session's
-            // `maxConcurrent` pool — see `occupiesPoolSlot`. The run already
-            // bounds how many of its agents run at once, and counting them
-            // twice would let one fan-out starve everything else the user is
-            // doing. No `bypassQueue` needed: an agent outside the pool is
-            // never queued behind it.
-            ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
-            ...(model !== undefined ? { model } : {}),
-            ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
-            invocation: {
-              ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
-            },
-            // Fires once the child's session exists, which is where the model
-            // and the clamped thinking level first become knowable.
-            onSessionCreated: () => { sessionReady = true; reportResolved(); },
-            ...progressHooks(reportProgress),
-            ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
-            ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
-            ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
-            ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
-            ...(onBeforeWorktreeCleanup !== undefined ? { onBeforeWorktreeCleanup } : {}),
-          },
-          id => {
-            spawnedId = id;
-            records.set(request.agentId, id);
-            // Ahead of `reportResolved`, and not folded into it: that one waits
-            // for the child's session so it can name the effective model, while
-            // the record id is known here and is what the inspector opens a
-            // conversation on. A child that fails before its session resolves
-            // would otherwise never be openable at all.
-            request.onResolved?.({ recordId: id });
-            reportResolved();
-            // Counters a stub reported synchronously, before the id existed.
-            reportProgress();
-          },
-        );
-        remember(record);
-        return { ...toSpawnResult(record), ...(gate !== undefined ? { gate } : {}) };
-      } catch (error) {
-        // Strict worktree isolation rejects out of `awaitStartup` — the child
-        // never ran. That is this agent's failure, not the run's: the script
-        // sees `null` and its siblings carry on.
-        return { ok: false, error: error instanceof Error ? error.message : String(error) };
-      }
     },
-
-    abortAgent(agentId) {
-      const id = records.get(agentId);
-      // Nothing to abort before the manager has issued an id — the child is
-      // still in startup, and the run's own signal reaches it there.
-      if (id !== undefined) manager.abort(id);
-    },
-
-    async resumeAgent(agentId, prompt, onResolved, onProgress) {
-      const id = records.get(agentId);
-      if (id === undefined) {
-        return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
-      }
-      // A live record carries the earlier runs' totals; the resumed row counts
-      // only what this continuation adds.
-      const previous = manager.getRecord(id);
-      const baseline = previous === undefined ? undefined : usageSince(previous);
-      const record = await manager.resume(id, prompt, deps.signal, progressHooks(() => {
-        const current = manager.getRecord(id);
-        if (current !== undefined) onProgress?.(usageSince(current, baseline));
-      }));
-      // No live session: the manager evicted the child, or it never got as far
-      // as having one. `reopenAgent` refuses the second with the reason — and a
-      // record still in memory without a session is refused by the manager,
-      // which never reopens an id that is still live.
-      if (record === undefined) return reopenAgent(id, prompt, onResolved, onProgress);
-      // The resumed row is built from scratch, so it has to be told the same
-      // thing the first one was — the child's session already exists, so this is
-      // simply read back rather than waited for. The id goes first for the same
-      // reason it does on the spawn path: it is knowable even when the rest is
-      // not.
-      onResolved?.({ recordId: id });
-      const info = resolvedInfo(record);
-      if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record, baseline);
-    },
-
-    /**
-     * Resolve a nested `workflow()` reference. The runtime decides whether what
-     * comes back is a workflow; this only finds it.
-     */
-    loadWorkflow(ref) {
-      return resolveWorkflowSource(ref, ctx.cwd);
-    },
-
-    // Reached only for a gate the spawn did not already run — a child with no
-    // worktree of its own, or a host wired without the pre-cleanup hook.
-    async runGate(command, gate) {
-      // The child's worktree when it had one and it survived; otherwise the
-      // session's own directory, which is where a non-isolated child worked.
-      return await executeGate(command, gate.cwd ?? ctx.cwd);
-    },
+    loadWorkflow(ref) { return resolveWorkflowSource(ref, captured?.configCwd ?? ctx.cwd); },
+    async runGate(command) { return { ok: false, output: `Gate was not executed while the child task claim was held: ${command}` }; },
   };
 }

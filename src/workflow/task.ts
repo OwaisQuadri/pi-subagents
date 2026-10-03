@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { type TaskSnapshot, validateTaskSnapshot } from "../task-worktree.js";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
@@ -28,6 +29,8 @@ export function workflowRunId(): string {
 }
 
 export interface WorkflowTask {
+  taskSnapshot?: TaskSnapshot;
+  settlement?: Promise<void>;
   /** Discriminator, alongside Claude Code's `local_agent` / `local_bash`. */
   type: "local_workflow";
   id: string;
@@ -95,6 +98,7 @@ export interface WorkflowTask {
 }
 
 export function createWorkflowTask(init: {
+  taskSnapshot?: TaskSnapshot;
   id: string;
   script: string;
   scriptPath?: string;
@@ -108,6 +112,7 @@ export function createWorkflowTask(init: {
 }): WorkflowTask {
   return {
     type: "local_workflow",
+    taskSnapshot: init.taskSnapshot === undefined ? undefined : validateTaskSnapshot(init.taskSnapshot),
     id: init.id,
     status: "running",
     script: init.script,
