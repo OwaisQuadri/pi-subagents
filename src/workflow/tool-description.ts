@@ -1,41 +1,3 @@
-/**
- * tool-description.ts — the model-facing description of the `SubagentWorkflow` tool.
- *
- * This is a deliberate port of Claude Code's `Workflow` tool description, not a
- * paraphrase of it. The rule the text is held to: **match Claude Code's wording
- * everywhere; deviate only in the specific clause where its sentence would be
- * false about pi, and keep that deviation minimal and in its voice.** Wording
- * parity is the point — a user who knows one tool should not have to relearn
- * the other, and the orchestration patterns below are load-bearing guidance
- * that gets used badly when compressed.
- *
- * Parts omitted because pi has no such feature: the `ultracode` opt-in, MCP
- * tools reached through `ToolSearch`, the `agent-<id>.jsonl` resume fallback,
- * and the `/config` workflow-size guideline.
- *
- * Clauses that had to deviate, each because Claude Code's is untrue here:
- *   - `schema` is pressure, not force — `toolChoice` is not plumbed through
- *     pi's `AgentSession`, so a child can decline and the call returns null.
- *   - `budget.total` is always null; pi has no token-target directive.
- *   - `parallel` propagates a fatal run error instead of folding it to null.
- *   - `effort` inherits the agent definition's level, then the parent's.
- *   - `isolation` removes the worktree on settle, changes kept on a branch.
- * Additions with no upstream counterpart: `gate`, `resume`, `effort: "minimal"`,
- * the saved-workflow directories, and the reject-unknown-options guarantee.
- *
- * Kept out of index.ts purely for size. `{{placeholder}}` tokens are rendered by
- * the same substitution pass the Agent tool's description uses, so a
- * user-authored override can interpolate the live agent roster.
- */
-
-/**
- * Rendered with `{{typeList}}` substituted. Keep the prose accurate to what the
- * runtime actually implements — documenting a global we do not ship is worse
- * than documenting nothing, because the script only fails once it is running.
- * `workflow-tool-description.test.ts` pins the parts that can drift: the
- * `agent()` option set, the `resume` exclusions, the effort levels, the caps,
- * and that every example here uses options the runtime actually accepts.
- */
 export const fullWorkflowToolDescription = `Execute a workflow script that orchestrates multiple subagents deterministically. Workflows run in the background — this tool returns immediately with a task ID, and you are notified when the workflow completes. Use /agents → Workflows to watch live progress.
 
 A workflow structures work across many agents — to be comprehensive (decompose and cover in parallel), to be confident (independent perspectives and adversarial checks before committing), or to take on scale one context can't hold (migrations, audits, broad sweeps). The script is where you encode that structure: what fans out, what verifies, what synthesizes.
@@ -76,8 +38,10 @@ Every script must begin with \`export const meta = {...}\`:
 
 The \`meta\` object must be a PURE LITERAL — no variables, function calls, spreads, or template interpolation. Required fields: \`name\`, \`description\`. Optional: \`whenToUse\` (shown in the workflow list), \`phases\`. Use the SAME phase titles in meta.phases as in phase() calls — titles are matched exactly; a phase() call with no matching meta entry just gets its own progress group. Add \`model\` to a phase entry when that phase uses a specific model override.
 
+Every child requires an initialized task_id or the workflow's captured task binding. For the read-only fan-out patterns below, use task_access: 'read-stable' on each agent call or bind with --access read-stable. Stable readers cannot run shell commands. Independent parallel writers need distinct existing task_id values; never derive them from labels or invent them.
+
 Script body hooks:
-- agent(prompt: string, opts?: {label?: string, phase?: string, schema?: object, model?: string, effort?: string, isolation?: 'worktree', agentType?: string, gate?: string, resume?: string}): Promise<any> — spawn a subagent. Without schema, returns its final text as a string. With schema (a JSON Schema), the subagent is given a StructuredOutput tool built from it and agent() returns the validated object — no parsing needed. A payload that does not match is rejected back to the child, which corrects it; a child that never answers through the tool gets one more prompt and then fails, so the call returns null — filter after every schema stage. Returns null if the user skips the agent mid-run or the subagent dies on a terminal API error after retries (filter with .filter(Boolean)). opts.label overrides the display label. opts.phase explicitly assigns this agent to a progress group (use this inside pipeline()/parallel() stages to avoid races on the global phase() state — same phase string → same group box). opts.model overrides the model for this agent call. Default to omitting it — the agent inherits the main-loop model (the resolved session model), which is almost always correct. Only set it when the user explicitly selected a different model. opts.effort overrides the reasoning effort for this agent call ('off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max') — omit to inherit the current parent's level; only set it when the user explicitly selected a different level. opts.isolation: 'worktree' runs the agent in a fresh git worktree — EXPENSIVE (setup time + disk per agent), use ONLY when agents mutate files in parallel and would otherwise conflict; the worktree is removed when the agent settles, its changes preserved on a branch. opts.gate: '<command>' runs a shell command after the agent finishes and requires it to pass — a non-zero exit marks the agent failed and the command's output becomes the error; prefer gate: 'npm test' over asking another agent whether the code looks right. opts.resume: '<label>' continues the child that ran under that label instead of starting fresh, so an iterative loop keeps its context — it cannot be combined with agentType, model, effort, isolation, gate or schema. opts.agentType uses a custom subagent type instead of the default workflow subagent — resolved from the same registry as the Agent tool; composes with schema. Available types:
+- agent(prompt: string, opts?: {label?: string, phase?: string, schema?: object, model?: string, effort?: string, isolation?: 'worktree', agentType?: string, gate?: string, resume?: string, task_id?: string, task_access?: 'write' | 'read-stable'}): Promise<any> — spawn a subagent. Without schema, returns its final text as a string. With schema (a JSON Schema), the subagent is given a StructuredOutput tool built from it and agent() returns the validated object — no parsing needed. A payload that does not match is rejected back to the child, which corrects it; a child that never answers through the tool gets one more prompt and then fails, so the call returns null — filter after every schema stage. Returns null if the user skips the agent mid-run or the subagent dies on a terminal API error after retries (filter with .filter(Boolean)). opts.label overrides the display label. opts.phase explicitly assigns this agent to a progress group (use this inside pipeline()/parallel() stages to avoid races on the global phase() state — same phase string → same group box). opts.model overrides the model for this agent call. Default to omitting it — the agent inherits the main-loop model (the resolved session model), which is almost always correct. Only set it when the user explicitly selected a different model. opts.effort overrides the reasoning effort for this agent call ('off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max') — omit to inherit the current parent's level; only set it when the user explicitly selected a different level. Each child uses an initialized task checkout. Omit opts.task_id to inherit the workflow's task binding captured at launch. For independent parallel writers, supply distinct existing task IDs through opts.task_id. opts.task_access is 'write' or 'read-stable', defaulting to the captured access; stable readers cannot run shell commands or gates. Same-task writers fail TaskBusy. opts.isolation does not create a throwaway checkout or bypass task ownership. Working bytes remain in the task checkout after completion; there is no automatic commit or cleanup. opts.gate: '<command>' runs a shell command after the agent finishes and requires it to pass — a non-zero exit marks the agent failed and the command's output becomes the error; prefer gate: 'npm test' over asking another agent whether the code looks right. opts.resume: '<label>' continues the child that ran under that label instead of starting fresh, so an iterative loop keeps its context — it cannot be combined with agentType, model, effort, isolation, gate, schema, task_id or task_access. Resume retains the child's original task and re-runs its original gate once while the new claim is held. opts.agentType uses a custom subagent type instead of the default workflow subagent — resolved from the same registry as the Agent tool; composes with schema. Available types:
 {{typeList}}
 - pipeline(items, stage1, stage2, ...): Promise<any[]> — run each item through all stages independently, NO barrier between stages. Item A can be in stage 3 while item B is still in stage 1. This is the DEFAULT for multi-stage work. Wall-clock = slowest single-item chain, not sum-of-slowest-per-stage. Every stage callback receives (prevResult, originalItem, index) — use originalItem/index in later stages to label work without threading context through stage 1's return value. A stage that throws drops that item to \`null\` and skips its remaining stages.
 - parallel(thunks: Array<() => Promise<any>>): Promise<any[]> — run tasks concurrently. This is a BARRIER: awaits all thunks before returning. A thunk that throws (or whose agent errors) resolves to \`null\` in the result array, so \`.filter(Boolean)\` before using the results; only a fatal run error — a cap breach, or a nested workflow that could not load — propagates instead of being folded into a null. Use ONLY when you genuinely need all results together.
@@ -148,12 +112,8 @@ Loop-until-count pattern — accumulate to a target:
 Gate-and-retry pattern — verify by running, and keep the agent's context across attempts:
   let fixed = await agent('Find and fix the failing test.', {label: 'fix', gate: 'npm test'})
   if (fixed === null) {                        // a non-zero exit failed the agent
-    // Resume keeps everything the child already learned. It cannot carry the
-    // gate, so re-verification needs its own gated call, in the same tree.
     fixed = await agent('\`npm test\` is still failing. Fix the cause.', {label: 'fix', resume: 'fix'})
-    const verified = await agent('Run \`npm test\` and report the result. Change nothing.',
-      {label: 'verify', phase: 'Verify', gate: 'npm test', effort: 'low'})
-    return { passed: verified !== null, summary: fixed }
+    return { passed: fixed !== null, summary: fixed }
   }
   return { passed: true, summary: fixed }
   // An LLM judging whether a fix works is a weaker signal than the test suite.
@@ -197,4 +157,4 @@ Use this tool for multi-step orchestration where control flow should be determin
 
 ## Resume
 
-The tool result includes a runId. To resume after a pause, kill, or script edit, relaunch with SubagentWorkflow({scriptPath, resumeFromRunId}) — the longest unchanged prefix of agent() calls returns cached results instantly; the first edited/new call and everything after it runs live. Same script + same args → 100% cache hit. It is a prefix and not a lookup: a later call that still matches is not reused once an earlier one has changed. A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. Same session only, and the run must have finished — stop it from /agents → Workflows first. Before diagnosing why a completed workflow returned an empty or unexpected result, Read the run's \`<run id>.workflow.jsonl\` beside its script — it records each agent's actual return value; do not assume cached results are non-empty. Date.now()/Math.random()/new Date() are unavailable in scripts (they would break this) — stamp results after the workflow returns, or pass timestamps via args.`;
+The tool result includes a runId. To re-run after a kill or script edit, use SubagentWorkflow({scriptPath, resumeFromRunId}). Managed task checkouts run live: the journal does not prove unchanged uncommitted working bytes, even at the same base and generation. Generic library hosts can reuse a matching pure prefix only with positive immutable-input evidence. Old unqualified entries, writing calls, gated calls and resumed calls run live. A replayed result creates no session for a later resume. Workflow completion and termination wait for child, command and claim settlement; a cancel acknowledgment or stopped display is not completion. Same session only, and the run must have finished — stop it from /agents → Workflows first. Before diagnosing why a completed workflow returned an empty or unexpected result, Read the run's \`<run id>.workflow.jsonl\` beside its script — it records each agent's actual return value; do not assume cached results are non-empty. Date.now()/Math.random()/new Date() are unavailable in scripts (they would break this) — stamp results after the workflow returns, or pass timestamps via args.`;

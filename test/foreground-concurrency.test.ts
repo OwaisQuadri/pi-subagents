@@ -13,6 +13,11 @@
 // exercises a path out of the queue therefore asserts the waiter RESOLVES.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, fixturePromise, settleFixtureWorkers } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
+
 import { AgentManager } from "../src/agent-manager.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -21,14 +26,10 @@ vi.mock("../src/agent-runner.js", () => ({
 }));
 
 vi.mock("../src/worktree.js", () => ({
-  createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
 import { runAgent } from "../src/agent-runner.js";
-import { createWorktree } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -40,15 +41,15 @@ function controllableRuns() {
   // History, not just the implementation: these tests assert on call COUNTS,
   // and vitest shares the module mock across the file.
   vi.mocked(runAgent).mockClear();
-  vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any) =>
-    new Promise<any>(resolve => {
+  vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any, options: any) =>
+    fixturePromise<any>(resolve => {
       resolvers.set(prompt as string, () => resolve({
         responseText: `${prompt}-result`,
         session: mockSession(),
         aborted: false,
         steered: false,
       }));
-    }),
+    }, options.signal),
   );
   return resolvers;
 }
@@ -56,14 +57,20 @@ function controllableRuns() {
 /** Let queued microtasks (gate resolution, settle handlers) run. */
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
+let taskIndex = 0;
+const independentTasks = ["concurrency-A", "concurrency-B", "concurrency-C", "concurrency-D", "concurrency-E", "concurrency-F", "concurrency-G"];
+const taskSnapshot = () => declareTask("/tmp", independentTasks[taskIndex++]);
+
 const fg = (manager: AgentManager, prompt: string, options: any = {}) =>
   manager.spawnAndWait(mockPi, mockCtx, "general-purpose", prompt, {
+    taskSnapshot: taskSnapshot(),
     description: prompt,
     ...options,
   });
 
 const bg = (manager: AgentManager, prompt: string, options: any = {}) =>
   manager.spawn(mockPi, mockCtx, "general-purpose", prompt, {
+    taskSnapshot: taskSnapshot(),
     description: prompt,
     isBackground: true,
     ...options,
@@ -73,21 +80,23 @@ const bg = (manager: AgentManager, prompt: string, options: any = {}) =>
 const recordFor = (manager: AgentManager, prompt: string) =>
   manager.listAgents().find(a => a.description === prompt)!;
 
-describe("maxConcurrentForeground", () => {
+describe("maxConcurrentForeground", async () => {
   let manager: AgentManager;
 
   beforeEach(() => {
+    taskIndex = 0;
     vi.mocked(runAgent).mockClear();
   });
 
-  afterEach(() => {
-    manager?.dispose();
-    vi.mocked(createWorktree).mockReset();
+  afterEach(async () => {
+    manager?.abortAll();
+    settleFixtureWorkers();
+    await manager?.dispose();
   });
 
   // The governing constraint: a user who never sets this must see exactly the
   // behaviour that shipped before it existed.
-  it("is unlimited by default, and the default path stays synchronous", () => {
+  it("is unlimited by default, and the default path stays synchronous", async () => {
     controllableRuns();
     manager = new AgentManager();
 
@@ -102,6 +111,7 @@ describe("maxConcurrentForeground", () => {
     // inside poolFor is deliberately NOT pinned here: it is a belt-and-braces
     // optimisation with no observable effect, since an unlimited pool always
     // reports room anyway.)
+    await flush();
     expect(runAgent).toHaveBeenCalledTimes(3);
     for (const p of ["a", "b", "c"]) expect(recordFor(manager, p).status).toBe("running");
   });
@@ -115,9 +125,13 @@ describe("maxConcurrentForeground", () => {
     const second = fg(manager, "b");
     const third = fg(manager, "c");
 
+    await flush();
+
     expect(runAgent).toHaveBeenCalledTimes(1);
     expect(recordFor(manager, "b").status).toBe("queued");
     expect(recordFor(manager, "c").status).toBe("queued");
+
+    await flush();
 
     resolvers.get("a")!();
     expect(await first).toMatchObject({ record: { status: "completed", result: "a-result" } });
@@ -126,8 +140,11 @@ describe("maxConcurrentForeground", () => {
     expect(recordFor(manager, "b").status).toBe("running");
     expect(recordFor(manager, "c").status).toBe("queued");
 
+    await flush();
+
     resolvers.get("b")!();
     expect(await second).toMatchObject({ record: { result: "b-result" } });
+    await flush();
     resolvers.get("c")!();
     expect(await third).toMatchObject({ record: { result: "c-result" } });
   });
@@ -146,6 +163,7 @@ describe("maxConcurrentForeground", () => {
     void fg(manager, "child", { parentAgentId: recordFor(manager, "parent").id, depth: 2 });
 
     expect(recordFor(manager, "child").status).toBe("running");
+    await flush();
     expect(runAgent).toHaveBeenCalledTimes(2);
   });
 
@@ -167,6 +185,7 @@ describe("maxConcurrentForeground", () => {
     expect(recordFor(manager, "wf-a").status).toBe("running");
     expect(recordFor(manager, "wf-b").status).toBe("running");
     expect(recordFor(manager, "wf-c").status).toBe("running");
+    await flush();
     expect(runAgent).toHaveBeenCalledTimes(3);
 
     // The session's own blocking work is still bounded — the exemption is for
@@ -203,14 +222,14 @@ describe("maxConcurrentForeground", () => {
   // Detached spawns block nobody, so bounding them buys nothing — and would
   // park a record with no one waiting to release it. README documents RPC
   // spawns as starting immediately whatever isBackground says.
-  it("does not queue a detached spawn, even one flagged isBackground: false", () => {
+  it("does not queue a detached spawn, even one flagged isBackground: false", async () => {
     controllableRuns();
     manager = new AgentManager();
     manager.setMaxConcurrentForeground(1);
 
     void fg(manager, "holder");
     manager.spawn(mockPi, mockCtx, "general-purpose", "rpc", {
-      description: "rpc",
+      description: "rpc", taskSnapshot: declareTask("/tmp", "detached-rpc"),
       isBackground: false,
     });
 
@@ -232,7 +251,7 @@ describe("maxConcurrentForeground", () => {
     expect(recordFor(manager, "next").status).toBe("queued");
   });
 
-  describe("cancellation", () => {
+  describe("cancellation", async () => {
     // A rejection here would escape into the caller's tool `execute` and reject
     // pi's Promise.all for the entire tool batch, killing unrelated tool calls.
     it("resolves — never rejects — when a queued agent is aborted", async () => {
@@ -252,7 +271,9 @@ describe("maxConcurrentForeground", () => {
       expect(record.completedAt).toBeDefined();
 
       // Freeing the slot must not resurrect it.
+      await flush();
       resolvers.get("holder")!();
+      await flush();
       await flush();
       expect(runAgent).toHaveBeenCalledTimes(1);
     });
@@ -284,6 +305,7 @@ describe("maxConcurrentForeground", () => {
 
       const { record } = await fg(manager, "victim", { signal: controller.signal });
       expect(record.status).toBe("stopped");
+      await flush();
       expect(runAgent).toHaveBeenCalledTimes(1);
     });
 
@@ -332,11 +354,11 @@ describe("maxConcurrentForeground", () => {
     });
   });
 
-  describe("slot accounting", () => {
+  describe("slot accounting", async () => {
     it("frees the slot when a foreground agent fails", async () => {
       const rejectors = new Map<string, (e: unknown) => void>();
-      vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any) =>
-        new Promise<any>((_resolve, reject) => { rejectors.set(prompt as string, reject); }),
+      vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any, options: any) =>
+        fixturePromise<any>((_resolve, reject) => { rejectors.set(prompt as string, reject); }, options.signal),
       );
       manager = new AgentManager();
       manager.setMaxConcurrentForeground(1);
@@ -344,6 +366,8 @@ describe("maxConcurrentForeground", () => {
       const first = fg(manager, "a");
       void fg(manager, "b");
       expect(recordFor(manager, "b").status).toBe("queued");
+
+      await flush();
 
       rejectors.get("a")!(new Error("boom"));
       expect((await first).record.status).toBe("error");
@@ -362,7 +386,9 @@ describe("maxConcurrentForeground", () => {
       void fg(manager, "b");
       void fg(manager, "c");
 
+      await flush();
       manager.abort(recordFor(manager, "a").id);
+      await flush();
       resolvers.get("a")!(); // the aborted run still settles normally
       await first;
 
@@ -371,24 +397,27 @@ describe("maxConcurrentForeground", () => {
     });
   });
 
-  // #179: a strict worktree-isolation failure throws out of spawnAndWait on the
-  // immediate path. Queue pressure must not silently turn that into a result.
+  // #179: a startup failure (a refused task claim) throws out of spawnAndWait on
+  // the immediate path. Queue pressure must not silently turn that into a result.
   it("rethrows a drain-time startup failure, and keeps draining", async () => {
     const resolvers = controllableRuns();
     manager = new AgentManager();
     manager.setMaxConcurrentForeground(1);
 
-    vi.mocked(createWorktree).mockReturnValue(undefined as any);
-
     const first = fg(manager, "holder");
-    const doomed = fg(manager, "doomed", { isolation: "worktree" });
+    await flush();
+    vi.spyOn(FixtureTaskAuthority.prototype, "claim").mockRejectedValueOnce(new Error("TaskBusy: refused at drain"));
+    const doomed = fg(manager, "doomed");
+    const refused = expect(doomed).rejects.toThrow("TaskBusy");
     const after = fg(manager, "after");
     expect(recordFor(manager, "doomed").status).toBe("queued");
+
+    await flush();
 
     resolvers.get("holder")!();
     await first;
 
-    await expect(doomed).rejects.toThrow(/worktree/i);
+    await refused;
     expect(recordFor(manager, "doomed").status).toBe("error");
     // The throw above IS the caller's report. Left unconsumed, the record would
     // also nudge the session — the same failure delivered twice, and only for
@@ -397,6 +426,7 @@ describe("maxConcurrentForeground", () => {
 
     // The failure freed nothing, but it also blocked nothing.
     expect(recordFor(manager, "after").status).toBe("running");
+    await flush();
     resolvers.get("after")!();
     await after;
   });
@@ -409,9 +439,11 @@ describe("maxConcurrentForeground", () => {
     void fg(manager, "a");
     void fg(manager, "b");
     void fg(manager, "c");
+    await flush();
     expect(runAgent).toHaveBeenCalledTimes(1);
 
     manager.setMaxConcurrentForeground(0); // back to unlimited
+    await flush();
     expect(runAgent).toHaveBeenCalledTimes(3);
   });
 
@@ -419,7 +451,7 @@ describe("maxConcurrentForeground", () => {
   // user-editable at runtime (`/agents → Settings`, and applySettings on load).
   // Recomputing the pool at settle time made the release disagree with the
   // acquire in both directions.
-  describe("a limit changed mid-run", () => {
+  describe("a limit changed mid-run", async () => {
     it("releases the slot a cleared limit no longer describes", async () => {
       const resolvers = controllableRuns();
       manager = new AgentManager();
@@ -427,6 +459,7 @@ describe("maxConcurrentForeground", () => {
 
       const a = fg(manager, "a");
       manager.setMaxConcurrentForeground(0); // unlimited, while "a" holds a slot
+      await flush();
       resolvers.get("a")!();
       await a;
       await flush();
@@ -445,6 +478,7 @@ describe("maxConcurrentForeground", () => {
 
       const a = fg(manager, "a"); // unlimited — takes no slot
       manager.setMaxConcurrentForeground(1);
+      await flush();
       resolvers.get("a")!();
       await a;
       await flush();
@@ -458,7 +492,7 @@ describe("maxConcurrentForeground", () => {
     });
   });
 
-  it("clamps a negative limit to unlimited rather than to 1", () => {
+  it("clamps a negative limit to unlimited rather than to 1", async () => {
     controllableRuns();
     manager = new AgentManager();
     manager.setMaxConcurrentForeground(-3);
@@ -475,7 +509,9 @@ describe("maxConcurrentForeground", () => {
     expect(manager.hasRunning()).toBe(true);
 
     const all = manager.waitForAll();
+    await flush();
     resolvers.get("a")!();
+    await flush();
     await flush();
     resolvers.get("b")!();
     await all;
@@ -497,27 +533,38 @@ describe("maxConcurrentForeground", () => {
     const secondHook = vi.fn();
 
     const first = manager.spawnAndWait(
-      mockPi, mockCtx, "general-purpose", "a", { description: "a" }, firstHook,
+      mockPi, mockCtx, "general-purpose", "a", { description: "a", taskSnapshot: declareTask("/tmp", "hook-A") }, firstHook,
     );
     const second = manager.spawnAndWait(
-      mockPi, mockCtx, "general-purpose", "b", { description: "b" }, secondHook,
+      mockPi, mockCtx, "general-purpose", "b", { description: "b", taskSnapshot: declareTask("/tmp", "hook-B") }, secondHook,
     );
 
+    await flush();
+
     expect(firstHook).toHaveBeenCalledTimes(1);
+    await flush();
     expect(secondHook).not.toHaveBeenCalled();
+
+    await flush();
 
     resolvers.get("a")!();
     await first;
 
+    await flush();
+
     expect(secondHook).toHaveBeenCalledTimes(1);
+    await flush();
     expect(secondHook).toHaveBeenCalledWith(recordFor(manager, "b").id);
+    await flush();
     expect(firstHook).toHaveBeenCalledTimes(1);
+
+    await flush();
 
     resolvers.get("b")!();
     await second;
   });
 
-  it("reports how many are ahead when a spawn is queued", () => {
+  it("reports how many are ahead when a spawn is queued", async () => {
     controllableRuns();
     manager = new AgentManager();
     manager.setMaxConcurrentForeground(1);
@@ -547,6 +594,7 @@ describe("maxConcurrentForeground", () => {
     expect(recordFor(manager, "bg-queued").status).toBe("queued");
 
     // Free a BACKGROUND slot while the foreground queue is still stuck.
+    await flush();
     resolvers.get("bg-holder")!();
     await flush();
 

@@ -331,6 +331,8 @@ const AGENT_OPTIONS = [
   "resume",
   "effort",
   "schema",
+  "task_id",
+  "task_access",
 ];
 
 /** Claude Code options this runtime does not have, and why. */
@@ -468,6 +470,14 @@ async function agentIn(scope, prompt, opts) {
   const resume = optionalText(options.resume, "agent() opts.resume");
   const effort = optionalText(options.effort, "agent() opts.effort");
   const schema = options.schema;
+  const task_id = options.task_id;
+  if (task_id !== undefined && (typeof task_id !== "string" || !task_id.trim() || task_id.includes("\\0") || Buffer.byteLength(task_id) > 128)) {
+    throw new Error("agent() opts.task_id must be an explicit nonempty string of at most 128 UTF-8 bytes.");
+  }
+  const task_access = options.task_access;
+  if (task_access !== undefined && task_access !== "write" && task_access !== "read-stable") {
+    throw new Error('agent() opts.task_access must be "write" or "read-stable".');
+  }
   if (schema !== undefined) {
     if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
       throw new Error("agent() opts.schema must be a JSON Schema object.");
@@ -486,6 +496,9 @@ async function agentIn(scope, prompt, opts) {
   // keeps the agent, model and tool contract it was started with. Rejecting is
   // the point: silently ignoring these opts would look like they applied.
   if (resume !== undefined) {
+    if (task_id !== undefined || task_access !== undefined) {
+      throw new Error("agent() opts.resume keeps the child's captured task identity and access.");
+    }
     if (agentType !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.agentType are mutually exclusive: a resumed agent keeps the agent type it was started with."
@@ -525,6 +538,8 @@ async function agentIn(scope, prompt, opts) {
 
   const result = await callHost("agent", {
     prompt: text,
+    task_id: task_id,
+    task_access: task_access,
     label: label,
     model: model,
     agentType: agentType,

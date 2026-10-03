@@ -22,10 +22,10 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, RunActivity, SubagentType, ThinkingLevel } from "./types.js";
+import { type TaskAccess, TaskAuthority, type TaskAuthorityFixture, TaskClaim, type TaskClaimHolder, type TaskSnapshot, validateTaskAccess, validateTaskId, validateTaskSnapshot } from "./task-worktree.js";
+import type { AgentInvocation, AgentRecord, AgentTombstone, MentionResolution, RunActivity, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord, activity?: RunActivity, isPresentation?: boolean) => void;
 export type OnAgentStart = (record: AgentRecord, activity?: RunActivity, isPresentation?: boolean) => void;
@@ -155,10 +155,27 @@ function occupiesForegroundSlot(
   return !!record.blocking && isTopLevelAgent(record);
 }
 
-/** Which concurrency pool a spawn is charged to, if any. */
 type Pool = "background" | "foreground";
 
+interface TaskRequest {
+  repository: string;
+  task_id: string;
+  generation: number;
+  access: TaskAccess;
+  configCwd: string;
+  snapshot?: TaskSnapshot;
+}
+
+export type OnBeforeTaskSettlement = (claim: TaskClaim, record: AgentRecord) => Promise<void>;
+
+export interface TaskBindOptions {
+  base_oid?: string;
+  access?: TaskAccess;
+  configCwd?: string;
+}
+
 interface SpawnArgs {
+  task: TaskRequest;
   pi: ExtensionAPI;
   ctx: ExtensionContext;
   type: SubagentType;
@@ -166,7 +183,11 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+export interface SpawnOptions {
+  task_id?: string;
+  task_access?: TaskAccess;
+  taskSnapshot?: TaskSnapshot;
+  onBeforeTaskSettlement?: OnBeforeTaskSettlement;
   description: string;
   /**
    * Optional memorable name for this instance, becoming a second handle
@@ -232,33 +253,12 @@ interface SpawnOptions {
    * compiled schema. Set only by the workflow host, for `agent({ schema })`.
    */
   structuredOutput?: CompiledSchema;
-  /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
-  isolation?: IsolationMode;
   /**
-   * Working directory for the agent (absolute path). Default: parent session
-   * cwd. The agent's tools operate here, but .pi config (extensions, skills,
-   * settings, memory) still loads from the parent session's project — the
-   * target directory's `.pi` extensions never execute. With isolation:
-   * "worktree", the worktree is created FROM this directory and the result
-   * branch lands in that repo.
+   * Repository for an explicit `task_id` without a captured snapshot (absolute
+   * path). Default: parent session cwd. The agent itself always runs in its
+   * claimed task checkout; .pi config still loads from `configCwd`.
    */
   cwd?: string;
-  /**
-   * Last chance to look at an isolated agent's worktree, awaited immediately
-   * before it is committed to a branch and removed.
-   *
-   * Exists because that removal happens inside the settle path, before
-   * `spawnAndWait` resolves: by the time a caller has the finished record, the
-   * directory the child actually wrote in is gone. Anything that must inspect
-   * or verify that tree — a workflow `gate` is the motivating case — has to run
-   * here or it silently inspects the main tree instead.
-   *
-   * Fires only on the normal settle path, and only when a worktree was created.
-   * Not on the error path and not on the stop-during-copy guard: those are
-   * already failing, and delaying cleanup there would leak a copy for no gain.
-   * A rejection is swallowed — the hook can never keep the worktree alive.
-   */
-  onBeforeWorktreeCleanup?: (worktreePath: string) => Promise<void>;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
@@ -303,29 +303,12 @@ interface SpawnOptions {
   rootSessionId?: string;
 }
 
-interface ResumeOptions {
-  /**
-   * Run the resumed turn detached in the background: return immediately with
-   * the record still "running" (or "queued" at the concurrency limit) and
-   * notify on completion via onComplete, exactly like a background spawn.
-   * Default (false/undefined) runs the resume inline and returns the settled
-   * record — the historical behavior.
-   */
+export interface ResumeOptions {
+  onBeforeTaskSettlement?: OnBeforeTaskSettlement;
   isBackground?: boolean;
-  /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
-  /** Called once per assistant message_end with that message's usage delta. */
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
-  /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
-  /**
-   * Background resume only: called synchronously when the run actually starts —
-   * immediately, or later from drainQueue. Callers wire per-run side effects
-   * (output-file streaming) here rather than at the call site, so a resume that
-   * is stopped while still queued never leaves a subscription behind: `abort()`
-   * drops a queued record without reaching `settle()`, which is what would have
-   * torn that subscription down.
-   */
   onStarted?: () => void;
 }
 
@@ -372,14 +355,23 @@ export class AgentManager {
   private parentAbortCleanup = new WeakMap<AgentRecord, () => void>();
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
-  /** Base repos worktrees were created from — so dispose() can prune them all,
-   *  not just the parent repo (caller-supplied cwd can target other repos). */
-  private worktreeRepos = new Set<string>();
+  private binding?: TaskSnapshot;
+  private holders = new WeakMap<AgentRecord, TaskClaimHolder>();
+  private taskHooks = new WeakMap<AgentRecord, OnBeforeTaskSettlement>();
+  private attempts = new Map<AgentRecord, Promise<string>>();
+  private taskAuthorityFixture?: TaskAuthorityFixture;
+  private isDisposing = false;
+  /**
+   * Records whose current settlement error no `waitForAll` has surfaced yet. Each
+   * error rejects the first wait, dispose or session switch after it, and only
+   * that one; the record itself stays retained and listed with the error.
+   */
+  private unreportedSettlements = new Set<AgentRecord>();
 
   /**
    * Startup phases, keyed by agent id. `spawn()` still returns synchronously,
-   * but an agent using worktree isolation is not running yet when it does —
-   * copying the repo is an awaited git call. This is what `awaitStartup` hands
+   * but the agent is not running yet when it does — claiming its task is an
+   * awaited helper request. This is what `awaitStartup` hands
    * callers that must fail their tool call on a startup failure, and what
    * `waitForAll` waits on while a record is "running" with no `promise` yet.
    * Entries are dropped once the run is underway, and kept (rejected) after a
@@ -422,7 +414,12 @@ export class AgentManager {
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
     private isRunActivityEnabled = false,
+    taskAuthorityFixture?: TaskAuthorityFixture,
   ) {
+    if (taskAuthorityFixture) {
+      new TaskAuthority(taskAuthorityFixture);
+      this.taskAuthorityFixture = Object.freeze({ ...taskAuthorityFixture });
+    }
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
@@ -431,6 +428,92 @@ export class AgentManager {
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
+  }
+
+  getTaskBinding(): TaskSnapshot | undefined { return this.binding; }
+
+  setTaskBinding(snapshot?: TaskSnapshot): void {
+    this.binding = snapshot === undefined ? undefined : validateTaskSnapshot(snapshot);
+  }
+
+  async bindTask(repository: string, task_id: string, options: TaskBindOptions = {}): Promise<TaskSnapshot> {
+    const snapshot = await this.captureTaskSnapshot(repository, task_id, options);
+    this.setTaskBinding(snapshot);
+    return snapshot;
+  }
+
+  async captureTaskSnapshot(repository: string, task_id: string, options: TaskBindOptions = {}): Promise<TaskSnapshot> {
+    validateTaskId(task_id);
+    const access = options.access === undefined ? "write" : validateTaskAccess(options.access);
+    const configCwd = options.configCwd ?? repository;
+    assertValidSpawnCwd(repository);
+    assertValidSpawnCwd(configCwd);
+    if (options.base_oid !== undefined && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.base_oid)) {
+      throw new Error("Task binding initialization requires an explicitly resolved full base_oid, not HEAD or a ref");
+    }
+    const authority = new TaskAuthority(this.taskAuthorityFixture);
+    try {
+      if (options.base_oid !== undefined) await authority.ensure(repository, task_id, options.base_oid);
+      const claim = await this.acquireTask({ repository, task_id, generation: 1, access, configCwd }, `bind-${randomUUID()}`, authority);
+      const snapshot = claim.snapshot;
+      await claim.release();
+      return snapshot;
+    } finally {
+      await authority.close();
+    }
+  }
+
+  async finishTask(snapshot: TaskSnapshot, disposition: "complete" | "abandoned", preservation: string): Promise<void> {
+    const { repository, task_id, generation } = validateTaskSnapshot(snapshot);
+    const authority = new TaskAuthority(this.taskAuthorityFixture);
+    try { await authority.finish({ repository, task_id, generation }, disposition, preservation); }
+    finally { await authority.close(); }
+  }
+
+  private captureTask(ctx: ExtensionContext, options: SpawnOptions): TaskRequest {
+    const explicitId = options.task_id === undefined ? undefined : validateTaskId(options.task_id);
+    const supplied = options.taskSnapshot === undefined ? undefined : validateTaskSnapshot(options.taskSnapshot);
+    if (supplied && explicitId !== undefined && supplied.task_id !== explicitId) throw new Error("task_id differs from the captured task snapshot");
+    const snapshot = supplied ?? (options.parentAgentId === undefined && (explicitId === undefined || explicitId === this.binding?.task_id) ? this.binding : undefined);
+    const task_id = explicitId ?? snapshot?.task_id;
+    if (task_id === undefined) throw new Error("Explicit task_id or a captured task binding is required; use /agents task bind");
+    const access = options.task_access === undefined ? snapshot?.access ?? "write" : validateTaskAccess(options.task_access);
+    if (snapshot && access !== snapshot.access) throw new Error("task_access differs from the captured task snapshot; bind explicitly with the required access");
+    const configCwd = options.configCwd ?? snapshot?.configCwd ?? ctx.cwd;
+    assertValidSpawnCwd(configCwd);
+    const captured = snapshot ? validateTaskSnapshot({ ...snapshot, configCwd }) : undefined;
+    return {
+      repository: captured?.repository ?? options.cwd ?? ctx.cwd, task_id, generation: captured?.generation ?? 1,
+      access, configCwd, snapshot: captured,
+    };
+  }
+
+  private async acquireTask(task: TaskRequest, worker_run: string, authority = new TaskAuthority(this.taskAuthorityFixture)): Promise<TaskClaim> {
+    const identity = { repository: task.repository, task_id: task.task_id, generation: task.generation };
+    try {
+      const claimed = await authority.claim(identity, task.access, worker_run);
+      const verified = await authority.verify(identity, claimed.token);
+      const snapshot = validateTaskSnapshot({
+        ...identity, access: task.access, configCwd: task.configCwd,
+        repository_id: verified.repository_id, base_oid: verified.base_oid, checkout: verified.checkout,
+      });
+      if (verified.state !== "open" || claimed.checkout !== verified.checkout || claimed.base_oid !== verified.base_oid || claimed.repository_id !== verified.repository_id ||
+          (task.snapshot && Object.keys(task.snapshot).some(key => snapshot[key as keyof TaskSnapshot] !== task.snapshot![key as keyof TaskSnapshot]))) {
+        throw new Error("Task snapshot identity mismatch; explicit revalidation/binding is required");
+      }
+      return new TaskClaim(authority, snapshot, claimed.token);
+    } catch (error) {
+      try { await authority.close(); } catch {}
+      throw error;
+    }
+  }
+
+  private trackAttempt(record: AgentRecord, promise: Promise<string>): void {
+    record.promise = promise;
+    this.attempts.set(record, promise);
+    const forget = () => { if (this.attempts.get(record) === promise) this.attempts.delete(record); };
+    void promise.then(forget, forget);
+    void promise.catch(() => {});
   }
 
   /** Update the max concurrent background agents limit. */
@@ -485,8 +568,8 @@ export class AgentManager {
    * Spawn an agent and return its ID immediately (for background use).
    * If the concurrency limit is reached, the agent is queued.
    *
-   * The id comes back synchronously, but with `isolation: "worktree"` the agent
-   * is not running yet when it does — the repo copy is an awaited git call.
+   * The id comes back synchronously, but the agent is not running yet when it
+   * does — claiming its task is an awaited helper request.
    * Callers that must fail a tool call on a startup failure await
    * `awaitStartup(id)`; everyone else sees it on the record (status "error").
    */
@@ -497,10 +580,10 @@ export class AgentManager {
     prompt: string,
     options: SpawnOptions,
   ): string {
-    // Validate before the queue branch — a queued spawn should fail at the
-    // call, not minutes later at drain. Throw (not warn): programmatic callers
-    // can fix and retry; the RPC layer converts throws into error envelopes.
+    if (this.isDisposing) throw new Error("Agent manager is disposing");
     assertValidSpawnCwd(options.cwd);
+    const task = this.captureTask(ctx, options);
+    options = { ...options, configCwd: task.configCwd };
 
     // Snapshot the parent's live selection here, synchronously, before the queue
     // branch. `runAgent` can start minutes later at queue drain; reading either
@@ -522,6 +605,7 @@ export class AgentManager {
     const record: AgentRecord = {
       id,
       type,
+      taskSnapshot: task.snapshot,
       // Owned children — nested, or a workflow's — are filtered out of every
       // top-level surface, so no handle: nothing can address them and they must
       // not consume a name a top-level sibling could otherwise take.
@@ -567,6 +651,8 @@ export class AgentManager {
       ?? ctx.sessionManager?.getSessionId?.();
     this.rootSessions.set(record, record.rootSessionId);
     this.agents.set(id, record);
+    this.holders.set(record, {});
+    if (options.onBeforeTaskSettlement) this.taskHooks.set(record, options.onBeforeTaskSettlement);
     // After the insert, so `takenHandles()` already counts this record's own
     // handle — a spawn named after its own type gets `explore-2`, not a
     // duplicate `explore` that would make resolution ambiguous.
@@ -574,7 +660,11 @@ export class AgentManager {
       record.alias = assignHandle(handleBase(options.name), this.takenHandles());
     }
 
-    const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    if (options.signal?.aborted) {
+      record.abortController!.abort(); record.status = "stopped"; record.completedAt = Date.now(); record.promise = Promise.resolve("");
+      return id;
+    }
+    const args: SpawnArgs = { pi, ctx, type, prompt, options, task };
 
     const pool = this.poolFor(record);
     if (pool !== undefined && !options.bypassQueue && !this.poolHasRoom(pool)) {
@@ -621,54 +711,33 @@ export class AgentManager {
     return true;
   }
 
-  /**
-   * Kick off an agent's startup and register it under `startups`. The returned
-   * promise never rejects — the failure is delivered through `awaitStartup`,
-   * and to the record.
-   *
-   * @param queuedPool - The pool this start was QUEUED on, or undefined for an
-   *   immediate start. A queue drain can be minutes after `spawn()` returned,
-   *   and nobody is awaiting `awaitStartup` by then, so a failure has to live
-   *   on the record as status "error" — what drainQueue did when the throw was
-   *   still synchronous. An immediate start instead drops the record, exactly
-   *   as the throw out of `spawn()` did: no orphan in `listAgents()`, and the
-   *   handle goes back.
-   */
   private launch(id: string, record: AgentRecord, args: SpawnArgs, queuedPool: Pool | undefined): Promise<void> {
-    const startup = this.startAgent(id, record, args).then(
-      () => { this.startups.delete(id); },
-      (err) => {
-        this.parentAbortCleanup.get(record)?.();
-        this.startups.delete(id);
-        if (queuedPool !== undefined) {
-          // Mirrors settleRun: an inline caller gets this failure as a throw
-          // out of spawnAndWait, so an unconsumed record would ALSO nudge the
-          // session about it — the same failure reported twice.
-          if (queuedPool === "foreground") record.resultConsumed = true;
-          record.status = "error";
-          record.error = err instanceof Error ? err.message : String(err);
-          record.completedAt = Date.now();
-          this.finishRun(record);
-        } else {
-          this.agents.delete(id);
-        }
-        // The agent never kept its slot (startAgent gives it back on failure),
-        // so anything queued behind it can go now.
-        this.drainQueue();
-        throw err;
-      },
-    );
+    let started!: () => void;
+    let failed!: (error: unknown) => void;
+    let isStarted = false;
+    const startup = new Promise<void>((resolve, reject) => { started = resolve; failed = reject; });
     this.startups.set(id, startup);
-    // Nothing is obliged to await `startups` — swallow the rejection once here
-    // so an unawaited startup can't take the process down, and hand callers
-    // (drainQueue) that swallowed promise.
+    const attempt = this.startAgent(id, record, args, () => { isStarted = true; this.startups.delete(id); started(); }, queuedPool !== undefined);
+    this.trackAttempt(record, attempt);
+    void attempt.catch(error => {
+      if (!isStarted) {
+        record.status = "error";
+        record.error = error instanceof Error ? error.message : String(error);
+        record.completedAt ??= Date.now();
+        if (queuedPool === "foreground") record.resultConsumed = true;
+        failed(error);
+        if (queuedPool === undefined && !record.taskSettlementError) {
+          this.agents.delete(id);
+          this.startups.delete(id);
+        }
+      }
+    });
     return startup.catch(() => {});
   }
 
   /**
-   * Resolves once the agent is actually running, and rejects with the startup
-   * failure (strict worktree isolation) that `spawn()` used to throw before the
-   * repo copy became async. Resolves immediately for an agent that is already
+   * Resolves once the agent is actually running, and rejects with its startup
+   * failure (a task claim that fails, such as TaskBusy). Resolves immediately for an agent that is already
    * running, still queued, or unknown — so callers can await it unconditionally.
    *
    * Call it in the same tick as the `spawn()` it belongs to: a failed startup
@@ -678,100 +747,37 @@ export class AgentManager {
     return this.startups.get(id) ?? Promise.resolve();
   }
 
-  /** Actually start an agent (called immediately or from queue drain). */
   private async startAgent(
     id: string,
     record: AgentRecord,
-    { pi, ctx, type, prompt, options }: SpawnArgs,
-  ) {
-    // Re-validate a caller-supplied cwd: queued spawns can start minutes after
-    // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
-    // curated errors; drainQueue parks a throw on the record as an error.
-    assertValidSpawnCwd(options.cwd);
-    // Single resolution point for the caller-supplied cwd — the worktree base
-    // repo and both cleanup calls below MUST agree on this value forever.
-    const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
-    const baseCwd = customCwd ?? ctx.cwd;
-
-    // Take the running state — and with it the concurrency slot — BEFORE the
-    // first await. Creating a worktree is an awaited git call, and drainQueue
-    // reads the pool counters synchronously in a loop: incrementing after the
-    // await would let it start every queued agent at once while the first is
-    // still copying its repo. Claiming "running" here also keeps abort() and
-    // abortAll() able to reach an agent whose worktree is still being created.
-    //
-    // The pool is resolved ONCE, here, and carried to `settleRun` below:
-    // `poolFor` reads `maxConcurrentForeground`, which the user can change from
-    // `/agents → Settings` mid-run, so recomputing it at settle time would
-    // decrement a pool this run never charged (counter underflow, limit
-    // silently lifted) or skip the decrement for one it did (leaked slot —
-    // every later blocking spawn queues forever). The two startup exits below
-    // never reach `settleRun`, so they hand the slot back themselves.
+    { pi, ctx, type, prompt, options, task }: SpawnArgs,
+    started: () => void,
+    isQueued: boolean,
+  ): Promise<string> {
     const pool = this.poolFor(record);
-    const releaseSlot = () => {
-      if (pool === "background") this.runningBackground--;
-      else if (pool === "foreground") this.runningForeground--;
-    };
     record.status = "running";
     record.startedAt = Date.now();
     record.startGate = undefined;
     if (pool === "background") this.runningBackground++;
     else if (pool === "foreground") this.runningForeground++;
-
-    // Worktree isolation: try to create a temporary git worktree. Strict —
-    // fail loud if not possible (no silent fallback to main tree). Done BEFORE
-    // the run is kicked off so a failure doesn't leave a half-running agent.
-    // The project switch is enforced here as well as at the tool boundary
-    // because cross-extension RPC forwards its options unvalidated — a schema
-    // that omits the field can't stop a caller that never saw the schema.
-    let worktreeCwd: string | undefined;
-    if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
-      if (!wt) {
-        releaseSlot();
-        throw new Error(
-          'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
-          'Initialize git and commit at least once, or omit `isolation`.',
-        );
-      }
-      record.worktree = wt;
-      // workPath preserves subdirectory scoping for caller-supplied cwds: a
-      // cwd deep in a monorepo maps to the same subdir inside the copy, not
-      // the copied repo's root. Plain worktree spawns keep the historical
-      // behavior (agent at the copy's root) — moving them to workPath would
-      // also move .pi config discovery when the parent session sits in a repo
-      // subdirectory, silently dropping extensions/skills.
-      worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
-      this.worktreeRepos.add(baseCwd);
-
-      // No longer "running" means a stop landed while the copy was being made
-      // (abort(), abortAll()) — a window that did not exist when creation was
-      // synchronous. The record is already terminal, so launching the run would
-      // burn tokens on work nobody is waiting for: discard the fresh (and by
-      // definition unchanged) worktree instead.
-      if (record.status !== "running") {
-        releaseSlot();
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
-        this.drainQueue();
-        return;
-      }
-    }
-
     this.armRunningAbort(record, options.signal);
-    if (!record.abortController!.signal.aborted) this.startRun(record);
-    const detach = () => this.parentAbortCleanup.get(record)?.();
-    if (record.abortController!.signal.aborted) {
-      detach();
-      if (record.worktree) {
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-      }
-      record.promise = Promise.resolve("");
-      this.settleRun(record, true, pool);
+    const holder = this.holders.get(record)!;
+    let claim: TaskClaim | undefined;
+    let isLaunched = false;
+    let isPreLaunchFailure = false;
+    try {
+      assertValidSpawnCwd(options.cwd);
+      if (record.abortController!.signal.aborted) { started(); return ""; }
+      claim = await this.acquireTask(task, id);
+      record.taskSnapshot = claim.snapshot;
+      holder.current = claim;
+      if (record.abortController!.signal.aborted || this.isStopped(record)) { started(); return ""; }
+      this.startRun(record);
+      if (record.abortController!.signal.aborted || this.isStopped(record)) { started(); return ""; }
       options.onSpawned?.(id);
-      return;
-    }
-
-    const promise = runAgent(ctx, type, prompt, {
+      if (record.abortController!.signal.aborted || this.isStopped(record)) { started(); return ""; }
+      isLaunched = true;
+      const worker = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
       model: options.model,
@@ -783,16 +789,10 @@ export class AgentManager {
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,
       workflow: options.workflowId !== undefined,
-      // Worktree wins for the working dir (the agent must run in the copy —
-      // which, with a custom cwd, was created from that target). Config stays
-      // with the parent project when a caller-supplied cwd is in play; it must
-      // stay undefined otherwise so plain worktree runs keep resolving config
-      // (incl. relative extension paths and memory) inside the worktree copy.
-      cwd: worktreeCwd ?? customCwd,
-      // Set iff a worktree was created (see above) — names the directory the
-      // copy came from, so the prompt can tell the agent not to work there.
-      worktreeBase: worktreeCwd ? baseCwd : undefined,
-      configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
+      cwd: claim.snapshot.checkout,
+      worktreeBase: claim.snapshot.repository,
+      configCwd: task.configCwd,
+      taskClaimHolder: holder,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -858,106 +858,70 @@ export class AgentManager {
         }
         options.onSessionCreated?.(session);
       },
-    })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
-          // Precedence: a hard abort keeps "aborted"; then a failed final turn
-          // (provider error that pi resolved instead of rejecting, #144) is an
-          // honest "error" — not a completion with an empty or stale result.
-          if (aborted) {
-            record.status = "aborted";
-          } else if (failure) {
-            record.status = "error";
-            record.error = failure;
-          } else {
-            record.status = steered ? "steered" : "completed";
-          }
-        }
-        record.result = responseText;
-        // Kept beside `result`, never inside it: `result` is prose meant for a
-        // reader — it is previewed, transcribed, and appended to below — while
-        // this is a machine-readable payload one caller asked for by schema.
-        record.structuredJson = structuredJson;
-        record.structuredRetried = structuredRetried;
-        record.session = session;
-        record.completedAt ??= Date.now();
-
-        detach();
-
-        // Final flush of streaming output file
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
-        }
-
-        // Clean up worktree if used
-        if (record.worktree) {
-          // The one moment the child's tree still exists and the child is done
-          // writing to it. try/catch, not decoration: a hook that throws must
-          // not leave the worktree behind.
-          if (options.onBeforeWorktreeCleanup) {
-            try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
-            } catch { /* ignore — never block cleanup */ }
-          }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
-            // With a caller-supplied cwd the branch lives in THAT repo, not the
-            // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
-            // Appended to the prose only. A structured child's caller parses
-            // `structuredJson`, which stays untouched — but `result` is also
-            // what a human reads, so the note still belongs on it.
-            record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
-          }
-        }
-
-        this.abortOwnedChildren(id);
-
-        this.settleRun(record, true, pool);
-        return responseText;
-      })
-      .catch(async (err) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
-          record.status = "error";
-        }
-        record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt ??= Date.now();
-
-        detach();
-
-        // Final flush of streaming output file on error
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
-        }
-
-        // Best-effort worktree cleanup on error
-        if (record.worktree) {
-          try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
-          } catch { /* ignore cleanup errors */ }
-        }
-
-        this.abortOwnedChildren(id);
-
-        this.settleRun(record, false, pool);
-        return "";
       });
+      started();
+      try {
+        const result = await worker;
+        if (!this.isStopped(record)) {
+          record.status = result.aborted ? "aborted" : result.failure ? "error" : result.steered ? "steered" : "completed";
+          if (result.failure) record.error = result.failure;
+        }
+        record.result = result.responseText;
+        record.session = result.session;
+        record.structuredJson = result.structuredJson;
+        record.structuredRetried = result.structuredRetried;
+      } catch (error) {
+        if (!this.isStopped(record)) record.status = "error";
+        record.error = error instanceof Error ? error.message : String(error);
+        record.result = "";
+      }
+      return record.result ?? "";
+    } catch (error) {
+      isPreLaunchFailure = true;
+      record.error = error instanceof Error ? error.message : String(error);
+      if (!this.isStopped(record)) record.status = "error";
+      throw error;
+    } finally {
+      try { if (claim) await this.settleTask(record, claim, isLaunched); }
+      finally {
+        this.parentAbortCleanup.get(record)?.();
+        record.completedAt ??= Date.now();
+        this.flushOutput(record);
+        // An immediate spawn that fails before launch reaches its caller as a throw
+        // and its record is dropped; presenting it too would report it twice. A
+        // queued one has no caller left, so its failure is presented as before.
+        this.settleRun(record, true, pool, isQueued || !isPreLaunchFailure);
+      }
+    }
+  }
 
-    record.promise = promise;
+  private async settleTask(record: AgentRecord, claim: TaskClaim, isLaunched: boolean): Promise<void> {
+    const failures: unknown[] = [];
+    const phases: NonNullable<TaskClaimHolder["recovery"]>["phases"] = [];
+    try { await this.abortOwnedChildren(record.id); }
+    catch (error) { failures.push(error); phases.push("children"); }
+    if (!failures.length && isLaunched) {
+      try { await this.taskHooks.get(record)?.(claim, record); }
+      catch (error) { failures.push(error); phases.push("hook"); }
+    }
+    const holder = this.holders.get(record)!;
+    holder.current = undefined;
+    try { await claim.release(); } catch (error) { failures.push(error); phases.push("release"); }
+    try { await claim.authority.close(); } catch (error) { failures.push(error); phases.push("close"); }
+    if (failures.length) {
+      record.taskSettlementError = failures.map(error => (error instanceof Error ? error.message : String(error)).replaceAll(claim.token, "[redacted]")).join("; ");
+      holder.recovery = { snapshot: claim.snapshot, phases, error: record.taskSettlementError };
+      this.unreportedSettlements.add(record);
+      record.status = "error";
+      record.error = record.error ? `${record.error}; Task settlement failed: ${record.taskSettlementError}` : `Task settlement failed: ${record.taskSettlementError}`;
+      throw new AggregateError(failures, record.taskSettlementError);
+    }
+  }
 
-    // Notify caller that spawn is complete (record is in the map, promise is set).
-    // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
-    // Used by spawnAndWait to let the caller set up output files before streaming
-    // starts. Read off the options, so a spawn that started from a queue drain
-    // still reaches the caller that queued it.
-    options.onSpawned?.(id);
+  private isStopped(record: AgentRecord): boolean { return record.status === "stopped"; }
+
+  private flushOutput(record: AgentRecord): void {
+    if (record.outputCleanup) { try { record.outputCleanup(); } catch {} record.outputCleanup = undefined; }
   }
 
   private armRunningAbort(record: AgentRecord, signal?: AbortSignal): void {
@@ -1006,33 +970,15 @@ export class AgentManager {
     } else if (isPresentation) this.onComplete?.(record);
   }
 
-  /**
-   * The shared tail of both settle paths: release whatever pool slot the run
-   * held, notify, and let the queue drain into the freed slot.
-   *
-   * The decrement lives HERE and nowhere else. `abort()` on a running record
-   * only fires its controller and leaves the run to settle normally, so
-   * decrementing there too would double-free — permanently lifting the limit.
-   *
-   * Foreground agents fire `onComplete` for lifecycle symmetry, with
-   * `resultConsumed` set so the callback skips notifications the inline result
-   * already delivered.
-   *
-   * @param guardCallback swallow a throwing `onComplete` (the success path does;
-   *   the error path historically did not, and keeps not doing so).
-   * @param pool the pool this run was CHARGED TO at start time — passed in, not
-   *   recomputed, so a mid-run change to `maxConcurrentForeground` can't make
-   *   the release disagree with the acquire.
-   */
-  private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
+  private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined, isPresentation = true): void {
     if (!record.isBackground) record.resultConsumed = true;
     if (pool === "background") this.runningBackground--;
     else if (pool === "foreground") this.runningForeground--;
 
     if (guardCallback) {
-      try { this.finishRun(record); } catch {}
+      try { this.finishRun(record, isPresentation); } catch {}
     } else {
-      this.finishRun(record);
+      this.finishRun(record, isPresentation);
     }
 
     // The isBackground half reproduces the pre-pool condition exactly — a
@@ -1050,21 +996,24 @@ export class AgentManager {
    * parent would burn tokens unseen with no way to reach it. Grandchildren are
    * covered transitively — each abort lands in that child's own settle path.
    */
-  private abortOwnedChildren(parentId: string): void {
+  private async abortOwnedChildren(parentId: string): Promise<void> {
+    const pending: Promise<string>[] = [];
     for (const [id, record] of this.agents) {
-      if (record.parentAgentId === parentId) this.abort(id);
+      if (record.parentAgentId !== parentId) continue;
+      this.abort(id);
+      const attempt = this.attempts.get(record);
+      if (attempt) pending.push(attempt);
     }
+    const results = await Promise.allSettled(pending);
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    for (const record of this.agents.values()) {
+      if (record.parentAgentId === parentId && record.taskSettlementError) failures.push(new Error(record.taskSettlementError));
+    }
+    if (failures.length) throw new AggregateError(failures, failures.map(error => error instanceof Error ? error.message : String(error)).join("; "));
   }
 
-  /**
-   * Start queued agents up to each pool's concurrency limit.
-   *
-   * `findIndex` on the entry's OWN pool rather than `shift`: with one queue
-   * serving two independent limits, a saturated foreground pool at the head
-   * would otherwise stall every background agent behind it. Taking the earliest
-   * eligible entry keeps FIFO within each pool, which is what callers see.
-   */
   private drainQueue() {
+    if (this.isDisposing) return;
     for (;;) {
       const i = this.queue.findIndex(e => this.poolHasRoom(e.pool));
       if (i === -1) return;
@@ -1126,16 +1075,16 @@ export class AgentManager {
     // tool `execute` and take down pi's whole Promise.all tool batch.
     if (record.status === "queued") await record.startGate;
 
-    // The run promise only exists once startup is past its awaited repo copy —
+    // The run promise only exists once startup is past its awaited task claim —
     // without this the call would return before the agent had started at all.
-    // A startup failure (strict worktree isolation) rejects here, which is what
+    // A startup failure (such as TaskBusy) rejects here, which is what
     // the immediate path owes its caller: pi only marks a tool result failed
     // when `execute` throws. A queued spawn's failure landed on the record
     // instead (nobody was awaiting `startups` at drain time) and is rethrown
     // below, so the contract is the same either way.
     await this.awaitStartup(id);
 
-    // undefined when it was aborted while queued, or stopped mid-copy, and so
+    // undefined when it was aborted while queued, or stopped mid-claim, and so
     // never ran — the record is already terminal with a completedAt, which is
     // what the caller renders.
     if (record.promise) await record.promise;
@@ -1150,199 +1099,96 @@ export class AgentManager {
     return { id, record };
   }
 
-  /**
-   * Resume an existing agent session with a new prompt.
-   */
-  async resume(
-    id: string,
-    prompt: string,
-    signal?: AbortSignal,
-    options?: ResumeOptions,
-  ): Promise<AgentRecord | undefined> {
+  async resume(id: string, prompt: string, signal?: AbortSignal, options: ResumeOptions = {}): Promise<AgentRecord | undefined> {
+    if (this.isDisposing) throw new Error("Agent manager is disposing");
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
-    if (record.status === "running" || record.status === "queued" || this.runs.has(record)) return undefined;
-
-    if (options?.isBackground) {
-      record.isBackground = true;
-      record.resultConsumed = false;
-      record.result = undefined;
-      record.error = undefined;
-      record.completedAt = undefined;
-      record.status = "queued";
-
-      if (!this.armQueuedAbort(id, signal)) return record;
-      const start = () => this.startResume(id, record, prompt, signal, options);
-      if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
-        // At the concurrency limit — queue it, drains when a slot frees. A
-        // detached resume has no inline caller, hence nothing to release. The
-        // queue is shared with spawns, whose startup is async, so entries are
-        // promise-shaped even though a resume starts synchronously; failures
-        // land on the record here, since drainQueue no longer catches.
-        this.queue.push({
-          id,
-          pool: "background",
-          start: async () => {
-            try {
-              start();
-            } catch (err) {
-              record.status = "error";
-              record.error = err instanceof Error ? err.message : String(err);
-              record.completedAt = Date.now();
-              this.finishRun(record);
-            }
-          },
-          release: () => {},
-        });
-      } else {
-        start();
-      }
-      return record;
-    }
-
+    if (record.status === "running" || record.status === "queued" || this.attempts.has(record) || this.runs.has(record)) return undefined;
+    if (!record.taskSnapshot) throw new Error("Cannot resume a legacy record without a captured task snapshot; explicitly bind/reopen its task");
+    const snapshot = validateTaskSnapshot(record.taskSnapshot);
+    if (options.onBeforeTaskSettlement) this.taskHooks.set(record, options.onBeforeTaskSettlement);
+    record.abortController = new AbortController();
+    record.result = undefined; record.error = undefined; record.completedAt = undefined;
     if (signal?.aborted) {
-      record.status = "stopped";
-      record.result = undefined;
-      record.error = undefined;
-      record.completedAt = Date.now();
+      record.abortController.abort(); record.status = "stopped"; record.completedAt = Date.now(); record.promise = Promise.resolve("");
       return record;
     }
-
-    record.status = "running";
-    record.startedAt = Date.now();
-    record.completedAt = undefined;
-    record.result = undefined;
-    record.error = undefined;
-    const abortController = new AbortController();
-    record.abortController = abortController;
-    this.armRunningAbort(record, signal);
-    this.startRun(record, false);
-
-    try {
-      if (abortController.signal.aborted) return record;
-      const { text, failure } = await resumeAgent(record.session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-          options?.onToolActivity?.(activity);
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-          this.onUsage?.(record, usage);
-          options?.onAssistantUsage?.(usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-          options?.onCompaction?.(info);
-        },
-        signal: abortController.signal,
-      });
-      if (!abortController.signal.aborted) {
-        record.status = failure ? "error" : "completed";
-        if (failure) record.error = failure;
+    if (options.isBackground) {
+      record.isBackground = true; record.resultConsumed = false; record.status = "queued"; record.promise = undefined;
+      if (!this.armQueuedAbort(id, signal)) return record;
+      if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
+        let release!: () => void;
+        record.startGate = new Promise<void>(resolve => { release = resolve; });
+        this.queue.push({ id, pool: "background", start: () => this.launchResume(record, snapshot, prompt, signal, options, true), release });
+        return record;
       }
-      record.result = text;
-      record.completedAt = Date.now();
-    } catch (err) {
-      if (!abortController.signal.aborted) {
-        record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
-      }
-      record.completedAt ??= Date.now();
-    } finally {
-      this.parentAbortCleanup.get(record)?.();
-      this.finishRun(record, false);
-      this.abortOwnedChildren(id);
+      await this.launchResume(record, snapshot, prompt, signal, options, true);
+      return record;
     }
-
+    await this.launchResume(record, snapshot, prompt, signal, options, false);
+    await record.promise;
     return record;
   }
 
-  /**
-   * Start a background resume run: detached, settling and notifying like
-   * startAgent's background path. Invoked immediately, or from drainQueue when
-   * a concurrency slot frees. The session already exists (resume reuses it), so
-   * there is no onSessionCreated to hang per-run wiring off — callers use
-   * `options.onStarted`, which fires on both the immediate and the drained path.
-   */
-  private startResume(
-    id: string,
-    record: AgentRecord,
-    prompt: string,
-    parentSignal: AbortSignal | undefined,
-    options: ResumeOptions,
-  ) {
-    if (!record.session) return;
+  private launchResume(record: AgentRecord, snapshot: TaskSnapshot, prompt: string, parentSignal: AbortSignal | undefined, options: ResumeOptions, isPresentation: boolean): Promise<void> {
+    let started!: () => void;
+    let failed!: (error: unknown) => void;
+    let isStarted = false;
+    const startup = new Promise<void>((resolve, reject) => { started = resolve; failed = reject; });
+    this.startups.set(record.id, startup);
+    const attempt = this.startResume(record, snapshot, prompt, parentSignal, options, isPresentation, () => { isStarted = true; this.startups.delete(record.id); started(); });
+    this.trackAttempt(record, attempt);
+    void attempt.catch(error => { if (!isStarted) failed(error); });
+    return startup;
+  }
 
-    record.status = "running";
-    record.startedAt = Date.now();
-    if (occupiesPoolSlot(record)) this.runningBackground++;
-
-    const abortController = new AbortController();
-    record.abortController = abortController;
+  private async startResume(record: AgentRecord, snapshot: TaskSnapshot, prompt: string, parentSignal: AbortSignal | undefined, options: ResumeOptions, isPresentation: boolean, started: () => void): Promise<string> {
+    const pool = isPresentation && occupiesPoolSlot(record) ? "background" : undefined;
+    record.status = "running"; record.startedAt = Date.now(); record.startGate = undefined;
+    if (pool === "background") this.runningBackground++;
     this.armRunningAbort(record, parentSignal);
-    this.startRun(record);
-    try { options.onStarted?.(); } catch {}
-
-    const settle = () => {
-      this.parentAbortCleanup.get(record)?.();
-      if (record.outputCleanup) {
-        try { record.outputCleanup(); } catch {}
-        record.outputCleanup = undefined;
-      }
-      this.abortOwnedChildren(id);
-      if (occupiesPoolSlot(record)) this.runningBackground--;
-      try { this.finishRun(record); } catch {}
-      this.drainQueue();
-    };
-
-    if (abortController.signal.aborted) {
-      record.promise = Promise.resolve("");
-      settle();
-      return;
-    }
-
-    const promise = resumeAgent(record.session, prompt, {
-      onToolActivity: (activity) => {
-        if (activity.type === "end") record.toolUses++;
-        options.onToolActivity?.(activity);
-      },
-      onAssistantUsage: (usage) => {
-        addUsage(record.lifetimeUsage, usage);
-        this.onUsage?.(record, usage);
-        options.onAssistantUsage?.(usage);
-      },
-      onCompaction: (info) => {
-        record.compactionCount++;
-        this.onCompact?.(record, info);
-        options.onCompaction?.(info);
-      },
-      signal: abortController.signal,
-    })
-      .then(({ text, failure }) => {
-        // Don't overwrite status if externally stopped via abort().
-        if (record.status !== "stopped") {
-          // Same contract as the spawn path (#144): a failed final turn is an
-          // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
-        }
-        record.result = text;
-        record.completedAt ??= Date.now();
-        settle();
-        return text;
-      })
-      .catch((err) => {
-        if (record.status !== "stopped") {
-          record.status = "error";
-          record.error = err instanceof Error ? err.message : String(err);
-        }
-        record.completedAt ??= Date.now();
-        settle();
-        return "";
+    const holder = this.holders.get(record) ?? {};
+    this.holders.set(record, holder);
+    let claim: TaskClaim | undefined;
+    let isLaunched = false;
+    try {
+      if (record.abortController!.signal.aborted) { started(); return ""; }
+      claim = await this.acquireTask({ ...snapshot, snapshot }, `${record.id}-${randomUUID()}`);
+      record.taskSettlementError = undefined;
+      this.unreportedSettlements.delete(record);
+      holder.recovery = undefined;
+      holder.current = claim;
+      if (record.abortController!.signal.aborted || this.isStopped(record)) { started(); return ""; }
+      this.startRun(record, isPresentation);
+      if (record.abortController!.signal.aborted || this.isStopped(record)) { started(); return ""; }
+      try { options.onStarted?.(); } catch {}
+      if (record.abortController!.signal.aborted || this.isStopped(record)) { started(); return ""; }
+      isLaunched = true;
+      const worker = resumeAgent(record.session!, prompt, {
+        onToolActivity: activity => { if (activity.type === "end") record.toolUses++; options.onToolActivity?.(activity); },
+        onAssistantUsage: usage => { addUsage(record.lifetimeUsage, usage); this.onUsage?.(record, usage); options.onAssistantUsage?.(usage); },
+        onCompaction: info => { record.compactionCount++; this.onCompact?.(record, info); options.onCompaction?.(info); },
+        signal: record.abortController!.signal,
       });
-
-    record.promise = promise;
+      started();
+      try {
+        const result = await worker;
+        if (!this.isStopped(record)) { record.status = result.failure ? "error" : "completed"; if (result.failure) record.error = result.failure; }
+        record.result = result.text;
+      } catch (error) {
+        if (!this.isStopped(record)) record.status = "error";
+        record.error = error instanceof Error ? error.message : String(error); record.result = "";
+      }
+      return record.result ?? "";
+    } catch (error) {
+      record.status = "error"; record.error = error instanceof Error ? error.message : String(error); throw error;
+    } finally {
+      try { if (claim) await this.settleTask(record, claim, isLaunched); }
+      finally {
+        this.parentAbortCleanup.get(record)?.(); record.completedAt ??= Date.now(); this.flushOutput(record);
+        this.settleRun(record, true, pool, isPresentation);
+      }
+    }
   }
 
   /**
@@ -1456,7 +1302,13 @@ export class AgentManager {
       return true;
     }
 
-    if (record.status !== "running") return false;
+    // A finished worker can still be settling (hook, gate, children, helper
+    // release). Its settlement work is cancelled and still awaited, but its
+    // status is the worker's outcome: only running or queued records stop.
+    if (record.status !== "running") {
+      if (this.attempts.has(record)) record.abortController?.abort();
+      return false;
+    }
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
@@ -1464,8 +1316,8 @@ export class AgentManager {
     return true;
   }
 
-  /** Dispose a record's session and remove it from the map. */
-  private removeRecord(id: string, record: AgentRecord): void {
+  private removeRecord(id: string, record: AgentRecord, isSettlementFailureRemovable = false): void {
+    if (this.attempts.has(record) || (record.taskSettlementError && !isSettlementFailureRemovable)) return;
     this.tombstone(record);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
@@ -1496,6 +1348,7 @@ export class AgentManager {
       type: record.type,
       description: record.description,
       sessionFile: record.sessionFile,
+      taskSnapshot: record.taskSnapshot === undefined ? undefined : validateTaskSnapshot(record.taskSnapshot),
       completedAt: record.completedAt ?? Date.now(),
     });
     // Bound the memory a long session can accumulate. Oldest first, since the
@@ -1509,41 +1362,32 @@ export class AgentManager {
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (record.status === "running" || record.status === "queued" || this.attempts.has(record)) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
   }
 
   /**
-   * Remove all completed/stopped/errored records immediately.
-   * Called on session start/switch so tasks from a prior session don't persist.
-   * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
-   * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
+   * Drop finished records. A record with a settlement error is retained, except at
+   * a successful session switch (`isSessionSwitch`) once its error was reported:
+   * the helper's durable recovery state on disk stays authoritative.
    */
-  clearCompleted(skipUnconsumed = false): void {
+  clearCompleted(skipUnconsumed = false, isSessionSwitch = false): void {
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (record.status === "running" || record.status === "queued" || this.attempts.has(record)) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
-      this.removeRecord(id, record);
+      this.removeRecord(id, record, isSessionSwitch);
     }
-    // Unconditional: both callers are session boundaries (`session_start` and
-    // `session_before_switch`), and `skipUnconsumed` only spares records whose
-    // results the LLM has yet to read — it does not make the sweep partial in
-    // the sense that matters here. A new session means new handles, or
-    // `@explore` would silently reach an agent the user never started. Claude
-    // Code resets its registry on `/clear` for the same reason.
     this.tombstones.clear();
   }
 
-  /** Whether any agents are still running or queued. */
   hasRunning(): boolean {
-    return [...this.agents.values()].some(
+    return this.attempts.size > 0 || [...this.agents.values()].some(
       r => r.status === "running" || r.status === "queued",
     );
   }
 
-  /** Abort all running and queued agents immediately. */
   abortAll(): number {
     let count = 0;
     // Clear queued agents first
@@ -1558,6 +1402,8 @@ export class AgentManager {
     this.dequeue(() => true);
     for (const record of this.agents.values()) {
       this.parentAbortCleanup.get(record)?.();
+      // Same rule as abort(): a settling record's work is cancelled, its status kept.
+      if (record.status !== "running" && this.attempts.has(record)) record.abortController?.abort();
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
@@ -1569,47 +1415,34 @@ export class AgentManager {
     return count;
   }
 
-  /** Wait for all running and queued agents to complete (including queued ones). */
   async waitForAll(): Promise<void> {
-    // Loop because drainQueue respects the concurrency limit — as running
-    // agents finish they start queued ones, which need awaiting too.
-    while (true) {
+    const failures: unknown[] = [];
+    while (this.attempts.size || this.queue.length) {
       this.drainQueue();
-      const pending: Promise<unknown>[] = [];
-      for (const record of this.agents.values()) {
-        if (record.status !== "running" && record.status !== "queued") continue;
-        // An agent whose worktree is still being created is "running" with no
-        // `promise` yet — without its startup the wait would return too early.
-        const startup = this.startups.get(record.id);
-        if (startup) pending.push(startup);
-        if (record.promise) pending.push(record.promise);
-      }
-      if (pending.length === 0) break;
-      await Promise.allSettled(pending);
+      const attempts = [...this.attempts.entries()];
+      const pending: Promise<unknown>[] = attempts.map(([, attempt]) => attempt);
+      for (const entry of this.queue) { const gate = this.agents.get(entry.id)?.startGate; if (gate) pending.push(gate); }
+      if (!pending.length) break;
+      const results = await Promise.allSettled(pending);
+      results.forEach((result, index) => {
+        // A settlement failure is reported once, from its record, below.
+        if (result.status === "rejected" && !attempts[index]?.[0].taskSettlementError) failures.push(result.reason);
+      });
     }
+    for (const record of this.unreportedSettlements) failures.push(new Error(record.taskSettlementError));
+    this.unreportedSettlements.clear();
+    if (failures.length) throw new AggregateError(failures, failures.map(error => error instanceof Error ? error.message : String(error)).join("; "));
   }
 
-  async dispose(pi?: ExtensionAPI): Promise<void> {
+  async dispose(_pi?: ExtensionAPI): Promise<void> {
     clearInterval(this.cleanupInterval);
-    this.abortAll();
-    this.dequeue(() => true);
-    const sessions = [...this.agents.values()].map(record => record.session);
-    this.agents.clear();
-    this.startups.clear();
-    if (pi) {
-      // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
-      // on the shutdown path, which cannot wait for git. Started before the awaited
-      // shutdown below rather than after it, so the git calls have that window to
-      // finish in instead of racing the process exit that follows.
-      const prune = (repo: string) => { pruneWorktrees(pi, repo).catch(() => {}); };
-      prune(process.cwd());
-      // Also prune repos that caller-supplied cwds created worktrees in — a clean
-      // exit with in-flight agents would otherwise leave stale registrations there.
-      for (const repo of this.worktreeRepos) prune(repo);
+    this.isDisposing = true;
+    this.abortAll(); this.dequeue(() => true);
+    try { await this.waitForAll(); }
+    finally {
+      const sessions = [...this.agents.values()].map(record => record.session);
+      await Promise.all(sessions.map(shutdownChildSession));
     }
-    // Awaited, unlike the eviction path: pi awaits this extension's `session_shutdown`
-    // handler and the process exits right after it returns, so anything left unawaited
-    // here never runs at all. Bounded — each call carries its own ceiling, concurrently.
-    await Promise.all(sessions.map(session => shutdownChildSession(session)));
+    this.agents.clear(); this.startups.clear(); this.unreportedSettlements.clear(); this.binding = undefined;
   }
 }

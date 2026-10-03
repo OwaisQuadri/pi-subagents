@@ -1,20 +1,5 @@
-/**
- * task.ts — the background record one workflow run lives in.
- *
- * A `SubagentWorkflow` tool call returns a task id immediately and the run continues
- * without it, so the run's state cannot live in the tool call's closure: the
- * inline card, the completion notification and (later) the `/agents → Workflows` dialog
- * all read it after `execute` has returned. This is that record, shaped after
- * Claude Code's `local_workflow` task so the fields line up with what the
- * renderers already expect.
- *
- * The progress log is append-only and collapses by index (see `progress.ts`),
- * so every derived counter here is recomputed from the log rather than
- * incremented as entries arrive — a re-emitted agent entry replaces its
- * predecessor, and adding its tokens on top would double-count them.
- */
-
 import { randomUUID } from "node:crypto";
+import { type TaskSnapshot, validateTaskSnapshot } from "../task-worktree.js";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
@@ -27,6 +12,8 @@ export function workflowRunId(): string {
 }
 
 export interface WorkflowTask {
+  taskSnapshot?: TaskSnapshot;
+  settlement?: Promise<void>;
   /** Discriminator, alongside Claude Code's `local_agent` / `local_bash`. */
   type: "local_workflow";
   id: string;
@@ -89,6 +76,7 @@ export interface WorkflowTask {
 }
 
 export function createWorkflowTask(init: {
+  taskSnapshot?: TaskSnapshot;
   id: string;
   script: string;
   scriptPath?: string;
@@ -102,6 +90,7 @@ export function createWorkflowTask(init: {
 }): WorkflowTask {
   return {
     type: "local_workflow",
+    taskSnapshot: init.taskSnapshot === undefined ? undefined : validateTaskSnapshot(init.taskSnapshot),
     id: init.id,
     status: "running",
     script: init.script,

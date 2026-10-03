@@ -11,6 +11,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -37,6 +41,7 @@ function agentTool() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
+  wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
   subagentsExtension(pi);
   return tools.get("Agent");
 }
@@ -60,7 +65,7 @@ function ctx() {
 
 /** What a child session reports about itself once pi has resolved it. */
 function session(provider: string, id: string, thinkingLevel: string, name?: string) {
-  return { model: { provider, id, name: name ?? MODEL_NAMES[id] }, thinkingLevel, dispose: vi.fn() } as never;
+  return { model: { provider, id, name: name ?? MODEL_NAMES[id] }, thinkingLevel, messages: [], subscribe: () => () => {}, dispose: vi.fn() } as never;
 }
 
 const MODELS = [
@@ -215,7 +220,7 @@ describe("Agent tool result — effective model", () => {
   it("shows explicit thinking despite a conflicting definition pin", async () => {
     pinnedAgent("thinking: low\n");
     const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
 
     const result = await tool.execute(
       "tc-4",
@@ -232,7 +237,7 @@ describe("Agent tool result — effective model", () => {
   it("shows the explicit model despite a conflicting definition pin", async () => {
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
 
     const result = await tool.execute(
       "tc-5",
@@ -257,7 +262,7 @@ describe("Agent tool result — effective model", () => {
     // caller. Comparing the raw strings would print "haiku 4.5 (asked haiku)".
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
 
     const result = await tool.execute(
       "tc-5b",
@@ -273,7 +278,7 @@ describe("Agent tool result — effective model", () => {
   it("rejects an unavailable explicit model despite a valid definition pin", async () => {
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, options) => heldWorker({ responseText: "held", session: { dispose() {} } as any, aborted: false, steered: false }, undefined, options.signal));
 
     const result = await tool.execute(
       "tc-5c",

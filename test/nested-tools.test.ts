@@ -45,6 +45,7 @@ function tools(
 ) {
   return createNestedSubagentTools({
     manager,
+    taskSnapshot: { repository: cwd, task_id: "explicit-nested-fixture", generation: 1, repository_id: "fixture", base_oid: "a".repeat(40), checkout: cwd, access: "write", configCwd },
     pi: {} as any,
     parentAgentId: "parent-1",
     depth,
@@ -54,8 +55,9 @@ function tools(
   });
 }
 
+/** A nested writer needs a task distinct from the parent's; pass `task_id: undefined` to omit it. */
 async function execute(tool: any, params: Record<string, unknown>, executionCwd = cwd) {
-  return tool.execute("call-1", params, undefined, undefined, ctx(executionCwd));
+  return tool.execute("call-1", { task_id: "nested-child-fixture", ...params }, undefined, undefined, ctx(executionCwd));
 }
 
 beforeEach(() => {
@@ -109,6 +111,21 @@ describe("child-safe nested Agent tools", () => {
       }),
       expect.any(Function), // onSpawned — attaches the child's transcript
     );
+  });
+
+  it("refuses a nested writer on the parent's own task before launch", async () => {
+    const [agent] = tools();
+    for (const task_id of [undefined, "explicit-nested-fixture"]) {
+      const result = await execute(agent, { subagent_type: "reviewer", description: "same task", prompt: "Edit it", task_id });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('A nested writer needs its own distinct task_id: this agent already holds task "explicit-nested-fixture"');
+    }
+    expect(spawnAndWait).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    const distinct = await execute(agent, { subagent_type: "reviewer", description: "own task", prompt: "Edit it", task_id: "nested-child-task" });
+    expect(distinct.isError).toBe(false);
+    expect(spawnAndWait.mock.calls[0][4]).toMatchObject({ task_id: "nested-child-task", cwd });
+    expect(spawnAndWait.mock.calls[0][4]).not.toHaveProperty("taskSnapshot");
   });
 
   it("keeps agent discovery rooted in inherited config, not the working directory", async () => {
@@ -497,7 +514,7 @@ describe("child-safe nested Agent tools", () => {
   it("files a nested transcript under the root session, honoring output_transcript", async () => {
     records.set("parent-1", { id: "parent-1", status: "running", rootSessionId: "root-session" });
     spawnAndWait.mockImplementation(async (_pi, _ctx, type, _prompt, options, onSpawned) => {
-      const record = { id: "child-1", type, status: "completed", result: "done", parentAgentId: options.parentAgentId };
+      const record = { id: "child-1", type, status: "completed", result: "done", parentAgentId: options.parentAgentId, taskSnapshot: options.taskSnapshot };
       records.set("child-1", record);
       onSpawned?.("child-1");
       return { id: "child-1", record };
@@ -528,6 +545,7 @@ describe("child-safe nested Agent tools", () => {
     const [agent] = tools();
     const executionCtx = ctx();
     await agent.execute("call-1", {
+      task_id: "nested-child-fixture",
       subagent_type: "scout",
       description: "ctx check",
       prompt: "Do work",

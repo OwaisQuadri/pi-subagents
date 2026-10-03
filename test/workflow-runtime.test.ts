@@ -38,6 +38,7 @@ function stubHost(
     calls,
     aborted,
     host: {
+      journalContext: () => ({ reuse: { effect: "pure", immutableInput: "fixture:prompt-only:v1" } }),
       async spawnAgent(request) {
         calls.push(request);
         return reply ? await reply(request) : { ok: true, text: `ok:${request.prompt}` };
@@ -86,6 +87,42 @@ describe("workflowConcurrency", () => {
 });
 
 describe("script globals", () => {
+  it("forwards public task fields and rejects malformed fields or forged snapshots", async () => {
+    const stub = stubHost();
+    const result = await run('return await agent("valid", { task_id: "explicit-A", task_access: "read-stable" });', { host: stub.host });
+    expect(result.status).toBe("completed");
+    expect(stub.calls[0]).toMatchObject({ task_id: "explicit-A", task_access: "read-stable" });
+    for (const options of ['task_id: ""', 'task_id: null', 'task_access: "read"', 'taskSnapshot: { task_id: "forged" }']) {
+      const denied = await run(`return await agent("denied", { ${options} });`, { host: stub.host });
+      expect(denied.status).toBe("failed"); expect(denied.error).toMatch(/task_id|task_access|taskSnapshot/);
+    }
+    expect(stub.calls).toHaveLength(1);
+  });
+  it("awaits the host settlement barrier on natural completion and surfaces uncertainty", async () => {
+    let release!: () => void; let isEntered = false; let isSettled = false;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const host = { ...stubHost().host, async settle() { isEntered = true; await held; throw new Error("RecoveryRequired: uncertain release"); } };
+    const pending = run('return await agent("work");', { host });
+    void pending.then(() => { isSettled = true; });
+    for (let attempt = 0; attempt < 400 && !isEntered; attempt++) await sleep(5);
+    try { expect(isEntered).toBe(true); expect(isSettled).toBe(false); } finally { release(); }
+    const result = await pending; expect(result.status).toBe("failed"); expect(result.error).toContain("RecoveryRequired");
+
+    let first!: (value: WorkflowSpawnResult) => void; let second!: (value: WorkflowSpawnResult) => void;
+    const firstResult = new Promise<WorkflowSpawnResult>(resolve => { first = resolve; });
+    const secondResult = new Promise<WorkflowSpawnResult>(resolve => { second = resolve; });
+    const stub = stubHost(request => request.prompt === "first" ? firstResult : secondResult);
+    let isErrorSettled = false;
+    const failing = run('return await parallel([() => agent("first"), () => agent("second")]);', {
+      host: stub.host, journal: { append: () => { throw new Error("journal write failed"); } },
+    });
+    void failing.then(() => { isErrorSettled = true; });
+    for (let attempt = 0; attempt < 400 && stub.calls.length < 2; attempt++) await sleep(5);
+    expect(stub.calls).toHaveLength(2); first({ ok: true, text: "first" });
+    await sleep(50);
+    try { expect(isErrorSettled).toBe(false); } finally { second({ ok: false, skipped: true }); }
+    expect((await failing).status).toBe("failed");
+  });
   it("runs a script, returns its value and reports meta", async () => {
     const { host, calls } = stubHost();
     const result = await run('const answer = await agent("hello");\nreturn { answer };', { host });
@@ -506,7 +543,9 @@ describe("caps and validation", () => {
 describe("abort", () => {
   it("terminates the run and aborts every in-flight child", async () => {
     const controller = new AbortController();
-    const { host, aborted } = stubHost(() => new Promise<WorkflowSpawnResult>(() => {}));
+    let release!: (result: WorkflowSpawnResult) => void;
+    const { host, aborted } = stubHost(() => new Promise<WorkflowSpawnResult>(resolve => { release = resolve; }));
+    let isSettled = false;
 
     let started = () => {};
     const running = new Promise<void>(resolve => {
@@ -523,6 +562,10 @@ describe("abort", () => {
 
     await running;
     controller.abort();
+    void promise.then(() => { isSettled = true; });
+    await sleep(50);
+    expect(isSettled).toBe(false);
+    release({ ok: false, skipped: true });
     const result = await promise;
 
     expect(result.status).toBe("killed");

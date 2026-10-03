@@ -21,8 +21,10 @@ import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
+import { resolveTaskInvocation } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
+import { type TaskAccess, type TaskSnapshot, validateTaskSnapshot } from "./task-worktree.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
@@ -35,6 +37,9 @@ export type ScheduleChangeEvent =
 
 /** Params accepted at job creation — ID, timestamps, and state are derived. */
 export interface NewJobInput {
+  task_id?: string;
+  task_access?: TaskAccess;
+  taskSnapshot?: TaskSnapshot;
   name: string;
   description: string;
   schedule: string;
@@ -94,7 +99,9 @@ export class SubagentScheduler {
    */
   buildJob(input: NewJobInput): ScheduledSubagent {
     const detected = SubagentScheduler.detectSchedule(input.schedule);
+    const taskSnapshot = validateTaskSnapshot(input.taskSnapshot ?? this.manager?.getTaskBinding());
     return {
+      taskSnapshot,
       id: nanoid(10),
       name: input.name,
       description: input.description,
@@ -114,13 +121,26 @@ export class SubagentScheduler {
     };
   }
 
-  /** Add a job, persist, and arm if enabled. Returns the stored job. */
-  addJob(input: NewJobInput): ScheduledSubagent {
+  async addJob(input: NewJobInput): Promise<ScheduledSubagent> {
     const store = this.requireStore();
     if (store.hasName(input.name)) {
       throw new Error(`A scheduled job named "${input.name}" already exists.`);
     }
-    const job = this.buildJob(input);
+    const fields = resolveTaskInvocation(input);
+    const binding = this.manager?.getTaskBinding();
+    let snapshot = input.taskSnapshot ?? binding;
+    if (fields.task_id !== undefined && (fields.task_id !== snapshot?.task_id || (fields.task_access !== undefined && fields.task_access !== snapshot.access))) {
+      if (!this.manager || !this.ctx) throw new Error("Scheduler not started — no task capture available");
+      snapshot = await this.manager.captureTaskSnapshot(binding?.repository ?? this.ctx.cwd, fields.task_id, {
+        access: fields.task_access,
+        configCwd: binding?.configCwd ?? this.ctx.cwd,
+      });
+    }
+    if (!snapshot) throw new Error("Scheduled jobs require an explicit task_id or task binding; use /agents task bind");
+    if (fields.task_access !== undefined && fields.task_access !== snapshot.access) throw new Error("task_access differs from scheduled task snapshot");
+    if (this.store !== store) throw new Error("Session switched while capturing scheduled task; create the job again");
+    const job = this.buildJob({ ...input, taskSnapshot: snapshot });
+    if (store.hasName(input.name)) throw new Error(`A scheduled job named "${input.name}" already exists.`);
     store.add(job);
     if (job.enabled) this.scheduleJob(job);
     this.emit({ type: "added", job });
@@ -252,13 +272,13 @@ export class SubagentScheduler {
       if (!dispatch.ok) throw new Error(dispatch.message);
       agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
         description: job.description,
+        taskSnapshot: validateTaskSnapshot(job.taskSnapshot),
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,
         maxTurns: job.max_turns,
         isolated: job.isolated,
         thinkingLevel: job.thinking,
-        isolation: job.isolation,
         // A scheduled run has no tool call to build this, so without it the
         // conversation viewer shows nothing about how the job was configured.
         // The model is left out on purpose: agent-manager fills in the effective

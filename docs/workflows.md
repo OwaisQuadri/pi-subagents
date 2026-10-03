@@ -14,6 +14,18 @@ A script can loop, branch, and fan out over a list discovered at runtime. A batc
 
 Use the `Agent` tool for one delegated task, or a handful you can name up front. Reach for a workflow when the *number* of agents depends on something discovered at runtime, when work flows through stages, or when you want findings independently verified before you believe them. It costs a subprocess per agent, so it is not the thing to dress a single task up as.
 
+## Task ownership
+
+Bind an initialized task with `/agents task bind <task_id>`, or supply an initialized `task_id` on every child call. To create a task, supply `--base <full commit object ID>`. Put the `worktree-hygiene` helper on PATH. Workflow labels, prompts and sessions supply no task identity.
+
+The workflow captures its binding at launch. Later parent rebindings do not redirect its children. Each child acquires its own claim. Independent parallel writers need distinct existing `task_id` values; readers can share a task with `task_access: "read-stable"`. A stable reader cannot mutate files or run shell commands. A competing writer receives `TaskBusy`.
+
+Children use the task's verified checkout, not the parent directory. Completion retains working bytes and the task checkout, with no automatic commit or removal. Retry and `resume` keep the child's original task snapshot. A resumed child acquires a new token. Journals store no claim tokens.
+
+The child holds its claim while the helper runs the gate. It uses the shell of Pi's own `bash` tool (`/bin/bash -c` by default, or the `shellPath` setting from the child's config root), the verified checkout and a ten-minute deadline. The result uses bounded tails from the helper's stdout and stderr evidence files. Failed, cancelled, timed-out or disconnected commands never pass. A failed worker skips the gate. A failed gate leaves the child resumable, and resume runs its original gate once under the new claim.
+
+Workflow completion, abort and shutdown wait for the owned children, commands and claims to settle. A stopped row or cancel acknowledgment is not proof of quiescence. The runtime reports settlement uncertainty as an error, with no fallback to the parent directory.
+
 ## The lifecycle
 
 ### 1. Ask for one
@@ -44,7 +56,7 @@ To iterate, edit the script file and call SubagentWorkflow again with scriptPath
 
 Three things in there matter.
 
-**`Task ID`** is what `resumeFromRunId` takes, and what `/agents → Workflows` lists the run under.
+**`Task ID`** here is the workflow run ID used by `resumeFromRunId` and `/agents → Workflows`. It is not a child checkout's public `task_id`.
 
 **`Script`** is the file to edit. **It is a scratch file in your system temp directory, not in your project** — it will not survive a reboot or a temp sweep. If the workflow turns out to be worth keeping, copy it somewhere durable; see [Save it](#5-save-it). The path means something slightly different depending on how the run was started: for an inline script it is a copy the tool just wrote, and for a run started from `scriptPath` or `name` it is *your own file*, reported straight back.
 
@@ -97,11 +109,11 @@ A run's own agents are not listed separately in the fleet list, the widget, the 
 
 Open the path from the `Script:` line, change it, and ask the model to run it again with `scriptPath`. That is the whole loop, and it is why the script is written to disk at all: iterating means editing a file, not asking the model to re-emit source it already produced.
 
-Re-running normally re-pays for every agent. `resumeFromRunId` avoids that:
+`resumeFromRunId` selects an earlier run's script and journal. Managed task checkouts execute every call live: the journal cannot prove that uncommitted working bytes stayed unchanged, even with the same base and generation. `read-stable` alone does not prove an immutable view across claims.
 
-> Its unchanged leading `agent()` calls return their recorded results instantly; the first changed or failed call, and everything after it, runs live.
+Generic library hosts can reuse a matching pure prefix only when they supply positive immutable-input evidence. Old unqualified entries, writing calls and gated calls run live. Keys include task identity, access, generation and base. A replayed result creates no session for a later `resume`.
 
-Every run journals each settled `agent()` call beside its script as `<run id>.workflow.jsonl`, and the resume replays the **unchanged prefix** of that journal. It is a prefix and not a lookup table on purpose: a later call that still matches came from a run whose earlier stages no longer exist, so its recorded answer was produced downstream of work that has changed.
+Every run journals each settled `agent()` call beside its script as `<run id>.workflow.jsonl`. Qualified pure library hosts can replay the **unchanged prefix** of that journal. Reuse stops at the first mismatch or failure. Later matches run live because they depended on earlier work that changed.
 
 Four things it will not do:
 
@@ -147,6 +159,8 @@ const listing = await agent(`List every file under ${root}. One path per line, n
 
 The task: *"find routes that don't check auth, and don't just take the first answer — check each finding."*
 
+Bind the task with `--access read-stable` for this read-only fan-out. The children share stable-reader claims and cannot run shell commands or modify files.
+
 The model writes something like this, and the run starts:
 
 ```js
@@ -189,7 +203,7 @@ const findings = await pipeline(
 return findings.filter(Boolean).filter(f => f.holds)
 ```
 
-Only the second stage changed, so re-running with `resumeFromRunId` replays the whole `Scan` phase and every `audit:` call from the journal, and pays only for the verify agents. The notification says so: `… , 7 replayed from wf_9f3ab21c04de`.
+Re-running with `resumeFromRunId` uses the edited script. Managed calls execute live, including unchanged stages, because snapshots do not prove immutable working inputs.
 
 Then it earns its keep — copy it to `.pi/workflows/auth-audit.js`, swap `src/routes/` for `args?.root ?? 'src/routes/'`, and from then on it is *"run auth-audit against src/api"*.
 
@@ -223,7 +237,7 @@ export const meta = {
 | `scriptPath` | string | A script file, absolute or project-relative. **Takes precedence over `script`** — this is how an edited workflow is re-run |
 | `name` | string | A saved workflow — `<name>.js` in one of the three directories above. Lowest precedence |
 | `args` | any | Handed to the script as the `args` global, verbatim. Must be JSON-shaped |
-| `resumeFromRunId` | string | Replay an earlier run in this session. Matches `^wf_[a-z0-9-]{6,}$` |
+| `resumeFromRunId` | string | Re-run an earlier script in this session. Managed calls execute live; qualified pure library hosts can reuse an immutable prefix. Matches `^wf_[a-z0-9-]{6,}$` |
 | `title` / `description` | string | Accepted and ignored — for Claude Code parity, so a ported call does not fail. A workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
@@ -243,7 +257,9 @@ Each non-isolated worker also receives two separate tools, `ask_parent_question`
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | Explicit user choice: `provider/modelId` or a fuzzy name. Omit to inherit the current parent model |
 | `effort` | string | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omit to inherit the current parent thinking level |
-| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
+| `task_id` | string | Existing initialized task ID. Omit to use the workflow's captured binding; independent parallel writers need distinct IDs |
+| `task_access` | `"write"` or `"read-stable"` | Defaults to captured access. Stable readers cannot mutate files or run shell commands |
+| `isolation` | `"worktree"` | Ignored legacy option, accepted for compatibility. Creates no per-agent checkout and does not bypass task ownership |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
@@ -252,7 +268,7 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Definition and registry pins do not select the child model or thinking level. Each new dispatch uses the current parent selection, including later calls through the same workflow host. Explicit values apply only to their own invocation.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+Combination rules: do not combine `resume` with `agentType`, `model`, `effort`, `isolation`, `gate`, `schema`, `task_id` or `task_access`. A resumed child keeps its original agent type, model and tree. Its session predates the `StructuredOutput` tool.
 
 ### `pipeline()` and `parallel()`
 
@@ -375,7 +391,7 @@ The script called `Date.now()`, `new Date()` or `Math.random()`. A script that v
 `meta` is evaluated before the script runs, in an empty context, so it cannot reference anything. Move the dynamic part into the body.
 
 **`agent() opts.<key> is not a recognised option.`**
-A typo, or an option from a different tool. The supported set is `label`, `phase`, `model`, `agentType`, `isolation`, `gate`, `resume`, `effort`, `schema`.
+A typo, or an option from a different tool. The supported set is `label`, `phase`, `model`, `agentType`, `isolation`, `gate`, `resume`, `effort`, `schema`, `task_id`, `task_access`.
 
 **An agent ran as the wrong type and nothing said so.**
 An `agentType` that names no known agent falls back to `general-purpose` **silently** — unlike the `Agent` tool, which tells you. Option *keys* are validated; option *values* are not. Check the spelling against `/agents`; matching is case-insensitive, and a disabled agent does not count.
@@ -387,10 +403,10 @@ The agent failed terminally, or you skipped it with `s` in the inspector. These 
 `schema` is pressure, not a guarantee. The child gets a `StructuredOutput` tool, `constrainedSampling` set to `strict: "prefer"`, and a validation-and-retry round trip — three soft pressures, where Claude Code has one hard one (it can force the tool call; this cannot, because `toolChoice` is not plumbed through pi's `AgentSession`). Keep schemas small and flat, and `.filter(Boolean)` after every schema stage.
 
 **The run failed complaining about an un-awaited `agent()`.**
-A dropped `await`, usually inside a `pipeline` stage. The run would otherwise finish while children were still working and throw their results away, so it fails instead — immediately rather than draining, since an agent that ignores its abort signal would wedge the run forever.
+A dropped `await`, usually inside a `pipeline` stage. The runtime fails the run to avoid discarding child work. The run aborts those children and waits for their operations and claims to settle before reporting the failure.
 
-**`Cannot run with isolation: "worktree"`.**
-Not a git repo, no commits yet, or `git worktree add` failed. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.
+**A child failed with `TaskBusy` or a missing task binding.**
+Bind an initialized task before launch. For parallel writers, initialize distinct task IDs and pass them on the calls. For read-only fan-out, use `task_access: "read-stable"`. Removing `isolation` does not bypass task ownership.
 
 **`No saved workflow named "x". Looked in: …`**
 The file is not in any of the three directories, or it is there but carries no `export const meta =` declaration, so it is not recognized as a workflow. The message lists the directories it searched and any workflows it did find.

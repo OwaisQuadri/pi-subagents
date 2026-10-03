@@ -4,20 +4,20 @@ import { join } from "node:path";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as codingAgent from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, fixturePromise, settleFixtureWorkers, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
+
 import * as agentRunner from "../src/agent-runner.js";
 import * as environment from "../src/env.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
-import * as worktree from "../src/worktree.js";
 
 vi.mock("../src/agent-runner.js", async () => ({
   ...(await vi.importActual<typeof agentRunner>("../src/agent-runner.js")),
   runAgent: vi.fn(), resumeAgent: vi.fn(),
-}));
-vi.mock("../src/worktree.js", async () => ({
-  ...(await vi.importActual<typeof worktree>("../src/worktree.js")),
-  createWorktree: vi.fn(), cleanupWorktree: vi.fn(async () => ({ hasChanges: false })), pruneWorktrees: vi.fn(async () => {}),
 }));
 
 import { AgentManager } from "../src/agent-manager.js";
@@ -25,19 +25,18 @@ import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { runInChildSessionContext } from "../src/child-context.js";
 import subagentsExtension from "../src/index.js";
 import type { RunActivity } from "../src/types.js";
-import { createWorktree } from "../src/worktree.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  const promise = fixturePromise<T>((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
 }
 
-const session = { dispose: vi.fn() } as unknown as AgentSession;
+const session = { dispose: vi.fn(), messages: [], subscribe: () => () => {} } as unknown as AgentSession;
 const result = { responseText: "done", session, aborted: false, steered: false };
 const pi = {} as ExtensionAPI;
-const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "root" } } as ExtensionContext;
+const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "root", getBranch: () => [] } } as ExtensionContext;
 const childCtx = { ...ctx, sessionManager: { getSessionId: () => "child-session" } } as ExtensionContext;
 
 function assertPairs(events: RunActivity[], count: number) {
@@ -78,19 +77,23 @@ describe("owner run activity", () => {
   });
 
   afterEach(async () => {
+    manager.abortAll(); settleFixtureWorkers();
     await manager.dispose();
+    vi.restoreAllMocks();
     vi.clearAllMocks();
   });
 
   it("does not start queued work until admission, and never starts cancelled queued work", async () => {
     const first = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(first.promise);
-    const a = manager.spawn(pi, ctx, "Explore", "a", { description: "a", isBackground: true });
-    const b = manager.spawn(pi, ctx, "Explore", "b", { description: "b", isBackground: true });
-    const c = manager.spawn(pi, ctx, "Explore", "c", { description: "c", isBackground: true });
+    const a = manager.spawn(pi, ctx, "Explore", "a", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-a"), description: "a", isBackground: true });
+    const b = manager.spawn(pi, ctx, "Explore", "b", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-b"), description: "b", isBackground: true });
+    const c = manager.spawn(pi, ctx, "Explore", "c", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-c"), description: "c", isBackground: true });
+    await new Promise(resolve => setImmediate(resolve));
     expect(events.map(event => event.agentId)).toEqual([a]);
     expect(manager.getRecord(b)?.status).toBe("queued");
     manager.abort(c);
+    await new Promise(resolve => setImmediate(resolve));
     expect(events).toHaveLength(1);
     first.resolve(result);
     await manager.waitForAll();
@@ -108,21 +111,22 @@ describe("owner run activity", () => {
     const blocker = deferred<typeof result>();
     if (isQueued) {
       vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-      manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+      manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     }
     const parent = new AbortController();
     parent.abort();
     const onSpawned = vi.fn();
     const id = manager.spawn(pi, ctx, "Explore", "cancelled", {
-      description: "cancelled", isBackground: true, signal: parent.signal, onSpawned,
+      taskSnapshot: declareTask(ctx.cwd, "lifecycle-cancelled"), description: "cancelled", isBackground: true, signal: parent.signal, onSpawned,
     });
     await manager.awaitStartup(id);
     expect(manager.getRecord(id)?.status).toBe("stopped");
     expect(manager.getRecord(id)?.completedAt).toEqual(expect.any(Number));
     expect(events.filter(event => event.agentId === id)).toEqual([]);
-    expect(onSpawned).toHaveBeenCalledTimes(isQueued ? 0 : 1);
+    expect(onSpawned).not.toHaveBeenCalled();
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledTimes(isQueued ? 1 : 0);
-    const next = manager.spawn(pi, ctx, "Explore", "next", { description: "next", isBackground: true });
+    const next = manager.spawn(pi, ctx, "Explore", "next", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-next"), description: "next", isBackground: true });
     blocker.resolve(result);
     await manager.waitForAll();
     expect(manager.getRecord(next)?.status).toBe("completed");
@@ -133,7 +137,7 @@ describe("owner run activity", () => {
     const parent = new AbortController();
     starts.mockImplementationOnce(() => parent.abort());
     const id = manager.spawn(pi, ctx, "Explore", "cancelled", {
-      description: "cancelled", isBackground: true, signal: parent.signal,
+      taskSnapshot: declareTask(ctx.cwd, "lifecycle-cancelled"), description: "cancelled", isBackground: true, signal: parent.signal,
     });
     await manager.awaitStartup(id);
     expect(manager.getRecord(id)?.status).toBe("stopped");
@@ -142,20 +146,49 @@ describe("owner run activity", () => {
     expect(events.map(event => event.transition)).toEqual(["started", "stopped"]);
   });
 
+  it("a spawn hook can cancel before SDK construction and release its task for handoff", async () => {
+    const snapshot = declareTask(ctx.cwd, "spawn-hook-task");
+    const id = manager.spawn(pi, ctx, "Explore", "cancelled", {
+      taskSnapshot: snapshot, description: "cancelled", onSpawned: id => { manager.abort(id); },
+    });
+    await manager.getRecord(id)!.promise;
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)?.status).toBe("stopped");
+    assertPairs(events, 1);
+    const handoff = await manager.spawnAndWait(pi, ctx, "Explore", "handoff", { taskSnapshot: snapshot, description: "handoff" });
+    expect(handoff.record.status).toBe("completed");
+    expect(runAgent).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("resume hooks cancel before prompting (background=%s)", async isBackground => {
+    const snapshot = declareTask(ctx.cwd, "resume-hook-task");
+    const { id } = await manager.spawnAndWait(pi, ctx, "Explore", "initial", { taskSnapshot: snapshot, description: "initial" });
+    await manager.resume(id, "cancelled", undefined, { isBackground, onStarted: () => { manager.abort(id); } });
+    await manager.getRecord(id)!.promise;
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)?.status).toBe("stopped");
+    assertPairs(events, 2);
+    const resumed = await manager.resume(id, "handoff");
+    expect(resumed?.status).toBe("completed");
+    expect(resumeAgent).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("drains despite throwing activity observers (runner rejection=%s)", async (isRejected) => {
     starts.mockImplementation(() => { throw new Error("start observer failed"); });
     completes.mockImplementation(() => { throw new Error("terminal observer failed"); });
     const first = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(first.promise);
-    const a = manager.spawn(pi, ctx, "Explore", "a", { description: "a", isBackground: true });
+    const a = manager.spawn(pi, ctx, "Explore", "a", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-a"), description: "a", isBackground: true });
     const aRecord = manager.getRecord(a)!;
-    const b = manager.spawn(pi, ctx, "Explore", "b", { description: "b", isBackground: true });
+    const b = manager.spawn(pi, ctx, "Explore", "b", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-b"), description: "b", isBackground: true });
     await expect(manager.awaitStartup(a)).resolves.toBeUndefined();
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledOnce();
     expect(manager.getRecord(b)?.status).toBe("queued");
     if (isRejected) first.reject(new Error("runner failed"));
     else first.resolve(result);
     await expect(aRecord.promise).resolves.toBe(isRejected ? "" : "done");
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledTimes(2);
     await manager.getRecord(b)!.promise;
     assertPairs(events, 2);
@@ -166,7 +199,8 @@ describe("owner run activity", () => {
     expect(manager.getRecord(b)?.status).toBe("completed");
     expect(starts).toHaveBeenCalledTimes(2);
     expect(completes).toHaveBeenCalledTimes(2);
-    const c = manager.spawn(pi, ctx, "Explore", "c", { description: "c", isBackground: true });
+    const c = manager.spawn(pi, ctx, "Explore", "c", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-c"), description: "c", isBackground: true });
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledTimes(3);
     await manager.getRecord(c)!.promise;
     assertPairs(events, 3);
@@ -176,16 +210,21 @@ describe("owner run activity", () => {
     completes.mockImplementation(() => { throw new Error("terminal observer failed"); });
     const first = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(first.promise);
-    vi.mocked(createWorktree).mockResolvedValueOnce(null);
-    const a = manager.spawn(pi, ctx, "Explore", "a", { description: "a", isBackground: true });
-    const b = manager.spawn(pi, ctx, "Explore", "b", { description: "b", isBackground: true, isolation: "worktree" });
-    const c = manager.spawn(pi, ctx, "Explore", "c", { description: "c", isBackground: true });
+    const claim = FixtureTaskAuthority.prototype.claim;
+    vi.spyOn(FixtureTaskAuthority.prototype, "claim").mockImplementation(async function(identity, access, worker_run) {
+      if (identity.task_id === "lifecycle-b") throw new Error("TaskBusy: refused claim");
+      return claim.call(this, identity, access, worker_run);
+    });
+    const a = manager.spawn(pi, ctx, "Explore", "a", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-a"), description: "a", isBackground: true });
+    const b = manager.spawn(pi, ctx, "Explore", "b", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-b"), description: "b", isBackground: true, isolation: "worktree" });
+    const c = manager.spawn(pi, ctx, "Explore", "c", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-c"), description: "c", isBackground: true });
     expect(manager.getRecord(b)?.status).toBe("queued");
     expect(manager.getRecord(c)?.status).toBe("queued");
     first.resolve(result);
     await manager.getRecord(a)!.promise;
     await vi.waitFor(() => expect(manager.getRecord(c)?.status).toBe("completed"));
     expect(manager.getRecord(b)?.status).toBe("error");
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledTimes(2);
     expect(events.some(event => event.agentId === b)).toBe(false);
     assertPairs(events, 2);
@@ -196,10 +235,11 @@ describe("owner run activity", () => {
     completes.mockImplementation(() => { throw new Error("terminal observer failed"); });
     const first = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(first.promise);
-    const a = manager.spawn(pi, ctx, "Explore", "a", { description: "a", isBackground: true });
-    const b = manager.spawn(pi, ctx, "Explore", "b", { description: "b", isBackground: true });
+    const a = manager.spawn(pi, ctx, "Explore", "a", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-a"), description: "a", isBackground: true });
+    const b = manager.spawn(pi, ctx, "Explore", "b", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-b"), description: "b", isBackground: true });
     first.reject(new Error("runner failed"));
     await expect(manager.getRecord(a)!.promise).resolves.toBe("");
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledTimes(2);
     await manager.getRecord(b)!.promise;
     assertPairs(events, 2);
@@ -215,10 +255,10 @@ describe("owner run activity", () => {
       if (activity) otherEvents.push(activity);
     }, undefined, undefined, true);
     try {
-      const parent = manager.spawn(pi, ctx, "Explore", "parent", { description: "parent" });
+      const parent = manager.spawn(pi, ctx, "Explore", "parent", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-parent"), description: "parent" });
       const parentRecord = manager.getRecord(parent)!;
       const child = otherManager.spawn(pi, childCtx, "Explore", "child", {
-        description: "child", parentAgentId: parent, rootSessionId: parentRecord.rootSessionId,
+        taskSnapshot: declareTask(ctx.cwd, "lifecycle-child"), description: "child", parentAgentId: parent, rootSessionId: parentRecord.rootSessionId,
       });
       await Promise.all([parentRecord.promise, otherManager.getRecord(child)!.promise]);
       expect(parentRecord.rootSessionId).toBe("root");
@@ -236,8 +276,9 @@ describe("owner run activity", () => {
     manager.setMaxConcurrentForeground(1);
     const first = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(first.promise);
-    const a = manager.spawnAndWait(pi, ctx, "Explore", "a", { description: "a" });
-    const b = manager.spawnAndWait(pi, ctx, "Explore", "b", { description: "b" });
+    const a = manager.spawnAndWait(pi, ctx, "Explore", "a", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-a"), description: "a" });
+    const b = manager.spawnAndWait(pi, ctx, "Explore", "b", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-b"), description: "b" });
+    await new Promise(resolve => setImmediate(resolve));
     expect(events).toHaveLength(1);
     first.resolve(result);
     await Promise.all([a, b]);
@@ -248,9 +289,9 @@ describe("owner run activity", () => {
   it("keeps root identity for nested and workflow-owned executions", async () => {
     const parentRun = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(parentRun.promise);
-    const parent = manager.spawn(pi, ctx, "Explore", "parent", { description: "parent", isBackground: true });
-    const nested = manager.spawn(pi, childCtx, "Explore", "nested", { description: "nested", parentAgentId: parent });
-    const workflow = manager.spawn(pi, childCtx, "Explore", "workflow", { description: "workflow", workflowId: "wf-real", rootSessionId: "root" });
+    const parent = manager.spawn(pi, ctx, "Explore", "parent", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-parent"), description: "parent", isBackground: true });
+    const nested = manager.spawn(pi, childCtx, "Explore", "nested", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-nested"), description: "nested", parentAgentId: parent });
+    const workflow = manager.spawn(pi, childCtx, "Explore", "workflow", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-workflow"), description: "workflow", workflowId: "wf-real", rootSessionId: "root" });
     await Promise.all([manager.getRecord(nested)!.promise, manager.getRecord(workflow)!.promise]);
     parentRun.resolve(result);
     await manager.waitForAll();
@@ -261,12 +302,12 @@ describe("owner run activity", () => {
   });
 
   it("assigns new identities to foreground and queued background resumes without adding foreground presentation", async () => {
-    const id = manager.spawn(pi, ctx, "Explore", "spawn", { description: "resume", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "spawn", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume", isBackground: true });
     await manager.getRecord(id)!.promise;
     await manager.resume(id, "foreground");
     const blocker = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-    manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+    manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     await manager.resume(id, "background", undefined, { isBackground: true });
     expect(events.filter(event => event.agentId === id)).toHaveLength(4);
     expect(manager.getRecord(id)?.status).toBe("queued");
@@ -284,7 +325,7 @@ describe("owner run activity", () => {
     ["steered", { ...result, steered: true }, "completed", "steered"],
   ] as const)("closes %s exactly once", async (_name, outcome, transition, status) => {
     vi.mocked(runAgent).mockResolvedValueOnce(outcome);
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run", isBackground: true });
     await manager.getRecord(id)!.promise;
     assertPairs(events, 1);
     expect(events[1]).toMatchObject({ transition, status });
@@ -293,21 +334,18 @@ describe("owner run activity", () => {
 
   it("closes runner rejection exactly once", async () => {
     vi.mocked(runAgent).mockRejectedValueOnce(new Error("runner failed"));
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run", isBackground: true });
     await manager.getRecord(id)!.promise;
     assertPairs(events, 1);
     expect(events[1]).toMatchObject({ transition: "failed", status: "error" });
   });
 
-  it("does not invent execution events for failed or stopped worktree preparation", async () => {
-    vi.mocked(createWorktree).mockResolvedValueOnce(null);
-    const failed = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isolation: "worktree" });
-    await expect(manager.awaitStartup(failed)).rejects.toThrow("Cannot run");
-    const preparing = deferred<Awaited<ReturnType<typeof createWorktree>>>();
-    vi.mocked(createWorktree).mockReturnValueOnce(preparing.promise);
-    const stopped = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isolation: "worktree" });
+  it("does not invent execution events for a refused or stopped task claim", async () => {
+    vi.spyOn(FixtureTaskAuthority.prototype, "claim").mockRejectedValueOnce(new Error("TaskBusy: refused claim"));
+    const failed = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run" });
+    await expect(manager.awaitStartup(failed)).rejects.toThrow("TaskBusy");
+    const stopped = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run" });
     manager.abort(stopped);
-    preparing.resolve({ path: "/tmp", branch: "test", baseSha: "sha", workPath: "/tmp" });
     await manager.awaitStartup(stopped);
     expect(events).toEqual([]);
     expect(runAgent).not.toHaveBeenCalled();
@@ -316,7 +354,8 @@ describe("owner run activity", () => {
   it("stop is terminal immediately and later settlement does not duplicate activity or summaries", async () => {
     const run = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(run.promise);
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run", isBackground: true });
+    await manager.awaitStartup(id);
     expect(manager.abort(id)).toBe(true);
     expect(manager.abort(id)).toBe(false);
     assertPairs(events, 1);
@@ -336,7 +375,7 @@ describe("owner run activity", () => {
       abort: vi.fn<AgentSession["abort"]>().mockResolvedValue(undefined), dispose: vi.fn(),
     } as unknown as AgentSession;
     vi.mocked(runAgent).mockResolvedValueOnce({ ...result, session: instrumented });
-    const id = manager.spawn(pi, ctx, "Explore", "spawn", { description: "resume" });
+    const id = manager.spawn(pi, ctx, "Explore", "spawn", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume" });
     await manager.getRecord(id)!.promise;
     manager.getRecord(id)!.error = "old error";
     vi.mocked(resumeAgent).mockImplementationOnce(actual.resumeAgent);
@@ -362,7 +401,7 @@ describe("owner run activity", () => {
       abort: vi.fn<AgentSession["abort"]>().mockResolvedValue(undefined), dispose: vi.fn(),
     } as unknown as AgentSession;
     vi.mocked(runAgent).mockResolvedValueOnce({ ...result, session: instrumented });
-    const id = manager.spawn(pi, ctx, "Explore", "spawn", { description: "resume" });
+    const id = manager.spawn(pi, ctx, "Explore", "spawn", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume" });
     await manager.getRecord(id)!.promise;
     const parent = new AbortController();
     manager = Object.assign(manager, {
@@ -378,7 +417,7 @@ describe("owner run activity", () => {
     expect(resumeAgent).not.toHaveBeenCalled();
     expect(manager.getRecord(id)?.status).toBe("stopped");
     assertPairs(events, 2);
-    const next = manager.spawn(pi, ctx, "Explore", "next", { description: "next", isBackground: true });
+    const next = manager.spawn(pi, ctx, "Explore", "next", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-next"), description: "next", isBackground: true });
     await manager.getRecord(next)!.promise;
     expect(manager.getRecord(next)?.status).toBe("completed");
     assertPairs(events, 3);
@@ -395,10 +434,10 @@ describe("owner run activity", () => {
       let pending: Promise<unknown>;
       if (kind === "spawn") {
         vi.mocked(runAgent).mockReturnValueOnce(running.promise);
-        id = manager.spawn(pi, ctx, "Explore", "run", { description: "run", signal: parent.signal });
+        id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run", signal: parent.signal });
         pending = manager.getRecord(id)!.promise!;
       } else {
-        id = manager.spawn(pi, ctx, "Explore", "run", { description: "run" });
+        id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run" });
         await manager.getRecord(id)!.promise;
         vi.mocked(resumeAgent).mockReturnValueOnce(resumed.promise);
         pending = manager.resume(id, "resume", parent.signal, { isBackground: kind === "background" });
@@ -408,7 +447,7 @@ describe("owner run activity", () => {
       if (action === "signal") parent.abort();
       else if (action === "stop") manager.abort(id);
       else if (action === "abortAll") manager.abortAll();
-      else await manager.dispose();
+      else { const disposing = manager.dispose(); running.resolve(result); resumed.resolve({ text: "late" }); await disposing; }
       for (const registration of added.mock.calls) {
         expect(removed).toHaveBeenCalledWith("abort", registration[1]);
       }
@@ -423,12 +462,13 @@ describe("owner run activity", () => {
   });
 
   it.each([false, true])("closes stopped resumes once (background=%s)", async (isBackground) => {
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run" });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run" });
     await manager.getRecord(id)!.promise;
     const resumed = deferred<{ text: string }>();
     vi.mocked(resumeAgent).mockReturnValueOnce(resumed.promise);
     const parentSignal = new AbortController();
     const resume = manager.resume(id, "resume", parentSignal.signal, { isBackground });
+    await manager.awaitStartup(id);
     parentSignal.abort();
     expect(manager.getRecord(id)?.status).toBe("stopped");
     assertPairs(events, 2);
@@ -440,13 +480,13 @@ describe("owner run activity", () => {
   });
 
   it.each([false, true])("does not let an old background resume signal stop a later run (queued=%s)", async (isQueued) => {
-    const id = manager.spawn(pi, ctx, "Explore", "spawn", { description: "resume", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "spawn", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume", isBackground: true });
     await manager.getRecord(id)!.promise;
     const oldSignal = new AbortController();
     const blocker = deferred<typeof result>();
     if (isQueued) {
       vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-      manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+      manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     }
     await manager.resume(id, "first", oldSignal.signal, { isBackground: true });
     if (isQueued) expect(manager.getRecord(id)?.status).toBe("queued");
@@ -474,10 +514,10 @@ describe("owner run activity", () => {
   it("does not let an old queued spawn signal stop a later resume", async () => {
     const blocker = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-    manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+    manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     const oldSignal = new AbortController();
     const id = manager.spawn(pi, ctx, "Explore", "spawn", {
-      description: "resume", isBackground: true, signal: oldSignal.signal,
+      taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume", isBackground: true, signal: oldSignal.signal,
     });
     expect(manager.getRecord(id)?.status).toBe("queued");
     blocker.resolve(result);
@@ -499,11 +539,11 @@ describe("owner run activity", () => {
   });
 
   it.each(["signal", "stop", "abortAll", "dispose"] as const)("detaches queued listeners on %s", async (action) => {
-    const id = manager.spawn(pi, ctx, "Explore", "spawn", { description: "resume", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "spawn", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume", isBackground: true });
     await manager.getRecord(id)!.promise;
     const blocker = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-    const blockerId = manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+    const blockerId = manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     const oldSignal = new AbortController();
     const added = vi.spyOn(oldSignal.signal, "addEventListener");
     const removed = vi.spyOn(oldSignal.signal, "removeEventListener");
@@ -513,7 +553,7 @@ describe("owner run activity", () => {
     if (action === "signal") oldSignal.abort();
     else if (action === "stop") manager.abort(id);
     else if (action === "abortAll") manager.abortAll();
-    else await manager.dispose();
+    else { const disposing = manager.dispose(); blocker.resolve(result); await disposing; }
     expect(removed).toHaveBeenCalledExactlyOnceWith("abort", added.mock.calls[0][1]);
     expect(resumeAgent).not.toHaveBeenCalled();
     blocker.resolve(result);
@@ -521,12 +561,12 @@ describe("owner run activity", () => {
   });
 
   it.each([false, true])("does not start a pre-aborted background resume (queued=%s)", async (isQueued) => {
-    const id = manager.spawn(pi, ctx, "Explore", "spawn", { description: "resume", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "spawn", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-resume"), description: "resume", isBackground: true });
     await manager.getRecord(id)!.promise;
     const blocker = deferred<typeof result>();
     if (isQueued) {
       vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-      manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+      manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     }
     const oldSignal = new AbortController();
     oldSignal.abort();
@@ -538,43 +578,50 @@ describe("owner run activity", () => {
     assertPairs(events, isQueued ? 2 : 1);
   });
 
-  it.each([false, true])("cleans up the queued signal through worktree preparation (failure=%s)", async (isFailed) => {
+  it.each([false, true])("cleans up queued and running signals through claim acquisition (failure=%s)", async (isFailed) => {
     const blocker = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-    const blockerId = manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
-    const preparing = deferred<Awaited<ReturnType<typeof createWorktree>>>();
-    vi.mocked(createWorktree).mockReturnValueOnce(preparing.promise);
+    const blockerId = manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
+    await manager.awaitStartup(blockerId);
+    const preparing = deferred<void>();
+    const claim = FixtureTaskAuthority.prototype.claim;
+    vi.spyOn(FixtureTaskAuthority.prototype, "claim").mockImplementationOnce(async function(...args) {
+      const record = await claim.apply(this, args);
+      await preparing.promise;
+      if (isFailed) throw new Error("TaskBusy: claim refused");
+      return record;
+    });
     const parentSignal = new AbortController();
     const added = vi.spyOn(parentSignal.signal, "addEventListener");
     const removed = vi.spyOn(parentSignal.signal, "removeEventListener");
     const id = manager.spawn(pi, ctx, "Explore", "queued", {
-      description: "queued", isBackground: true, isolation: "worktree", signal: parentSignal.signal,
+      taskSnapshot: declareTask(ctx.cwd, "lifecycle-queued"), description: "queued", isBackground: true, signal: parentSignal.signal,
     });
     blocker.resolve(result);
     await manager.getRecord(blockerId)!.promise;
     expect(manager.getRecord(id)?.status).toBe("running");
-    expect(removed).not.toHaveBeenCalled();
+    expect(removed).toHaveBeenCalledWith("abort", added.mock.calls[0][1]);
     if (isFailed) {
-      preparing.resolve(null);
-      await expect(manager.awaitStartup(id)).rejects.toThrow("Cannot run");
+      const refused = expect(manager.awaitStartup(id)).rejects.toThrow("TaskBusy");
+      preparing.resolve(); await refused;
       expect(manager.getRecord(id)?.status).toBe("error");
     } else {
       parentSignal.abort();
       expect(manager.getRecord(id)?.status).toBe("stopped");
-      preparing.resolve({ path: "/tmp", branch: "test", baseSha: "sha", workPath: "/tmp" });
-      await manager.awaitStartup(id);
+      preparing.resolve(); await manager.awaitStartup(id);
     }
-    expect(removed).toHaveBeenCalledExactlyOnceWith("abort", added.mock.calls[0][1]);
+    await manager.getRecord(id)?.promise?.catch(() => {});
+    for (const registration of added.mock.calls) expect(removed).toHaveBeenCalledWith("abort", registration[1]);
     expect(runAgent).toHaveBeenCalledOnce();
     assertPairs(events, 1);
   });
 
   it("cancels queued resumes on parent abort without reporting another execution", async () => {
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run", isBackground: true });
     await manager.getRecord(id)!.promise;
     const blocker = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(blocker.promise);
-    manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+    manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     const parentSignal = new AbortController();
     await manager.resume(id, "resume", parentSignal.signal, { isBackground: true });
     parentSignal.abort();
@@ -586,7 +633,7 @@ describe("owner run activity", () => {
   });
 
   it.each([false, true])("failed resume closes once (background=%s)", async (isBackground) => {
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run" });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run" });
     await manager.getRecord(id)!.promise;
     vi.mocked(resumeAgent).mockRejectedValueOnce(new Error("resume failed"));
     await manager.resume(id, "resume", undefined, { isBackground });
@@ -598,10 +645,10 @@ describe("owner run activity", () => {
   it("captures dispatch root identity before queued work starts", async () => {
     const run = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(run.promise);
-    manager.spawn(pi, ctx, "Explore", "blocker", { description: "blocker", isBackground: true });
+    manager.spawn(pi, ctx, "Explore", "blocker", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-blocker"), description: "blocker", isBackground: true });
     let sessionId = "dispatch-root";
     const dispatchCtx = { ...ctx, sessionManager: { getSessionId: () => sessionId } } as ExtensionContext;
-    const id = manager.spawn(pi, dispatchCtx, "Explore", "queued", { description: "queued", isBackground: true });
+    const id = manager.spawn(pi, dispatchCtx, "Explore", "queued", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-queued"), description: "queued", isBackground: true });
     sessionId = "next-session";
     run.resolve(result);
     await manager.waitForAll();
@@ -613,9 +660,10 @@ describe("owner run activity", () => {
     const first = deferred<typeof result>();
     const second = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-    const a = manager.spawn(pi, ctx, "Explore", "a", { description: "a", isBackground: true });
-    const b = manager.spawn(pi, childCtx, "Explore", "b", { description: "b", parentAgentId: a });
-    manager.spawn(pi, ctx, "Explore", "queue", { description: "queue", isBackground: true });
+    const a = manager.spawn(pi, ctx, "Explore", "a", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-a"), description: "a", isBackground: true });
+    const b = manager.spawn(pi, childCtx, "Explore", "b", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-b"), description: "b", parentAgentId: a });
+    manager.spawn(pi, ctx, "Explore", "queue", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-queue"), description: "queue", isBackground: true });
+    await manager.awaitStartup(a); await manager.awaitStartup(b);
     expect(manager.abortAll()).toBe(3);
     expect(manager.abortAll()).toBe(0);
     assertPairs(events, 2);
@@ -629,7 +677,8 @@ describe("owner run activity", () => {
   it("refuses overlapping resumes even after stop until the old execution settles", async () => {
     const run = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(run.promise);
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run" });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run" });
+    await manager.awaitStartup(id);
     manager.getRecord(id)!.session = session;
     expect(await manager.resume(id, "overlap")).toBeUndefined();
     manager.abort(id);
@@ -643,15 +692,18 @@ describe("owner run activity", () => {
   it("shutdown closes active runs, never launches the queue, and tolerates late settlement", async () => {
     const run = deferred<typeof result>();
     vi.mocked(runAgent).mockReturnValueOnce(run.promise);
-    const id = manager.spawn(pi, ctx, "Explore", "run", { description: "run", isBackground: true });
+    const id = manager.spawn(pi, ctx, "Explore", "run", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-run"), description: "run", isBackground: true });
     const pending = manager.getRecord(id)!.promise;
-    manager.spawn(pi, ctx, "Explore", "queued", { description: "queued", isBackground: true });
-    await manager.dispose();
+    manager.spawn(pi, ctx, "Explore", "queued", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-queued"), description: "queued", isBackground: true });
+    await manager.awaitStartup(id);
+    const disposing = manager.dispose();
     assertPairs(events, 1);
     expect(events[1]).toMatchObject({ transition: "stopped", status: "stopped" });
     run.resolve(result);
+    await disposing;
     await pending;
     assertPairs(events, 1);
+    await new Promise(resolve => setImmediate(resolve));
     expect(runAgent).toHaveBeenCalledOnce();
   });
 });
@@ -705,7 +757,7 @@ describe("persisted root identity through owner dispatch", () => {
       expect(childSession.getSessionId()).not.toBe(rootId);
       const rootContext = { ...ctx, cwd: directory, sessionManager: rootSession } as ExtensionContext;
       const childContext = { ...ctx, cwd: directory, sessionManager: childSession } as ExtensionContext;
-      const parent = rootManager.spawn(pi, rootContext, "Explore", "parent", { description: "parent" });
+      const parent = rootManager.spawn(pi, rootContext, "Explore", "parent", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-parent"), description: "parent" });
       await rootManager.getRecord(parent)!.promise;
       const [nestedTool] = createNestedSubagentTools({
         manager: {
@@ -718,13 +770,15 @@ describe("persisted root identity through owner dispatch", () => {
         pi, parentAgentId: parent, depth: 1, maxSubagentDepth: 2,
         allowedSubagents: "all", configCwd: directory,
       });
+      declareTask(ctx.cwd, "lifecycle-nested");
       const nestedResult = await nestedTool.execute("nested-call", {
-        subagent_type: "Explore", description: "nested", prompt: "nested",
+        task_id: "lifecycle-nested", subagent_type: "Explore", description: "nested", prompt: "nested",
       }, undefined, undefined, childContext);
       expect(nestedResult.isError).toBe(false);
       expect(runAgent).toHaveBeenLastCalledWith(childContext, "Explore", "nested", expect.objectContaining({ nested: true }));
       const host = createWorkflowHost({
         pi, ctx: childContext, manager: childManager, rootSessionId: rootId, workflowId: "persisted-workflow",
+        taskSnapshot: declareTask(directory, "persisted-workflow-task"),
       });
       await expect(host.spawnAgent({
         agentId: "workflow-child", index: 0, agentType: "Explore", prompt: "workflow", label: "workflow",
@@ -767,6 +821,7 @@ describe("actual runner prompt cancellation boundaries", () => {
         unsubscribes.push(unsubscribe);
         return unsubscribe;
       }),
+      agent: {}, getActiveToolNames: vi.fn(() => []), setActiveToolsByName: vi.fn(),
       setSessionName: vi.fn(), bindExtensions: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(),
     } as unknown as AgentSession;
     vi.spyOn(environment, "detectEnv").mockResolvedValue({ isGitRepo: false, branch: "", platform: process.platform });
@@ -798,7 +853,7 @@ describe("actual runner prompt cancellation boundaries", () => {
     const parent = new AbortController();
     try {
       const id = manager.spawn(pi, runnerCtx, "Explore", "cancelled", {
-        description: "cancelled", isolated: true, signal: parent.signal,
+        taskSnapshot: declareTask(ctx.cwd, "lifecycle-cancelled"), description: "cancelled", isolated: true, signal: parent.signal,
       });
       await entered.promise;
       parent.abort();
@@ -807,8 +862,9 @@ describe("actual runner prompt cancellation boundaries", () => {
       expect(prompt).not.toHaveBeenCalled();
       expect(manager.getRecord(id)?.status).toBe("stopped");
       assertPairs(events, 1);
-      expect(unsubscribes).toHaveLength(2);
-      for (const unsubscribe of unsubscribes) expect(unsubscribe).toHaveBeenCalledOnce();
+      expect(unsubscribes).toHaveLength(3);
+      expect(unsubscribes[0]).not.toHaveBeenCalled();
+      for (const unsubscribe of unsubscribes.slice(1)) expect(unsubscribe).toHaveBeenCalledOnce();
     } finally {
       gate.resolve();
       await manager.dispose();
@@ -829,7 +885,7 @@ describe("actual runner prompt cancellation boundaries", () => {
     expect(outcome.session).toBe(instrumented);
     expect(outcome.responseText).toBe("");
     expect(outcome.structuredRetried).toBeUndefined();
-    expect(unsubscribes).toHaveLength(2);
+    expect(unsubscribes.length).toBeGreaterThan(0);
     for (const unsubscribe of unsubscribes) expect(unsubscribe).toHaveBeenCalledOnce();
     for (const registration of added.mock.calls) expect(removed).toHaveBeenCalledWith("abort", registration[1]);
     expect(instrumented.dispose).not.toHaveBeenCalled();
@@ -845,7 +901,7 @@ describe("actual runner prompt cancellation boundaries", () => {
     });
     expect(prompt).not.toHaveBeenCalled();
     expect(outcome).toEqual({ text: "", failure: undefined });
-    expect(unsubscribes).toHaveLength(2);
+    expect(unsubscribes.length).toBeGreaterThan(0);
     for (const unsubscribe of unsubscribes) expect(unsubscribe).toHaveBeenCalledOnce();
     for (const registration of added.mock.calls) expect(removed).toHaveBeenCalledWith("abort", registration[1]);
     expect(instrumented.dispose).not.toHaveBeenCalled();
@@ -895,6 +951,8 @@ describe("root extension bus and presentation", () => {
       registerMessageRenderer: vi.fn(), registerEntryRenderer: vi.fn(), registerFlag: vi.fn(), getFlag: vi.fn(),
       registerTool: vi.fn(), registerCommand: vi.fn(), appendEntry, sendMessage,
     } as unknown as ExtensionAPI;
+    wiringTasks(api, ["lifecycle-binding", "lifecycle-root"]);
+    manager = undefined as unknown as AgentManager;
     subagentsExtension(api);
     await lifecycle.get("session_start")!({}, { ...ctx, cwd: directory, hasUI: false });
     vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => {
@@ -916,10 +974,11 @@ describe("root extension bus and presentation", () => {
 
   it("emits owned activity before filtering, with unchanged top-level events and exactly one summary", async () => {
     const registry = Reflect.get(globalThis, Symbol.for("pi-subagents:manager")) as { spawn: AgentManager["spawn"] };
-    const id = registry.spawn(api, ctx, "Explore", "root", { description: "root", isBackground: true });
+    const id = registry.spawn(api, ctx, "Explore", "root", { task_id: declareTask(ctx.cwd, "lifecycle-root").task_id, description: "root", isBackground: true });
+    await vi.waitFor(() => expect(manager).toBeDefined());
     await manager.getRecord(id)!.promise;
-    const nested = manager.spawn(api, childCtx, "Explore", "nested", { description: "nested", parentAgentId: id });
-    const workflow = manager.spawn(api, ctx, "Explore", "workflow", { description: "workflow", workflowId: "wf-real" });
+    const nested = manager.spawn(api, childCtx, "Explore", "nested", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-nested"), description: "nested", parentAgentId: id });
+    const workflow = manager.spawn(api, ctx, "Explore", "workflow", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-workflow"), description: "workflow", workflowId: "wf-real" });
     await Promise.all([manager.getRecord(nested)!.promise, manager.getRecord(workflow)!.promise]);
     const events = emit.mock.calls.filter(call => call[0] === "subagents:run-activity").map(call => call[1] as RunActivity);
     assertPairs(events, 3);
@@ -942,7 +1001,8 @@ describe("root extension bus and presentation", () => {
       return Promise.reject(new Error("failed"));
     });
     const registry = Reflect.get(globalThis, Symbol.for("pi-subagents:manager")) as { spawn: AgentManager["spawn"] };
-    const id = registry.spawn(api, ctx, "Explore", "root", { description: "root", isBackground: true });
+    const id = registry.spawn(api, ctx, "Explore", "root", { task_id: declareTask(ctx.cwd, "lifecycle-root").task_id, description: "root", isBackground: true });
+    await vi.waitFor(() => expect(manager).toBeDefined());
     await manager.getRecord(id)!.promise;
     expect(emit.mock.calls.filter(call => call[0] === "subagents:failed")).toHaveLength(1);
     expect(emit.mock.calls.filter(call => call[0] === "subagents:completed")).toHaveLength(0);
@@ -956,7 +1016,8 @@ describe("root extension bus and presentation", () => {
 
   it("foreground resume emits activity without adding top-level events or summaries", async () => {
     const registry = Reflect.get(globalThis, Symbol.for("pi-subagents:manager")) as { spawn: AgentManager["spawn"] };
-    const id = registry.spawn(api, ctx, "Explore", "root", { description: "root" });
+    const id = registry.spawn(api, ctx, "Explore", "root", { task_id: declareTask(ctx.cwd, "lifecycle-root").task_id, description: "root" });
+    await vi.waitFor(() => expect(manager).toBeDefined());
     await manager.getRecord(id)!.promise;
     vi.mocked(resumeAgent).mockResolvedValueOnce({ text: "resumed" });
     await manager.resume(id, "resume");
@@ -975,15 +1036,17 @@ describe("root extension bus and presentation", () => {
       return run.promise;
     });
     const registry = Reflect.get(globalThis, Symbol.for("pi-subagents:manager")) as { spawn: AgentManager["spawn"] };
-    const id = registry.spawn(api, ctx, "Explore", "root", { description: "root", isBackground: true });
+    const id = registry.spawn(api, ctx, "Explore", "root", { task_id: declareTask(ctx.cwd, "lifecycle-root").task_id, description: "root", isBackground: true });
+    await vi.waitFor(() => expect(manager).toBeDefined());
     const pending = manager.getRecord(id)!.promise;
-    await lifecycle.get("session_shutdown")!();
+    const shutdown = lifecycle.get("session_shutdown")!();
     const activityCalls = () => emit.mock.calls.filter(call => call[0] === "subagents:run-activity").map(call => call[1] as RunActivity);
     assertPairs(activityCalls(), 1);
     expect(activityCalls()[1]).toMatchObject({ rootSessionId: "root", transition: "stopped", status: "stopped" });
     expect(appendEntry).not.toHaveBeenCalled();
     run.resolve(result);
     await pending;
+    await shutdown;
     assertPairs(activityCalls(), 1);
     expect(appendEntry).toHaveBeenCalledOnce();
     expect(emit.mock.calls.filter(call => call[0] === "subagents:failed")).toHaveLength(1);

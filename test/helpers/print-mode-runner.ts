@@ -1,49 +1,7 @@
-/**
- * print-mode-runner.ts — a headless ("print mode") host runner for driving the
- * pi-subagents extension through REAL end-to-end subagent runs.
- *
- * WHY THIS EXISTS
- * ---------------
- * The other e2e suites (agent-runner-e2e, ext-templates-e2e) assert on the
- * *gated tool set captured at construction* — they never drive a turn, so they
- * never actually spawn a subagent or exercise the background hold condition.
- * This runner closes that gap: it boots a real headless pi session with the
- * pi-subagents extension loaded, drives a real assistant turn that calls the
- * `Agent` tool, and lets the extension spawn a real child session through the
- * real `runAgent` path — then waits for it to finish exactly like a production
- * print-mode host does.
- *
- * It is the pi-subagents analogue of pi-chonky-step's `src/agent.ts` headless
- * runner: same shape (DefaultResourceLoader → createAgentSession → prompt loop),
- * and crucially it replicates pi-chonky-step's SUBAGENT HOLD CONDITION — the
- * `dequeueFollowUpMessages` monkey-patch that blocks the parent agent loop until
- * background subagents complete (via the `Symbol.for("pi-subagents:manager")`
- * global the extension publishes). Without that patch, `session.prompt()`
- * resolves and the parent finishes before background children report back.
- *
- * MODEL BACKEND (faux default, real opt-in)
- * -----------------------------------------
- *   - Faux (default): a scripted `registerFauxProvider` model drives both the
- *     parent and the spawned child deterministically — no network, CI-safe. You
- *     supply a `respond(context)` function (or raw `steps`) that emits the
- *     `Agent` tool call on the parent and a reply on the child. `routeBySession`
- *     does the parent/child branching for the common single-spawn case.
- *   - Live (opt-in): set `PI_E2E_LIVE=1` or pass `live: {provider, model}`. A real
- *     model drives the turn; `respond`/`steps` are ignored. Non-deterministic,
- *     needs creds. With no explicit model pin, it resolves the model from your
- *     local `pi` config (settings default → first authed model), so a logged-in
- *     `pi` is picked up automatically — no PI_PROVIDER/PI_MODEL needed.
- *
- * ONE PARAMETERIZED RUNNER
- * ------------------------
- * The same `runPrintMode()` covers built-in agent types, `.pi/agents/*.md` /
- * `.agents/agents/*.md` frontmatter agents, and inline-instruction agents — the difference is purely
- * what you register in `beforeRun` and which `subagent_type` the `Agent` call
- * names. See `test/subagents-print-mode-e2e.test.ts` for usage.
- */
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   type AssistantMessage,
@@ -65,6 +23,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { TaskAuthority, type TaskSnapshot } from "../../src/task-worktree.js";
 import { fauxModelBackend } from "./faux-model-backend.js";
 import { getModel, registerFauxProvider, responderContext } from "./pi-ai.js";
 
@@ -94,6 +53,7 @@ export type FauxResponder = (
 ) => FauxReply | Promise<FauxReply>;
 
 export interface RunPrintModeOptions {
+  taskFixture?: { binary: string; task_ids: readonly string[] };
   /** The user prompt that kicks off the parent turn. */
   prompt: string;
   /**
@@ -253,10 +213,21 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const live = isLive(options);
   const isolateGlobals = options.isolateGlobals ?? !live;
   const timeoutMs = options.timeoutMs ?? 30_000;
+  if (!live && !options.steps && !options.respond) throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
+  if (options.taskFixture && (!options.taskFixture.task_ids.length || !isolateGlobals)) throw new Error("Declare explicit SDK tasks and isolate their authority storage");
 
-  // --- working dir (own it only if we created it) ---
-  const ownsCwd = options.cwd == null;
-  const cwd = options.cwd ?? mkdtempSync(join(tmpdir(), "subagents-print-"));
+  let isOwnedCwd = options.cwd == null;
+  let cwd = realpathSync(options.cwd ?? mkdtempSync(join(tmpdir(), "subagents-print-")));
+  if (options.taskFixture && options.cwd) {
+    let root: string | undefined;
+    try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
+    if (root !== cwd) {
+      const copy = realpathSync(mkdtempSync(join(tmpdir(), "subagents-print-repository-")));
+      cpSync(cwd, copy, { recursive: true }); cwd = copy; isOwnedCwd = true;
+    }
+  }
+  const previousPath = process.env.PATH;
+  if (options.taskFixture) process.env.PATH = `${dirname(options.taskFixture.binary)}:${previousPath}`;
 
   // chdir into cwd: the extension discovers project custom agents from process.cwd()
   // (not ctx.cwd), and re-reads them on every Agent invocation — so a custom agent
@@ -270,7 +241,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const prevHome = process.env.HOME;
   let hermeticDir: string | undefined;
   if (isolateGlobals) {
-    hermeticDir = mkdtempSync(join(tmpdir(), "subagents-print-home-"));
+    hermeticDir = realpathSync(mkdtempSync(join(tmpdir(), "subagents-print-home-")));
     process.env.PI_CODING_AGENT_DIR = hermeticDir;
     process.env.HOME = hermeticDir;
   }
@@ -349,10 +320,28 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   });
   await loader.reload();
 
-  // Run any test-supplied registration (e.g. loadCustomAgents) now that globals
-  // are isolated but before the parent turn spawns anything.
   await options.beforeRun?.();
 
+  const parentSessionManager = SessionManager.inMemory(cwd);
+  if (options.taskFixture) {
+    const git = (args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    let base: string;
+    try { base = git(["rev-parse", "HEAD"]); }
+    catch {
+      git(["init", "-q"]); git(["config", "user.name", "SDK fixture"]); git(["config", "user.email", "fixture@example.invalid"]);
+      git(["add", "."]); git(["commit", "--allow-empty", "-qm", "SDK fixture base"]); base = git(["rev-parse", "HEAD"]);
+    }
+    const authority = new TaskAuthority({ binary: options.taskFixture.binary, storage: join(homedir(), ".local", "share", "agents", "task-worktrees", "v1") });
+    try {
+      for (const task_id of options.taskFixture.task_ids) {
+        const task = await authority.ensure(cwd, task_id, base);
+        if (task_id === options.taskFixture.task_ids[0]) {
+          const snapshot: TaskSnapshot = { repository: cwd, task_id, generation: task.generation, repository_id: task.repository_id, base_oid: task.base_oid, checkout: task.checkout, configCwd: cwd, access: "write" };
+          parentSessionManager.appendCustomEntry("subagents:task-binding", { version: 1, snapshot });
+        }
+      }
+    } finally { await authority.close(); }
+  }
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -361,7 +350,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     modelRegistry: modelRegistry as any,
     modelRuntime: modelRuntime as any,
     resourceLoader: loader,
-    sessionManager: SessionManager.inMemory(cwd),
+    sessionManager: parentSessionManager,
     // Live: real settings so an omitted model resolves to your local default
     // (settingsManager.getDefaultModel) and retries/compaction match your config.
     // Faux: in-memory, deterministic, no disk.
@@ -418,15 +407,10 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   options.signal?.addEventListener("abort", onAbort, { once: true });
 
   const dispose = async () => {
-    // Emit session_shutdown FIRST so extensions tear down cleanly — in live mode
-    // the real env loads global extensions (e.g. a status-bar) whose background
-    // timers would otherwise fire after dispose() invalidates the ctx and surface
-    // as unhandled "stale ctx" rejections. dispose() itself does the invalidation,
-    // so shutdown has to happen before it.
     try {
       await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
-    } catch {
-      /* ignore */
+    } catch (error) {
+      if (options.taskFixture) throw error;
     }
     try {
       session.dispose?.();
@@ -448,7 +432,11 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
       else process.env.HOME = prevHome;
       if (hermeticDir) rmSync(hermeticDir, { recursive: true, force: true });
     }
-    if (ownsCwd) rmSync(cwd, { recursive: true, force: true });
+    if (options.taskFixture) {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+    if (isOwnedCwd) rmSync(cwd, { recursive: true, force: true });
   };
 
   // --- drive the turn under a wall-clock guard ---

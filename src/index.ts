@@ -25,7 +25,7 @@ import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode, resolveTaskInvocation, stripTaskCapabilities, taskParams } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
@@ -36,6 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { type TaskSnapshot, validateTaskAccess, validateTaskSnapshot } from "./task-worktree.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -76,6 +77,13 @@ import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./workt
 import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
+
+/**
+ * Carries a model-mode mention's captured task snapshot from its clone's Agent
+ * call into the Agent tool. A module-private symbol key: no tool-call JSON can
+ * produce it, so the model cannot forge a snapshot through it.
+ */
+const MENTION_TASK_SNAPSHOT = Symbol("pi-subagents:mention-task-snapshot");
 
 /** Tool execute return value for a text response. */
 function textResult(msg: string, details?: AgentDetails) {
@@ -609,6 +617,7 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      taskSnapshot: record.taskSnapshot, cwd: record.taskSnapshot?.checkout,
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -714,7 +723,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
-    const safeOptions = { ...(options ?? {}) };
+    const safeOptions = stripTaskCapabilities(options ?? {});
     delete safeOptions.parentAgentId;
     // Internal too: a forged value would hide an RPC-spawned agent inside
     // someone else's workflow, and take it out of the concurrency pool with it.
@@ -801,10 +810,21 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Capture ctx from session_start for RPC spawn handler + start the scheduler.
-  // This also wires the RPC handlers and broadcasts readiness — on the first
-  // bound session_start, so a filtered-out activation never advertises (#142).
+  let taskBindingEpoch = 0;
   pi.on("session_start", async (_event, ctx) => {
+    taskBindingEpoch++;
+    manager.setTaskBinding();
+    try {
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== "custom" || entry.customType !== "subagents:task-binding") continue;
+        const data = entry.data as { version?: unknown; snapshot?: unknown } | undefined;
+        if (!data || data.version !== 1 || Object.keys(data).some(key => key !== "version" && key !== "snapshot") || !Object.hasOwn(data, "snapshot")) throw new Error("Invalid explicit task binding entry; bind the task again");
+        manager.setTaskBinding(data.snapshot === null ? undefined : validateTaskSnapshot(data.snapshot));
+      }
+    } catch (error) {
+      manager.setTaskBinding();
+      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    }
     currentCtx = ctx;
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -1006,6 +1026,7 @@ export default function (pi: ExtensionAPI) {
           description: entry.description,
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
+          taskSnapshot: entry.taskSnapshot ?? (() => { throw new Error("Cannot reopen a legacy conversation without its recorded task snapshot"); })(),
           isBackground: true,
         });
         // The agent may still be starting — wait, so a startup failure lands in
@@ -1036,38 +1057,33 @@ export default function (pi: ExtensionAPI) {
       ?? (alias ? resolveHandleToType(alias, getAvailableTypes()) : undefined);
     if (!type) return { action: "continue" };
 
-    // Claude Code never starts the agent itself: `@agent-<type>` becomes an
-    // attachment asking the main model to do it, and the model writes the
-    // agent's prompt from the conversation rather than forwarding the typed
-    // text. That buys a real `Agent` tool call — transcript, per-tool widget
-    // detail, tool-use-id correlation, join grouping — and a prompt with the
-    // context a cold spawn lacks.
-    //
-    // It also costs a visible turn, spent narrating a decision the user already
-    // made by typing the handle. So the turn is taken by a clone of this
-    // conversation instead (mention-clone.ts): same messages, same system
-    // prompt, off-screen, holding only the `Agent` tool. Nothing reaches the
-    // chat, and what it starts is an ordinary top-level agent.
     if (getAgentMentionMode() === "model") {
       const label = `@${handleBase(type)}`;
-      // "Prompting", not "Starting": in this mode nothing starts until the
-      // off-screen clone has taken a whole model turn writing the agent's
-      // prompt, and that wait is the one thing the chat cannot show. `direct`
-      // says "Started" because by then it has. The distinction tells the user
-      // which of the two they are waiting on.
+      const capturedTask = manager.getTaskBinding();
+      if (!capturedTask) {
+        ctx.ui.notify("An explicit task binding is required before starting an agent mention; use /agents task bind", "error");
+        return { action: "handled" };
+      }
       ctx.ui.notify(`Prompting ${label}…`, "info");
-      // Not awaited: the clone runs a full model turn, and prompt() is blocked
-      // until this hook returns. The user gets their prompt back immediately
-      // and the agent appears in the widget when it starts.
-      void runMentionClone({ ctx, type, message: mention.message, agentTool: registeredAgentTool })
+      const capturedTool: typeof registeredAgentTool = {
+        ...registeredAgentTool,
+        execute: (toolCallId, params, signal, onUpdate, ctxRef) => {
+          const forwarded = params as Record<string, unknown>;
+          const task_id = forwarded.task_id === undefined ? capturedTask.task_id : forwarded.task_id;
+          const task_access = forwarded.task_access === undefined ? capturedTask.access : forwarded.task_access;
+          // The snapshot itself, not just its ID: a rebind before the clone's call
+          // must not change the repository or generation this mention captured.
+          const isCaptured = task_id === capturedTask.task_id && task_access === capturedTask.access;
+          return registeredAgentTool.execute(toolCallId, { ...forwarded, task_id, task_access, ...(isCaptured ? { [MENTION_TASK_SNAPSHOT]: capturedTask } : {}) }, signal, onUpdate, ctxRef);
+        },
+      };
+      void runMentionClone({ ctx, type, message: mention.message, agentTool: capturedTool })
         .then(async (result) => {
           if (result.spawned) return;
-          // A clone that could not run must not swallow the mention: start the
-          // agent the direct way rather than leaving the user with a toast and
-          // nothing running.
           try {
-            const id = spawnTopLevel(pi, ctx, type, mention.message, {
+            const id = spawnResolved(pi, ctx, type, mention.message, {
               description: describeMention(mention.message),
+              taskSnapshot: capturedTask,
               isBackground: true,
             });
             // Same reason as the direct path below: the agent may still be
@@ -1105,9 +1121,21 @@ export default function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
 
-  pi.on("session_before_switch", () => {
-    manager.clearCompleted(true);
+  pi.on("session_before_switch", async () => {
+    taskBindingEpoch++;
     scheduler.stop();
+    const workflowSettlements = [...workflowTasks.values()].map(task => {
+      task.abortController.abort();
+      return task.settlement;
+    });
+    manager.abortAll();
+    await Promise.all(workflowSettlements);
+    // Rejects for each settlement error not yet reported, keeping records and the
+    // binding. A later switch with nothing new to report clears them.
+    await manager.waitForAll();
+    manager.clearCompleted(true, true);
+    manager.setTaskBinding();
+    currentCtx = undefined;
   });
 
   // On shutdown, abort all agents immediately and clean up.
@@ -1126,18 +1154,24 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
-    // Before abortAll, and not folded into it: a workflow owns a worker thread
-    // as well as its children, and only its own signal terminates that.
-    for (const task of workflowTasks.values()) task.abortController.abort();
-    workflowTasks.clear();
+    const workflowSettlements = [...workflowTasks.values()].map(task => {
+      task.abortController.abort();
+      return task.settlement;
+    });
     manager.abortAll();
+    await Promise.all(workflowSettlements);
+    workflowTasks.clear();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those
-    // handlers would never run. Internally bounded, so a hung one can't strand quit.
+    // handlers would never run. Each child's shutdown handlers get 3 s; every task
+    // helper control request and post-EOF exit wait has a fixed deadline, and a miss
+    // rejects as uncertain settlement instead of hanging. A command run with
+    // timeout_ms is bounded by that timeout plus a fixed grace. A command run without
+    // one is cancelled first, but its settlement still waits on the helper.
     await manager.dispose(pi);
   });
 
@@ -1312,7 +1346,7 @@ export default function (pi: ExtensionAPI) {
     // path is deterministic per agent+session, so writing an initial entry
     // would truncate the previous run's turns (see ensureOutputFile).
     if (opts.outputTranscript) {
-      existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+      existing.outputFile ??= createOutputFilePath(existing.taskSnapshot!.configCwd, id, existing.rootSessionId ?? ctx.sessionManager.getSessionId());
       ensureOutputFile(existing.outputFile);
     }
     // Anchor streaming past the turns already on disk, captured BEFORE the
@@ -1340,7 +1374,7 @@ export default function (pi: ExtensionAPI) {
       onStarted: () => {
         const rec = manager.getRecord(id);
         if (rec?.session && rec.outputFile) {
-          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
+          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, rec.taskSnapshot!.checkout, transcriptAnchor, rec.taskSnapshot);
         }
       },
     });
@@ -1486,11 +1520,11 @@ export default function (pi: ExtensionAPI) {
   // With no per-result note by design, the model would have every reason to go
   // on reporting a `pi-agent-*` branch that was never created.
   const isolationGuideline = isWorktreeIsolationEnabled()
-    ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
+    ? `\n- isolation is an ignored legacy option: every agent works in its claimed task checkout, nothing is committed or removed automatically, and no branch is named in the result. Leave it unset.`
     : "";
 
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
-    ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
+    ? `\n- isolation is ignored; every agent works in its claimed task checkout.`
     : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
@@ -1666,6 +1700,7 @@ Terse command-style prompts produce shallow, generic work.
           description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
         }),
       ),
+      ...taskParams,
       ...isolationParam(isWorktreeIsolationEnabled()),
       ...scheduleParam,
     }),
@@ -1786,10 +1821,9 @@ Terse command-style prompts produce shallow, generic work.
       return new Text(line, 0, 0);
     },
 
-    // ---- Execute ----
-
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      // Ensure we have UI context for widget rendering
+      const mentionSnapshot = (params as Record<symbol, TaskSnapshot | undefined>)[MENTION_TASK_SNAPSHOT];
+      const taskFields = { ...resolveTaskInvocation(params), ...(mentionSnapshot !== undefined ? { taskSnapshot: mentionSnapshot } : {}) };
       widget.setUICtx(ctx.ui as UICtx);
 
       // Reload custom agents so new project/global .md files are picked up without restart
@@ -1869,7 +1903,7 @@ Terse command-style prompts produce shallow, generic work.
       const attachTranscript = (rec: AgentRecord | undefined, agentId: string): void => {
         if (!rec || !outputTranscript) return;
         rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
-        writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
+        writeInitialEntry(rec.outputFile, agentId, params.prompt, rec.taskSnapshot!.checkout, rec.taskSnapshot);
       };
 
       const { modelName, modelId } = model ? describeModel(model) : { modelName: undefined, modelId: undefined };
@@ -1942,7 +1976,8 @@ Terse command-style prompts produce shallow, generic work.
           return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
         try {
-          const job = scheduler.addJob({
+          const job = await scheduler.addJob({
+            ...taskFields,
             name: params.description as string,
             description: params.description as string,
             schedule: params.schedule as string,
@@ -1976,6 +2011,8 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+        if ((taskFields.task_id !== undefined && taskFields.task_id !== existing.taskSnapshot?.task_id) ||
+            (taskFields.task_access !== undefined && taskFields.task_access !== existing.taskSnapshot?.access)) throw new Error("Resume task fields must match the recorded snapshot");
 
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
@@ -2017,7 +2054,14 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const transcriptAnchor = existing.session.messages.length;
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          onStarted: () => {
+            if (existing.outputFile && existing.session) {
+              existing.outputCleanup = streamToOutputFile(existing.session, existing.outputFile, existing.id, existing.taskSnapshot!.checkout, transcriptAnchor, existing.taskSnapshot);
+            }
+          },
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2045,7 +2089,7 @@ Terse command-style prompts produce shallow, generic work.
           origBgOnSession(session);
           const rec = manager.getRecord(id);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, rec.taskSnapshot!.checkout, undefined, rec.taskSnapshot);
           }
         };
 
@@ -2053,6 +2097,8 @@ Terse command-style prompts produce shallow, generic work.
         // tool call failed only when execute throws, and a returned message
         // reads to the model as a subagent that ran and reported this (#179).
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+          ...taskFields,
+          onSpawned: agentId => attachTranscript(manager.getRecord(agentId), agentId),
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2061,7 +2107,6 @@ Terse command-style prompts produce shallow, generic work.
           inheritContext,
           thinkingLevel: thinking,
           isBackground: true,
-          isolation,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
@@ -2074,7 +2119,6 @@ Terse command-style prompts produce shallow, generic work.
         if (record && joinMode) {
           record.joinMode = joinMode;
           record.toolCallId = toolCallId;
-          attachTranscript(record, id);
         }
 
         // With isolation: "worktree" the agent isn't running yet — the repo
@@ -2191,7 +2235,7 @@ Terse command-style prompts produce shallow, generic work.
         if (fgId) {
           const rec = manager.getRecord(fgId);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, rec.taskSnapshot!.checkout, undefined, rec.taskSnapshot);
           }
         }
       };
@@ -2207,6 +2251,7 @@ Terse command-style prompts produce shallow, generic work.
       let record: AgentRecord;
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
+          ...taskFields,
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2214,7 +2259,6 @@ Terse command-style prompts produce shallow, generic work.
           isolated,
           inheritContext,
           thinkingLevel: thinking,
-          isolation,
           invocation: agentInvocation,
           signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
@@ -2354,6 +2398,7 @@ Terse command-style prompts produce shallow, generic work.
           signal: task.abortController.signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
           workflowId: task.id,
+          taskSnapshot: task.taskSnapshot,
         }),
         onProgress: entries => updateWorkflowProgressBatch(task, entries),
         // The dialog's pause / skip / retry keys run through this; it is dropped
@@ -2443,7 +2488,7 @@ Terse command-style prompts produce shallow, generic work.
         Type.String({
           pattern: "^wf_[a-z0-9-]{6,}$",
           description:
-            "Run id of an earlier workflow in this session. Its unchanged leading agent() calls return their recorded results instantly; the first changed or failed call, and everything after it, runs live. Same script and args means nothing re-runs.",
+            "Run id of an earlier workflow in this session. Managed task checkouts run live: journals cannot prove unchanged working bytes. Qualified pure library hosts may reuse an immutable prefix.",
         }),
       ),
       // Accepted and ignored, as in Claude Code. Models reach for them because
@@ -2538,6 +2583,7 @@ Terse command-style prompts produce shallow, generic work.
       const replay = resumeFrom !== undefined ? readJournal(resumeFrom.journalPath) : undefined;
 
       const task = createWorkflowTask({
+        taskSnapshot: resumeFrom === undefined ? manager.getTaskBinding() : workflowTasks.get(resumeFrom.runId)?.taskSnapshot,
         id: runId,
         script: resolved.script,
         scriptPath: resolved.scriptPath ?? savedPath,
@@ -2555,9 +2601,8 @@ Terse command-style prompts produce shallow, generic work.
       widget.update();
       fleet.update();
 
-      // Background, like Claude Code: the id comes back now and the run keeps
-      // going without the tool call.
-      void runWorkflowTask(ctx, task).then(() => notifyWorkflowFinished(task));
+      task.settlement = runWorkflowTask(ctx, task);
+      void task.settlement.then(() => notifyWorkflowFinished(task));
 
       return {
         content: [{
@@ -2704,18 +2749,14 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
+    const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta, taskSnapshot: manager.getTaskBinding() });
     workflowTasks.set(task.id, task);
     widget.update();
     fleet.update();
     report(`Running workflow ${meta.name}…`, "info");
 
-    // Detached: session_start is awaited by the host, and a workflow can run for
-    // minutes — blocking here would hold the whole session's startup.
-    void runWorkflowTask(ctx, task).then(() => {
-      // No tool call to attach a result card to, so the card becomes a session
-      // entry (same layout), and the outcome is handed to the model as context
-      // for its next turn rather than forcing one.
+    task.settlement = runWorkflowTask(ctx, task);
+    void task.settlement.then(() => {
       pi.appendEntry<WorkflowEntryData>(WORKFLOW_ENTRY_TYPE, workflowEntryData(task));
       pi.sendMessage({
         customType: "workflow-result",
@@ -3306,7 +3347,7 @@ memory: <"user" (global), "project" (per-project), or "local" (gitignored per-pr
       // session — the #231 pathology (models fill the fields they are shown)
       // one layer up. Built per invocation, so this read is live.
       isWorktreeIsolationEnabled()
-        ? `\nisolation: <"worktree" to run in isolated git worktree; "off" to refuse one even when the caller asks. Omit for normal>`
+        ? `\nisolation: <ignored legacy option; omit it>`
         : ""
     }
 ---
@@ -3321,7 +3362,7 @@ Guidelines for choosing settings:
 - Use prompt_mode: replace for fully custom agents with their own personality/instructions
 - Set inherit_context: true if the agent needs to know what was discussed in the parent conversation
 - Set isolated: true if the agent should NOT have access to MCP servers or other extensions
-- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session, isolation: worktree commits, and memory still write) — set those too if that's the goal
+- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session and memory still write) — set those too if that's the goal
 - Only include frontmatter fields that differ from defaults — omit fields where the default is fine
 
 Write the file using the write tool. Only write the file, nothing else.`;
@@ -3614,7 +3655,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
           id: "worktreeIsolation",
           label: "Worktree isolation",
           description:
-            "Allow isolation: worktree to copy the repo. Off refuses worktrees on every path immediately — for repos where a copy costs too much time or disk — and drops the `isolation` param from the Agent tool spec on next pi session.",
+            "Legacy setting. The `isolation` param is ignored either way; off drops it from the Agent tool spec on next pi session.",
           currentValue: isWorktreeIsolationEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -3967,8 +4008,47 @@ Write the file using the write tool. Only write the file, nothing else.`;
   }
 
   pi.registerCommand("agents", {
-    description: "Manage agents",
-    handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+    description: "Manage agents; task bind/status/unbind/finish/abandon",
+    handler: async (args, ctx) => {
+      const words = args.trim().split(/\s+/);
+      if (words[0] !== "task") { await showAgentsMenu(ctx); return; }
+      const persistBinding = (snapshot?: TaskSnapshot) => pi.appendEntry("subagents:task-binding", { version: 1, snapshot: snapshot ?? null });
+      try {
+        const action = words[1];
+        if (action === "bind") {
+          if (!words[2]) throw new Error("Use /agents task bind <task_id> [--base <full commit>] [--access write|read-stable]. Omit --base only for an existing initialized task.");
+          let base_oid: string | undefined;
+          let access = validateTaskAccess("write");
+          for (let i = 3; i < words.length; i += 2) {
+            if (words[i] === "--base" && base_oid === undefined && words[i + 1]) base_oid = words[i + 1];
+            else if (words[i] === "--access" && words[i + 1]) access = validateTaskAccess(words[i + 1]);
+            else throw new Error("Unknown or incomplete task bind option; use --base <full commit> and --access write|read-stable");
+          }
+          const epoch = taskBindingEpoch;
+          const snapshot = await manager.captureTaskSnapshot(ctx.cwd, words[2], { base_oid, access, configCwd: ctx.cwd });
+          if (epoch !== taskBindingEpoch) throw new Error("Session switched during task binding; bind again in the selected session");
+          manager.setTaskBinding(snapshot);
+          persistBinding(snapshot);
+          ctx.ui.notify(`Bound task ${snapshot.task_id} (${snapshot.access}) at ${snapshot.checkout}; base ${snapshot.base_oid}`, "info");
+        } else if (action === "status" && words.length === 2) {
+          const snapshot = manager.getTaskBinding();
+          ctx.ui.notify(snapshot ? `Task ${snapshot.task_id} (${snapshot.access}) at ${snapshot.checkout}; base ${snapshot.base_oid}` : "No task bound. Use /agents task bind <task_id>.", "info");
+        } else if (action === "unbind" && words.length === 2) {
+          manager.setTaskBinding(); persistBinding();
+          ctx.ui.notify("Task binding cleared; existing workers retain their captured task", "info");
+        } else if ((action === "finish" || action === "abandon") && words.length >= 3) {
+          const snapshot = manager.getTaskBinding();
+          if (!snapshot) throw new Error("Bind the existing task before finishing or abandoning it");
+          const epoch = taskBindingEpoch;
+          await manager.finishTask(snapshot, action === "finish" ? "complete" : "abandoned", words.slice(2).join(" "));
+          const isStillBound = epoch === taskBindingEpoch && manager.getTaskBinding() === snapshot;
+          if (isStillBound) { manager.setTaskBinding(); persistBinding(); }
+          ctx.ui.notify(`Task ${snapshot.task_id} ${action === "finish" ? "completed" : "abandoned"} with explicit preservation; no cleanup requested${isStillBound ? "" : ". The newer task binding stays in place"}`, "info");
+        } else throw new Error("Use /agents task bind <task_id> [--base <full commit>] [--access write|read-stable], status, unbind, finish <new absolute preservation destination>, or abandon <new absolute preservation destination>");
+      } catch (error) {
+        ctx.ui.notify(`Task operation failed: ${error instanceof Error ? error.message : String(error)}. No allocation fallback or cleanup was attempted.`, "error");
+      }
+    },
   });
 
   /**

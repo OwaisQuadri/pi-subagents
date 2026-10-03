@@ -1,8 +1,5 @@
-/**
- * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
- */
-
 import { readFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
@@ -11,12 +8,17 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createBashToolDefinition,
   createEventBus,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
   SessionManager,
   SettingsManager,
+  type ToolDefinition,
+  truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { ASK_PARENT_QUESTION_TOOL_NAME, captureParentQuestionContext, createAskParentQuestionTool } from "./ask-parent-question.js";
@@ -31,6 +33,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
+import { type TaskClaimHolder, taskShellArgv } from "./task-worktree.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -400,6 +403,7 @@ export type ToolActivity =
   | { type: "end"; toolCallId?: undefined; toolName: string };
 
 export interface RunOptions {
+  taskClaimHolder?: TaskClaimHolder;
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
@@ -643,6 +647,22 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+async function taskOutputTail(path: string): Promise<string> {
+  const file = await open(path, "r");
+  try {
+    const { size } = await file.stat();
+    const buffer = Buffer.alloc(DEFAULT_MAX_BYTES / 4);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, Math.max(0, size - buffer.length));
+    const tail = truncateTail(buffer.subarray(0, bytesRead).toString("utf8"), {
+      maxBytes: buffer.length,
+      maxLines: DEFAULT_MAX_LINES / 4,
+    });
+    return (tail.content || "(no output)") + (size > bytesRead || tail.truncated ? "\n[bounded tail; earlier bytes/lines omitted]" : "");
+  } finally {
+    await file.close();
+  }
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -652,11 +672,12 @@ export async function runAgent(
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
-  // Resolve working directory: worktree override > parent cwd
-  const effectiveCwd = options.cwd ?? ctx.cwd;
-  // Filesystem work happens in effectiveCwd; config discovery in configCwd.
-  // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
-  const configCwd = options.configCwd ?? effectiveCwd;
+  const holder = options.taskClaimHolder;
+  if (holder && !holder.current) throw new Error("Task claim is not active");
+  const effectiveCwd = holder?.current?.snapshot.checkout ?? options.cwd ?? ctx.cwd;
+  const configCwd = options.configCwd ?? holder?.current?.snapshot.configCwd ?? effectiveCwd;
+  const isStableReader = holder?.current?.snapshot.access === "read-stable";
+  const readerBuiltins = new Set(["read", "grep", "find", "ls"]);
 
   const env = await detectEnv(options.pi, effectiveCwd);
 
@@ -684,6 +705,7 @@ export async function runAgent(
   }
 
   let toolNames = getToolNamesForType(type);
+  if (isStableReader) toolNames = toolNames.filter(name => readerBuiltins.has(name));
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
@@ -894,7 +916,7 @@ export async function runAgent(
   const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
     ? options.nestedRuntime
     : undefined;
-  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated && !isStableReader
     ? createNestedSubagentTools({
         manager: nestedRuntime.manager,
         pi: options.pi,
@@ -932,52 +954,18 @@ export async function runAgent(
     ...parentQuestionTools.map(tool => tool.name),
     ...userQuestionTools.map(tool => tool.name),
   ]);
-  // Re-admitted together at every gate below. Kept as one set so a new injected
-  // tool cannot be added to some of the three gates and forgotten at the rest.
-  //
-  // `disallowed_tools` is applied HERE rather than at the gates, because the two
-  // kinds answer to it differently: a nested delegation tool is an opt-in the
-  // agent's own frontmatter can take back, while StructuredOutput exists only
-  // because this call asked for a schema — removing it would make the request
-  // unsatisfiable by construction rather than merely restricted.
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
     ...questionToolNames,
   ]);
 
-  // ─── Tool scoping ───────────────────────────────────────────────────────
-  //
-  // Some extensions register their tools ASYNCHRONOUSLY, long after the
-  // `loader.reload()` above: pi-mcp calls registerTool from `session_start`
-  // (once its MCP servers connect), context-mode from `before_agent_start`.
-  // That is deliberate on their part — eagerly spawning an MCP bridge during
-  // extension discovery orphans child processes on pi's non-agent code paths
-  // (--help, config, trust probing).
-  //
-  // So the tool set cannot be snapshotted here. pi's `allowedToolNames` gates
-  // tool *registration* (`_refreshToolRegistry`'s `isAllowedTool`), not merely
-  // the active set, and is frozen at construction — a name absent from the
-  // snapshot is dropped forever, even once the tool actually registers (#125).
-  //
-  // Whenever extensions are in play we therefore:
-  //   - leave `allowedToolNames` unset, so pi's live gate admits tools whenever
-  //     they register;
-  //   - express the name-stable, permanent part of the scope (our own
-  //     orchestration tools, built-ins the agent didn't ask for, and
-  //     `disallowedTools`) as `excludeTools`, which pi re-applies on every
-  //     registry refresh;
-  //   - enforce `ext:` narrowing on the ACTIVE set via the live `inScope()`
-  //     predicate installed after bind — the active set is what the LLM sees,
-  //     so a registry tool that is never activated is invisible and uncallable.
-  //
-  // `noExtensions`/`isolated` keeps the historical static allowlist: nothing
-  // async can appear there, and a hard registry gate is the correct boundary.
   const builtinToolNameSet = new Set(toolNames);
+  const safeCommunication = new Set([...structuredToolNames, ...questionToolNames]);
 
   let sessionTools: string[] | undefined;
   let sessionExcludeTools: string[] | undefined;
-  if (noExtensions) {
+  if (noExtensions || isStableReader) {
     // Strict allowlist: built-ins the agent asked for, plus any opt-in nested
     // tools (whose names would otherwise be dropped as EXCLUDED_TOOL_NAMES).
     sessionTools = [
@@ -985,10 +973,6 @@ export async function runAgent(
         (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
       ),
       ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
-      // Not filtered through `disallowedSet`, unlike the nested tools above:
-      // the caller asked for a schema, and removing the only tool that can
-      // satisfy it would make the request unsatisfiable by construction rather
-      // than merely restricted.
       ...structuredToolNames,
       ...questionToolNames,
     ];
@@ -1010,6 +994,12 @@ export async function runAgent(
       }
     }
     sessionExcludeTools = [...denyTools];
+  }
+
+  if (isStableReader) {
+    sessionExcludeTools = loader.getExtensions().extensions.flatMap(extension =>
+      [...extension.tools.keys()].filter(name => !safeCommunication.has(name)),
+    );
   }
 
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
@@ -1034,6 +1024,51 @@ export async function runAgent(
         })
       : SessionManager.inMemory(effectiveCwd);
 
+  const managedBash: ReturnType<typeof createBashToolDefinition> | undefined = holder ? {
+    ...createBashToolDefinition(effectiveCwd),
+    description: "Execute bash in the claimed task checkout. Output is returned after verified settlement, not streamed. Stdout and stderr are shown separately, not interleaved; each is bounded to 12.5KB or 500 lines. Full evidence paths are retained separately (fullOutputPath refers to stdout). Timeout is in seconds.",
+    async execute(_toolCallId, { command, timeout }, signal, _onUpdate, toolCtx) {
+      const claim = holder.current;
+      if (!claim) throw new Error("Task claim is not active");
+      if (claim.snapshot.access !== "write") throw new Error("Stable-reader task denies bash");
+      if (claim.snapshot.checkout !== effectiveCwd) throw new Error("Task checkout changed within a session");
+      let timeout_ms: number | undefined;
+      if (timeout !== undefined) {
+        if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("Invalid timeout: must be a finite number of seconds");
+        if (timeout * 1000 > 2_147_483_647) throw new Error("Invalid timeout: maximum is 2147483.647 seconds");
+        timeout_ms = Math.ceil(timeout * 1000);
+      }
+      const env: Record<string, string> = { PI_SESSION_ID: toolCtx.sessionManager.getSessionId() };
+      const sessionFile = toolCtx.sessionManager.getSessionFile();
+      if (sessionFile) env.PI_SESSION_FILE = sessionFile;
+      if (toolCtx.model) {
+        env.PI_PROVIDER = toolCtx.model.provider;
+        env.PI_MODEL = toolCtx.model.id;
+      }
+      if (toolCtx.thinkingLevel) env.PI_REASONING_LEVEL = toolCtx.thinkingLevel;
+      const prefix = settingsManager.getShellCommandPrefix();
+      const result = await claim.run({
+        argv: taskShellArgv(settingsManager.getShellPath(), prefix ? `${prefix}\n${command}` : command),
+        cwd: claim.snapshot.checkout,
+        env,
+        ...(timeout_ms !== undefined ? { timeout_ms } : {}),
+      }, signal).catch(error => {
+        if (error instanceof Error && error.message === "aborted") throw new Error("Command aborted");
+        throw error;
+      });
+      const stdout = await taskOutputTail(result.stdout);
+      const stderr = await taskOutputTail(result.stderr);
+      const text = `[stdout]\n${stdout}\n\n[stderr]\n${stderr}\n\nFull stdout: ${result.stdout}\nFull stderr: ${result.stderr}`;
+      if (result.is_cancelled || signal?.aborted) throw new Error(`${text}\n\nCommand aborted`);
+      if (result.is_timed_out) throw new Error(`${text}\n\nCommand timed out after ${timeout} seconds`);
+      if (result.is_disconnected) throw new Error(`${text}\n\nCommand disconnected`);
+      if (result.exit_code === null) throw new Error(`${text}\n\nCommand terminated without an exit code`);
+      if (result.exit_code !== 0) throw new Error(`${text}\n\nCommand exited with code ${result.exit_code}`);
+      const details = { fullOutputPath: result.stdout, stderrPath: result.stderr };
+      return { content: [{ type: "text", text }], details };
+    },
+  } : undefined;
+
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
@@ -1054,7 +1089,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...structuredTools, ...parentQuestionTools, ...userQuestionTools],
+    customTools: [...nestedTools, ...structuredTools, ...parentQuestionTools, ...userQuestionTools, ...(managedBash ? [managedBash as unknown as ToolDefinition] : [])],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
@@ -1094,6 +1129,29 @@ export async function runAgent(
       narrowing,
       readmitToolNames,
     });
+  }
+
+  if (holder) {
+    const readerNames = new Set([...readerBuiltins, ...safeCommunication]);
+    const isReaderTool = (name: string) => readerNames.has(name) &&
+      (safeCommunication.has(name) || !loader.getExtensions().extensions.some(extension => extension.tools.has(name)));
+    const renarrowReader = () => {
+      if (holder.current?.snapshot.access !== "read-stable") return;
+      const current = session.getActiveToolNames();
+      const next = current.filter(isReaderTool);
+      if (next.length !== current.length) session.setActiveToolsByName(next);
+    };
+    renarrowReader();
+    session.subscribe(event => { if (event.type === "turn_end") renarrowReader(); });
+    const priorBeforeToolCall = session.agent.beforeToolCall;
+    session.agent.beforeToolCall = async (context, signal) => {
+      if (!holder.current) return { block: true, reason: "Task claim is not active" };
+      if (holder.current.snapshot.checkout !== effectiveCwd) return { block: true, reason: "Task checkout changed within a session" };
+      if (holder.current.snapshot.access === "read-stable" && !isReaderTool(context.toolCall.name)) {
+        return { block: true, reason: `Stable-reader task denies tool "${context.toolCall.name}"` };
+      }
+      return priorBeforeToolCall?.(context, signal);
+    };
   }
 
   options.onSessionCreated?.(session);

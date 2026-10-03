@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: managed agents and workflows require explicit task ownership.** Managed execution needs the `worktree-hygiene` task helper on PATH. Bind a task or supply `task_id`; parallel writers need distinct task IDs. Use existing initialized task IDs. Workers hold claims through tools, workflow gates and cancellation settlement. Completion retains working bytes without automatic commits or checkout removal. Workflow journals execute managed calls live because task snapshots do not prove unchanged working bytes; qualified pure library hosts retain immutable-prefix reuse.
+- **BREAKING: the `isolation` field is accepted but ignored.** Every managed agent runs in its task checkout. A nested agent needs its own initialized `task_id`, distinct from its parent's task.
 - The extension now loads from a single-file bundle (`dist/index.js`, built by
   `npm run bundle`, never committed) instead of the 48-file `src/` graph. pi imports extensions through jiti with its module cache
   off, so the src graph cost ~380ms of every warm startup; the bundle imports in ~15-30ms.

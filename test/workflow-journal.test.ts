@@ -16,14 +16,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { appendJournal, journalKey, readJournal, type WorkflowJournalEntry } from "../src/workflow/journal.js";
-import { runWorkflow, type WorkflowSpawnRequest, type WorkflowSpawnResult } from "../src/workflow/runtime.js";
+import { appendJournal, type JournalKeyInput, journalKey as rawJournalKey, readJournal, type WorkflowJournalEntry } from "../src/workflow/journal.js";
+import { runWorkflow, type WorkflowHost, type WorkflowSpawnRequest, type WorkflowSpawnResult } from "../src/workflow/runtime.js";
 
 const HEAD = 'export const meta = { name: "probe", description: "a probe" };\n';
+const reuse = { effect: "pure" as const, immutableInput: "fixture:closed-prompt-only:v1" };
+const journalKey = (input: JournalKeyInput) => rawJournalKey({ ...input, reuse });
 
 interface Stub {
   calls: WorkflowSpawnRequest[];
-  host: { spawnAgent: (r: WorkflowSpawnRequest) => Promise<WorkflowSpawnResult>; abortAgent: () => void };
+  host: WorkflowHost;
 }
 
 function stubHost(reply?: (request: WorkflowSpawnRequest) => WorkflowSpawnResult): Stub {
@@ -31,6 +33,7 @@ function stubHost(reply?: (request: WorkflowSpawnRequest) => WorkflowSpawnResult
   return {
     calls,
     host: {
+      journalContext: () => ({ reuse }),
       async spawnAgent(request) {
         calls.push(request);
         return reply ? reply(request) : { ok: true, text: `live:${request.prompt}` };
@@ -114,6 +117,36 @@ describe("journal files", () => {
 });
 
 describe("replay", () => {
+  it("executes unqualified old, writing and gated successes live", async () => {
+    const first = recorder(); const body = 'return await agent("work");';
+    await run(body, { host: stubHost().host, journal: first });
+    const unqualified = first.entries.map(({ reuse: _reuse, ...entry }) => entry);
+    const next = stubHost(() => ({ ok: true, text: "fresh" }));
+    expect((await run(body, { host: next.host, journal: { entries: unqualified } })).value).toBe("fresh");
+    for (const opts of ['task_access: "write"', 'gate: "true"']) {
+      const live = stubHost(); let gates = 0;
+      live.host.runGate = async () => { gates++; return { ok: true, output: "" }; };
+      const script = `return await agent("work", { ${opts} });`;
+      const journal = recorder(); await run(script, { host: live.host, journal });
+      const result = await run(script, { host: live.host, journal: { entries: journal.entries } });
+      expect(result.replayedCount).toBe(0); expect(live.calls).toHaveLength(2);
+      expect(gates).toBe(opts.startsWith("gate") ? 2 : 0);
+    }
+    expect(next.calls).toHaveLength(1);
+  });
+  it("invalidates qualified reuse when immutable input or task identity changes", async () => {
+    const snapshot = { repository: "/repo", repository_id: "repo", task_id: "A", generation: 1, base_oid: "a".repeat(40), checkout: "/checkout", configCwd: "/repo", access: "read-stable" as const };
+    const original = stubHost(); original.host.journalContext = () => ({ identity: snapshot, reuse });
+    const journal = recorder(); const body = 'return await agent("work");'; await run(body, { host: original.host, journal });
+    for (const identity of [{ ...snapshot, task_id: "B" }, { ...snapshot, access: "write" as const }, { ...snapshot, base_oid: "b".repeat(40) }]) {
+      const changed = stubHost(); changed.host.journalContext = () => ({ identity, reuse });
+      expect((await run(body, { host: changed.host, journal: { entries: journal.entries } })).replayedCount).toBe(0);
+      expect(changed.calls).toHaveLength(1);
+    }
+    const changed = stubHost(); changed.host.journalContext = () => ({ identity: snapshot, reuse: { ...reuse, immutableInput: "fixture:v2" } });
+    expect((await run(body, { host: changed.host, journal: { entries: journal.entries } })).replayedCount).toBe(0);
+    expect(changed.calls).toHaveLength(1);
+  });
   const twoAgents = 'const a = await agent("first");\nconst b = await agent("second");\nreturn [a, b];';
 
   it("records every settled call, so a first run can be resumed", async () => {
@@ -126,8 +159,8 @@ describe("replay", () => {
     expect(journal.entries).toEqual([
       // Keyed on what the script asked for, not on what the runtime derived —
       // the label here was derived from the prompt, so it is not part of it.
-      { index: 0, key: journalKey({ prompt: "first" }), ok: true, text: "live:first" },
-      { index: 1, key: journalKey({ prompt: "second" }), ok: true, text: "live:second" },
+      { index: 0, key: journalKey({ prompt: "first" }), ok: true, text: "live:first", reuse },
+      { index: 1, key: journalKey({ prompt: "second" }), ok: true, text: "live:second", reuse },
     ]);
   });
 

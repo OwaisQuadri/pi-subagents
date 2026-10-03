@@ -14,6 +14,10 @@
  * the tool's own reply.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -49,9 +53,7 @@ function heldRun() {
   let createSession: ((session: any) => void) | undefined;
   vi.mocked(runAgent).mockImplementation(
     (_ctx: any, _type: any, _prompt: any, opts: any) =>
-      new Promise(() => {
-        createSession = (session: any) => opts.onSessionCreated?.(session);
-      }) as any,
+      heldWorker({ responseText: "held", session: fakeSession(), aborted: false, steered: false }, () => { createSession = (session: any) => opts.onSessionCreated?.(session); }, opts.signal),
   );
   return {
     create(session: any) {
@@ -77,7 +79,8 @@ const steer = (tools: Map<string, any>, agent_id: string, message: string) =>
 describe("steer_subagent before the session exists", () => {
   it("queues the message on the record and says so", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     heldRun();
 
     const id = await spawnBackground(tools);
@@ -93,7 +96,8 @@ describe("steer_subagent before the session exists", () => {
   it("appends a second queued steer instead of replacing the first", async () => {
     // Overwriting would lose the earlier correction while still reporting success.
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     const run = heldRun();
 
     const id = await spawnBackground(tools);
@@ -115,7 +119,8 @@ describe("steer_subagent before the session exists", () => {
 
   it("does not call steerAgent — there is no session to steer yet", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     heldRun();
 
     const id = await spawnBackground(tools);
@@ -133,7 +138,8 @@ describe("steer_subagent once the session exists", () => {
     // The event is emitted only AFTER steerAgent resolves, so a failed steer
     // must not announce itself as delivered.
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     const run = heldRun();
 
     const id = await spawnBackground(tools);
@@ -156,7 +162,8 @@ describe("steer_subagent once the session exists", () => {
 
   it("delivers through steerAgent and announces the steer on success", async () => {
     const { pi, tools, lifecycle } = makePi();
-    subagentsExtension(pi);
+    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
+  subagentsExtension(pi);
     const run = heldRun();
 
     const id = await spawnBackground(tools);

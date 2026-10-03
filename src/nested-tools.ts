@@ -16,7 +16,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
+import { isolationParam, resolveAgentInvocationConfig, resolveTaskInvocation, taskParams } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
@@ -26,11 +26,11 @@ import {
   writeInitialEntry,
 } from "./output-file.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { type TaskAccess, type TaskSnapshot, validateTaskSnapshot } from "./task-worktree.js";
 import type {
   AgentConfig,
   AgentInvocation,
   AgentRecord,
-  IsolationMode,
   ThinkingLevel,
 } from "./types.js";
 import { addUsage } from "./usage.js";
@@ -50,6 +50,10 @@ export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.m
 const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
 
 interface NestedSpawnOptions {
+  task_id?: string;
+  task_access?: TaskAccess;
+  taskSnapshot?: TaskSnapshot;
+  cwd?: string;
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -57,11 +61,11 @@ interface NestedSpawnOptions {
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
   isBackground?: boolean;
-  isolation?: IsolationMode;
   invocation?: AgentInvocation;
   signal?: AbortSignal;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   onSessionCreated?: (session: AgentSession) => void;
+  onSpawned?: (id: string) => void;
   depth: number;
   parentAgentId: string;
   maxSubagentDepth: number;
@@ -93,6 +97,7 @@ export interface NestedAgentManager {
 }
 
 export interface NestedToolContext {
+  taskSnapshot?: TaskSnapshot;
   manager: NestedAgentManager;
   pi: ExtensionAPI;
   parentAgentId: string;
@@ -142,11 +147,9 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   return note ? `Nested agent${note}.\n\n${text}` : text;
 }
 
-/** Build child-safe orchestration tools scoped to one parent agent instance. */
 export function createNestedSubagentTools(context: NestedToolContext): ToolDefinition[] {
-  // Agents resolve from a registry built for THIS branch's config root (under
-  // worktree isolation, the copy). Never via registerAgents — that is
-  // process-global state shared with the main session and every other agent.
+  const recorded = context.taskSnapshot ?? context.manager.getRecord(context.parentAgentId)?.taskSnapshot;
+  const parentTask = recorded === undefined ? undefined : validateTaskSnapshot(recorded);
   const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
@@ -178,14 +181,21 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
       inherit_context: Type.Optional(Type.Boolean()),
+      ...taskParams,
+      task_id: Type.Optional(Type.String({ description: "Required for a new nested agent: an initialized task distinct from your own. Omit only with resume.", minLength: 1 })),
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+      const fields = resolveTaskInvocation(params);
+      if (!parentTask) return textResult("Nested dispatch requires the parent's captured task snapshot", true);
+      if (parentTask.access !== "write") return textResult("Stable readers cannot delegate nested workers", true);
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
+        if ((fields.task_id !== undefined && fields.task_id !== existing.taskSnapshot?.task_id) ||
+            (fields.task_access !== undefined && fields.task_access !== existing.taskSnapshot?.access)) return textResult("Resume task fields must match the recorded child snapshot", true);
         const resumed = await context.manager.resume(params.resume, params.prompt, signal);
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
@@ -195,6 +205,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       if (context.depth >= context.maxSubagentDepth) {
         return textResult(
           `Nested subagent call blocked (depth=${context.depth}, max=${context.maxSubagentDepth}). Complete the task directly.`,
+          true,
+        );
+      }
+      // The parent holds its own task's writer claim for its whole run, so a child
+      // on that task could only ever fail TaskBusy at launch.
+      if (fields.task_id === undefined || fields.task_id === parentTask.task_id) {
+        return textResult(
+          `A nested writer needs its own distinct task_id: this agent already holds task "${parentTask.task_id}". Initialize a separate task and pass its task_id, or do the work directly.`,
           true,
         );
       }
@@ -256,13 +274,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const rootSessionId = context.manager.getRecord(context.parentAgentId)?.rootSessionId;
       const childDepth = context.depth + 1;
       const options: NestedSpawnOptions = {
+        ...fields,
+        cwd: parentTask.repository,
         description: params.description,
         model,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
         thinkingLevel: invocation.thinking,
-        isolation: invocation.isolation,
         invocation: {
           thinking: invocation.thinking,
           maxTurns: invocation.maxTurns,
@@ -314,12 +333,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         const rec = context.manager.getRecord(id);
         if (!rec) return;
         rec.outputFile = createOutputFilePath(context.configCwd, id, transcriptSessionId);
-        writeInitialEntry(rec.outputFile, id, params.prompt, ctx.cwd);
+        writeInitialEntry(rec.outputFile, id, params.prompt, rec.taskSnapshot?.checkout ?? parentTask.checkout, rec.taskSnapshot);
       };
       options.onSessionCreated = (session) => {
         const rec = childId === undefined ? undefined : context.manager.getRecord(childId);
         if (rec?.outputFile && childId !== undefined) {
-          rec.outputCleanup = streamToOutputFile(session, rec.outputFile, childId, ctx.cwd);
+          rec.outputCleanup = streamToOutputFile(session, rec.outputFile, childId, rec.taskSnapshot!.checkout, undefined, rec.taskSnapshot);
         }
       };
 
@@ -329,7 +348,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // one earlier would silently give a grandchild the wrong worktree base, the
       // wrong conversation under inherit_context, and the wrong inherited model.
       //
-      // spawn() throws on strict worktree-isolation failure and cwd validation —
+      // spawn() throws on task identity and cwd validation —
       // report it as a tool error, like the top-level Agent tool does, instead of
       // letting it escape into the child's turn.
       try {
@@ -337,12 +356,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
             ...options,
             isBackground: true,
+            onSpawned: attachTranscript,
           });
-          // Synchronous, before the event loop yields — onSessionCreated fires
-          // asynchronously inside runAgent, so the file is attached in time.
-          attachTranscript(id);
-          // Worktree isolation starts the agent asynchronously; surface its
-          // failure as a tool error, like the synchronous throw used to.
           await context.manager.awaitStartup(id);
           return textResult(`Nested agent started in background. Agent ID: ${id}`);
         }
