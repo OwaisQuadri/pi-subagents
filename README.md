@@ -325,7 +325,7 @@ All fields are optional — sensible defaults for everything.
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
-| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
+| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Unrelated to the ignored `isolation` field |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
 New children inherit the current parent model and thinking level unless the invocation supplies explicit user choices. Definition and registry pins do not select either value. This applies to foreground, background, nested, workflow, and programmatic spawns. In-memory resumes reuse the existing child session. File-based resumes retain their previous model and thinking resolution; the new parent fallback applies only to new children.

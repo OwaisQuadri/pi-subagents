@@ -1059,7 +1059,7 @@ export async function runAgent(
       const stdout = await taskOutputTail(result.stdout);
       const stderr = await taskOutputTail(result.stderr);
       const text = `[stdout]\n${stdout}\n\n[stderr]\n${stderr}\n\nFull stdout: ${result.stdout}\nFull stderr: ${result.stderr}`;
-      if (result.is_cancelled || signal?.aborted) throw new Error(`${text}\n\nCommand aborted`);
+      if (result.is_cancelled) throw new Error(`${text}\n\nCommand aborted`);
       if (result.is_timed_out) throw new Error(`${text}\n\nCommand timed out after ${timeout} seconds`);
       if (result.is_disconnected) throw new Error(`${text}\n\nCommand disconnected`);
       if (result.exit_code === null) throw new Error(`${text}\n\nCommand terminated without an exit code`);

@@ -235,6 +235,18 @@ describe.skipIf(!binary)(taskHelperTitle("managed SDK bash adapter with the task
     } finally { controller.abort(); await pending; child.stdout.off("data", observe); }
   });
 
+  it("keeps a command's success when the stop signal arrives after the command finished", async () => {
+    const f = await fixture();
+    const controller = new AbortController();
+    const original = f.claim.run.bind(f.claim);
+    vi.spyOn(f.claim, "run").mockImplementation((command, signal) => original(command, signal).then(result => { controller.abort(); return result; }));
+    f.script("printf finished-before-stop");
+    const result = await runAgent(f.ctx, "task-fixture", "script", { ...f.options, signal: controller.signal });
+    const text = toolResultsNamed(result.session, "bash")[0];
+    expect(text).toContain("finished-before-stop");
+    expect(text).not.toContain("Command aborted");
+  });
+
   it("preserves an extension guard veto before any Rust command", async () => {
     const f = await fixture("write", { extensions: [extensionFixture("veto")] });
     const run = vi.spyOn(f.claim, "run");

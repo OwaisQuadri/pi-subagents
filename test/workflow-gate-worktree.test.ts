@@ -205,6 +205,16 @@ describe.skipIf(!binary)(taskHelperTitle("workflow task gates and retained owner
     expect((await runs.mock.results[0].value).is_cancelled).toBe(true);
     const next = await host().spawnAgent(request()); expect(next.ok).toBe(true);
   });
+  it("keeps a passing gate when a stop arrives after the gate command finished", async () => {
+    const original = TaskAuthority.prototype.run;
+    vi.spyOn(TaskAuthority.prototype, "run").mockImplementation(async function (this: TaskAuthority, ...args) {
+      const result = await original.apply(this, args);
+      manager.listAgents()[0]?.abortController?.abort();
+      return result;
+    });
+    const result = await host().spawnAgent(request({ gate: 'printf "3 passing"' }));
+    expect(result).toMatchObject({ ok: true, gate: { ok: true, output: "3 passing" } });
+  });
   it("reports actual managed release uncertainty instead of quiet workflow completion", async () => {
     disposalError = /UnknownUse|RecoveryRequired/;
     let descriptor: Awaited<ReturnType<typeof open>> | undefined;

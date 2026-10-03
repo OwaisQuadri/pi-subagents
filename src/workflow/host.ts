@@ -74,7 +74,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       timeout_ms: gateTimeoutMs }, record.abortController?.signal);
     const output = (await Promise.all([evidenceTail(result.stdout), evidenceTail(result.stderr)])).filter(Boolean).join("\n");
     if (result.is_timed_out) return { ok: false, output: output || `Gate command timed out: ${command}` };
-    if (result.is_cancelled || record.abortController?.signal.aborted) return { ok: false, output: output || `Gate command cancelled: ${command}` };
+    if (result.is_cancelled) return { ok: false, output: output || `Gate command cancelled: ${command}` };
     if (result.is_disconnected || result.exit_code === null) return { ok: false, output: output || `Gate command did not settle successfully: ${command}` };
     return { ok: result.exit_code === 0, output };
   }
