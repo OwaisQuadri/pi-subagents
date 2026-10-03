@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { TASK_AUTHORITY_CONTROL_DEADLINE_MS, TASK_AUTHORITY_RUN_GRACE_MS, TaskAuthority, TaskClaim, type TaskIdentity } from "../src/task-worktree.js";
+import { homeRelativePath, TASK_AUTHORITY_CONTROL_DEADLINE_MS, TASK_AUTHORITY_RUN_GRACE_MS, TaskAuthority, TaskClaim, type TaskIdentity } from "../src/task-worktree.js";
 import { fixtureDirectory, taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
 
 const binary = taskHelper();
@@ -53,6 +54,28 @@ async function pendingRequests(authority: TaskAuthority, count: number): Promise
 function helperPid(authority: TaskAuthority): number {
   return (authority as unknown as { child: { pid: number } }).child.pid;
 }
+
+describe("home-relative checkout display", () => {
+  const saved = process.env.HOME;
+  const restore = () => { if (saved === undefined) delete process.env.HOME; else process.env.HOME = saved; };
+
+  it("shortens a path under HOME even when HOME ends with a slash", () => {
+    process.env.HOME = "/home/fixture/";
+    try {
+      expect(homeRelativePath("/home/fixture/tasks/checkout")).toBe("~/tasks/checkout");
+      expect(homeRelativePath("/home/fixture-other/checkout")).toBe("/home/fixture-other/checkout");
+      expect(homeRelativePath("/home/fixture")).toBe("/home/fixture");
+    } finally { restore(); }
+  });
+
+  it("shortens a path under the account home when HOME is unset", () => {
+    delete process.env.HOME;
+    try {
+      const home = homedir();
+      expect(homeRelativePath(`${home}/tasks/checkout`)).toBe("~/tasks/checkout");
+    } finally { restore(); }
+  });
+});
 
 describe("task authority protocol boundaries", () => {
   it("does no registration-time authority I/O", async () => {

@@ -36,7 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type TaskSnapshot, validateTaskAccess, validateTaskSnapshot } from "./task-worktree.js";
+import { homeRelativePath, type TaskSnapshot, validateTaskAccess, validateTaskSnapshot } from "./task-worktree.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -4007,11 +4007,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ctx.ui.notify(message, level);
   }
 
-  const homeRelative = (path: string) => {
-    const home = process.env.HOME;
-    return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
-  };
-
   pi.registerCommand("agents", {
     description: "Manage agents; task bind/status/unbind/finish/abandon",
     handler: async (args, ctx) => {
@@ -4034,10 +4029,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
           if (epoch !== taskBindingEpoch) throw new Error("Session switched during task binding; bind again in the selected session");
           manager.setTaskBinding(snapshot);
           persistBinding(snapshot);
-          ctx.ui.notify(`Bound task ${snapshot.task_id} (${snapshot.access}) at ${homeRelative(snapshot.checkout)}; base ${snapshot.base_oid}`, "info");
+          ctx.ui.notify(`Bound task ${snapshot.task_id} (${snapshot.access}) at ${homeRelativePath(snapshot.checkout)}; base ${snapshot.base_oid}`, "info");
         } else if (action === "status" && words.length === 2) {
           const snapshot = manager.getTaskBinding();
-          ctx.ui.notify(snapshot ? `Task ${snapshot.task_id} (${snapshot.access}) at ${homeRelative(snapshot.checkout)}; base ${snapshot.base_oid}` : "No task bound. Use /agents task bind <task_id>.", "info");
+          ctx.ui.notify(snapshot ? `Task ${snapshot.task_id} (${snapshot.access}) at ${homeRelativePath(snapshot.checkout)}; base ${snapshot.base_oid}` : "No task bound. Use /agents task bind <task_id>.", "info");
         } else if (action === "unbind" && words.length === 2) {
           manager.setTaskBinding(); persistBinding();
           ctx.ui.notify("Task binding cleared; existing workers retain their captured task", "info");
