@@ -55,7 +55,7 @@ import {
 } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, THINKING_LEVELS, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
-import { type TaskSnapshot, validateTaskAccess, validateTaskSnapshot } from "./task-worktree.js";
+import { homeRelativePath, type TaskSnapshot, validateTaskAccess, validateTaskSnapshot } from "./task-worktree.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -3975,10 +3975,10 @@ Terse command-style prompts produce shallow, generic work.
           if (epoch !== taskBindingEpoch) throw new Error("Session switched during task binding; bind again in the selected session");
           manager.setTaskBinding(snapshot);
           persistBinding(snapshot);
-          ctx.ui.notify(`Bound task ${snapshot.task_id} (${snapshot.access}) at ${snapshot.checkout}; base ${snapshot.base_oid}`, "info");
+          ctx.ui.notify(`Bound task ${snapshot.task_id} (${snapshot.access}) at ${homeRelativePath(snapshot.checkout)}; base ${snapshot.base_oid}`, "info");
         } else if (action === "status" && words.length === 2) {
           const snapshot = manager.getTaskBinding();
-          ctx.ui.notify(snapshot ? `Task ${snapshot.task_id} (${snapshot.access}) at ${snapshot.checkout}; base ${snapshot.base_oid}` : "No task bound. Use /agents task bind <task_id>.", "info");
+          ctx.ui.notify(snapshot ? `Task ${snapshot.task_id} (${snapshot.access}) at ${homeRelativePath(snapshot.checkout)}; base ${snapshot.base_oid}` : "No task bound. Use /agents task bind <task_id>.", "info");
         } else if (action === "unbind" && words.length === 2) {
           manager.setTaskBinding(); persistBinding();
           ctx.ui.notify("Task binding cleared; existing workers retain their captured task", "info");
