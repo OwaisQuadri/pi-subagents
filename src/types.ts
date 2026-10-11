@@ -1,6 +1,9 @@
+/**
+ * types.ts — Type definitions for the subagent system.
+ */
+
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { TaskSnapshot } from "./task-worktree.js";
 import type { LifetimeUsage } from "./usage.js";
 
 export type ThinkingLevel = ModelThinkingLevel;
@@ -132,7 +135,6 @@ export type AgentMentionMode = 'model' | 'direct' | 'off';
  * and this is the little that is needed to find and describe it again.
  */
 export interface AgentTombstone {
-  taskSnapshot?: TaskSnapshot;
   handle: string;
   alias?: string;
   id: string;
@@ -164,8 +166,6 @@ export type RunActivity = {
 );
 
 export interface AgentRecord {
-  taskSnapshot?: TaskSnapshot;
-  taskSettlementError?: string;
   id: string;
   type: SubagentType;
   /**
@@ -352,7 +352,6 @@ export interface EnvInfo {
  * survives `/resume` but resets on `/new`, mirroring pi-chonky-tasks.
  */
 export interface ScheduledSubagent {
-  taskSnapshot?: TaskSnapshot;
   id: string;
   /** Unique within store. Defaults to `description`. */
   name: string;

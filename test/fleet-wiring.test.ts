@@ -13,10 +13,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as TaskRuntime from "../src/task-worktree.js";
-import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
-
-vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -109,8 +105,7 @@ describe("FleetView wiring (real extension lifecycle)", () => {
 
   it("captures terminal input on tool_execution_start (fleet hooked into the UI)", async () => {
     const { pi, lifecycle } = makePi();
-    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
-  subagentsExtension(pi);
+    subagentsExtension(pi);
     const ui = uiCtx();
     await lifecycle.get("tool_execution_start")?.({}, ctxWith(ui));
     expect(ui.onTerminalInput).toHaveBeenCalled();
@@ -125,8 +120,7 @@ describe("FleetView wiring (real extension lifecycle)", () => {
     });
 
     const { pi, tools, lifecycle } = makePi();
-    wiringTasks(pi, ["native-binding", "native-worker-A", "native-worker-B"]);
-  subagentsExtension(pi);
+    subagentsExtension(pi);
 
     const ui = uiCtx();
     await lifecycle.get("tool_execution_start")?.({}, ctxWith(ui)); // fleet captures THIS ui

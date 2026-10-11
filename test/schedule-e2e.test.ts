@@ -29,7 +29,6 @@ function makeFaithfulManager(initialStatus = "completed") {
   const records = new Map<string, FakeRecord>();
   return {
     records,
-    getTaskBinding: () => ({ repository: "/tmp", task_id: "explicit-schedule-e2e-fixture", generation: 1, repository_id: "fixture", base_oid: "a".repeat(40), checkout: "/tmp", access: "write", configCwd: "/tmp" }),
     initialStatus,
     spawn: vi.fn(function (this: any) {
       const id = "agent-" + Math.random().toString(36).slice(2, 10);
@@ -94,7 +93,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     // Fire ~100ms in the future. detectSchedule normalizes "+100ms" — but our
     // parser only accepts s/m/h/d, so use a near-future ISO timestamp instead.
     const future = new Date(Date.now() + 100).toISOString();
-    const job = await scheduler.addJob({
+    const job = scheduler.addJob({
       name: "e2e-once",
       description: "test",
       schedule: future,
@@ -121,7 +120,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     scheduler.start(pi, makeCtx(), manager, store);
 
     const future = new Date(Date.now() + 100).toISOString();
-    const job = await scheduler.addJob({
+    const job = scheduler.addJob({
       name: "e2e-fail",
       description: "test",
       schedule: future,
@@ -142,7 +141,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     scheduler.start(pi, makeCtx(), manager, store);
 
     // 100ms interval — wait for ~3 fires
-    const job = await scheduler.addJob({
+    const job = scheduler.addJob({
       name: "e2e-interval",
       description: "test",
       schedule: "100s",  // Will be too long; override below.
@@ -169,7 +168,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     scheduler.start(pi, makeCtx(), manager, store);
 
     const future = new Date(Date.now() + 60_000).toISOString();  // far enough not to fire
-    const job = await scheduler.addJob({
+    const job = scheduler.addJob({
       name: "persistent",
       description: "x",
       schedule: future,
@@ -190,7 +189,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     const pi = makePi();
     scheduler.start(pi, makeCtx(), manager, store);
 
-    await scheduler.addJob({
+    scheduler.addJob({
       name: "shape-test",
       description: "x",
       schedule: "1h",
@@ -216,7 +215,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     scheduler.start(pi, makeCtx(), manager, store);
 
     const future = new Date(Date.now() + 100).toISOString();
-    const job = await scheduler.addJob({
+    const job = scheduler.addJob({
       name: "events", description: "x", schedule: future,
       subagent_type: "general-purpose", prompt: "x",
     });

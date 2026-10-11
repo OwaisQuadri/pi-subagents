@@ -18,9 +18,6 @@ import {
   routeBySession,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
-import { taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
-
-const TASK_BINARY = taskHelper();
 
 /** Text of the parent's Agent tool result — what the orchestrator LLM sees. */
 function agentToolResult(session: AgentSession): string {
@@ -35,7 +32,7 @@ vi.setConfig({ testTimeout: 30_000 });
 // Not matched by pi's transient-error patterns → no auto-retry, deterministic.
 const FATAL = "invalid request: provider rejected the prompt";
 
-describe.skipIf(!TASK_BINARY)(taskHelperTitle("issue #144 — empty-error final turns must not be 'completed'"), () => {
+describe("issue #144 — empty-error final turns must not be 'completed'", () => {
   let run: PrintModeRun | undefined;
   afterEach(async () => {
     await run?.dispose();
@@ -44,7 +41,6 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("issue #144 — empty-error final 
 
   it("a run whose ONLY turn errors with no output is a failure, not an empty success", async () => {
     run = await runPrintMode({
-      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate.",
       respond: routeBySession({
         parentInitial: agentCall({ run_in_background: false, description: "doomed", prompt: "Do work." }),
@@ -64,7 +60,6 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("issue #144 — empty-error final 
 
   it("an earlier turn's text must not mask a failed final turn as a fresh success", async () => {
     run = await runPrintMode({
-      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate.",
       respond: routeBySession({
         parentInitial: agentCall({ run_in_background: false, description: "masked", prompt: "Do work." }),
@@ -97,7 +92,6 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("issue #144 — empty-error final 
 
   it("a pure empty-error run shows no 'partial output' section", async () => {
     run = await runPrintMode({
-      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       prompt: "Delegate.",
       respond: routeBySession({
         parentInitial: agentCall({ run_in_background: false, description: "empty", prompt: "Do work." }),

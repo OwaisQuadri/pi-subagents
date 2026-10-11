@@ -31,12 +31,11 @@ describe("isolationParam", () => {
     expect(schema(true)?.anyOf?.[0]?.const).toBe("off");
   });
 
-  it("says the field is ignored, so no model expects a separate copy", () => {
-    // Every agent runs in its claimed task checkout; a description promising a
-    // fresh worktree copy would have the model reason about a tree it never gets.
+  it("warns that a worktree cannot see uncommitted work", () => {
+    // The specific trap in #231: the subagent reviewed an empty `git diff
+    // --cached` in a fresh copy and returned nothing, three times.
     const described = JSON.stringify(schema(true));
-    expect(described).toMatch(/Ignored legacy option/);
-    expect(described).toMatch(/creates no copy/);
+    expect(described).toMatch(/uncommitted or staged/);
   });
 
   it("omits the parameter entirely when the project disabled worktrees", () => {

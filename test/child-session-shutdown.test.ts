@@ -12,11 +12,6 @@
  * hung handler can't strand the user at a dead terminal.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type * as TaskRuntime from "../src/task-worktree.js";
-import { declareTask, FixtureTaskAuthority } from "./helpers/task-fixture.js";
-
-vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
-
 import { AgentManager } from "../src/agent-manager.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -25,10 +20,14 @@ vi.mock("../src/agent-runner.js", () => ({
 }));
 
 vi.mock("../src/worktree.js", () => ({
+  createWorktree: vi.fn(),
+  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
+  pruneWorktrees: vi.fn(async () => {}),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
 import { runAgent } from "../src/agent-runner.js";
+import { pruneWorktrees } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -53,7 +52,6 @@ async function spawnCompleted(manager: AgentManager, session: any) {
     steered: false,
   } as any);
   const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
-    taskSnapshot: declareTask("/tmp", "shutdown-worker"),
     description: "test",
     isBackground: true,
   });
@@ -116,6 +114,8 @@ describe("child session shutdown (#242)", () => {
     await spawnCompleted(manager, session);
 
     vi.useFakeTimers();
+    // `pi` is what reaches `pruneWorktrees` now that it shells out through
+    // `pi.exec`; without it dispose skips the prune and proves nothing here.
     const disposed = manager.dispose(mockPi);
     // Past the internal ceiling. Without it the TUI is already torn down and the
     // user is left at a dead terminal with only Ctrl-C.
@@ -123,6 +123,8 @@ describe("child session shutdown (#242)", () => {
     await disposed;
 
     expect(session.dispose).toHaveBeenCalledOnce();
+    // Teardown continues past the timeout rather than unwinding.
+    expect(pruneWorktrees).toHaveBeenCalled();
   });
 
   it("skips the emit when no extension handles session_shutdown", async () => {

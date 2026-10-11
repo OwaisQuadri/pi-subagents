@@ -26,9 +26,6 @@ import {
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
-import { taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
-
-const TASK_BINARY = taskHelper();
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -136,7 +133,6 @@ async function runWithAgents(
   const cwd = mkdtempSync(join(tmpdir(), "subagents-nested-e2e-"));
   writeAgents(cwd, agents);
   const run = await runPrintMode({
-    taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-owner", "sdk-worker", "sdk-peer"] },
     ...options,
     cwd,
     respond,
@@ -148,7 +144,7 @@ async function runWithAgents(
   return { run, cwd };
 }
 
-describe.skipIf(!TASK_BINARY)(taskHelperTitle("PR #164 nested agents through the real print-mode boundary"), () => {
+describe("PR #164 nested agents through the real print-mode boundary", () => {
   let run: PrintModeRun | undefined;
   let cwd: string | undefined;
 
@@ -210,7 +206,7 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("PR #164 nested agents through the
         if (route === "level_one-child") {
           if (toolResults(ctx, "Agent").length === 0) {
             return agentCall({
-              task_id: "sdk-worker", subagent_type: "level_two",
+              subagent_type: "level_two",
               description: "allowed level",
               prompt: "level_two-child",
               run_in_background: false,
@@ -256,7 +252,7 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("PR #164 nested agents through the
         if (route === "background-delegator-child") {
           if (toolResults(ctx, "Agent").length === 0) {
             return agentCall({
-              task_id: "sdk-worker", subagent_type: "background_grandchild",
+              subagent_type: "background_grandchild",
               description: "nested foreground work",
               prompt: "background-grandchild-child",
               run_in_background: false,
@@ -348,7 +344,7 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("PR #164 nested agents through the
             const agents = toolResults(ctx, "Agent");
             if (agents.length === 0) {
               return agentCall({
-                task_id: "sdk-worker", subagent_type: "owned_child",
+                subagent_type: "owned_child",
                 description: "owned nested child",
                 prompt: "owned-child",
                 run_in_background: true,
@@ -400,7 +396,7 @@ describe.skipIf(!TASK_BINARY)(taskHelperTitle("PR #164 nested agents through the
           if (agents.length === 1) {
             // Fire probe without waiting for the background owner to finish.
             return agentCall({
-              task_id: "sdk-peer", subagent_type: "probe",
+              subagent_type: "probe",
               description: "foreign ownership probe",
               prompt: "probe-child",
               run_in_background: true,

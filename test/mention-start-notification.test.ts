@@ -8,10 +8,6 @@
  * it is the path every first mention takes.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as TaskRuntime from "../src/task-worktree.js";
-import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
-
-vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -53,7 +49,7 @@ function fakeSession() {
 
 function boot(settings: Record<string, unknown> = {}) {
   hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
-  const b = makePi(); wiringTasks(b.pi, ["native-binding", "native-A", "native-B", "native-C"]);
+  const b = makePi();
   subagentsExtension(b.pi);
   booted = b.lifecycle;
   return b;

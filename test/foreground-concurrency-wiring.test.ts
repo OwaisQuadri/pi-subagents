@@ -14,10 +14,6 @@
  * So the Esc case below asserts `.resolves`, deliberately, not `.rejects`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as TaskRuntime from "../src/task-worktree.js";
-import { FixtureTaskAuthority, fixturePromise, wiringTasks } from "./helpers/task-fixture.js";
-
-vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -50,7 +46,7 @@ function boot(settings: Record<string, unknown> = {}) {
   hermetic = hermeticDir({
     settings: { outputTranscript: false, maxConcurrentForeground: 1, ...settings },
   });
-  const b = makePi(); wiringTasks(b.pi, ["native-binding", "native-A", "native-B", "native-C"]);
+  const b = makePi();
   subagentsExtension(b.pi);
   booted = b.lifecycle;
   return b;
@@ -61,7 +57,7 @@ function controllableRuns() {
   const resolvers = new Map<string, () => void>();
   vi.mocked(runAgent).mockImplementation(
     (_c: any, _t: any, prompt: any, opts: any) =>
-      fixturePromise<any>(resolve => {
+      new Promise<any>(resolve => {
         opts.onSessionCreated?.({
           dispose: vi.fn(),
           subscribe: vi.fn(() => () => {}),

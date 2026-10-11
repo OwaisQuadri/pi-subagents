@@ -25,11 +25,7 @@ import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-t
 import subagentsExtension, { WORKFLOW_ENTRY_TYPE, WORKFLOW_FILE_FLAG } from "../src/index.js";
 import { isScopeModelsEnabled, setScopeModelsEnabled } from "../src/model-scope.js";
 import type { AgentRecord } from "../src/types.js";
-import { createWorkflowHost as createHost, type WorkflowHostOptions } from "../src/workflow/host.js";
-import { declareTask } from "./helpers/task-fixture.js";
-
-const createWorkflowHost = (options: WorkflowHostOptions) => createHost({ ...options, taskSnapshot: declareTask(options.ctx.cwd, "tool-workflow") });
-
+import { createWorkflowHost } from "../src/workflow/host.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
@@ -66,17 +62,15 @@ function stubManager(
   settle: (type: string, prompt: string, options: any) => Promise<AgentRecord> | AgentRecord = () => record(),
 ): StubManager {
   const abort = vi.fn();
-  let current: AgentRecord | undefined;
-  const resume = vi.fn(async () => { current = record({ id: current?.id ?? "agent-1", result: "resumed" }); return current; });
+  const resume = vi.fn(async () => record({ id: "agent-1", result: "resumed" }));
   const spawnAndWait = vi.fn(
     async (_pi: any, _ctx: any, type: string, prompt: string, options: any, onSpawned?: (id: string) => void) => {
       const settled = await settle(type, prompt, options);
-      current = settled;
       onSpawned?.(settled.id);
       return { id: settled.id, record: settled };
     },
   );
-  return { manager: { spawnAndWait, abort, resume, getRecord: () => current } as unknown as AgentManager, spawnAndWait, abort, resume };
+  return { manager: { spawnAndWait, abort, resume } as unknown as AgentManager, spawnAndWait, abort, resume };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({
@@ -128,7 +122,7 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(options.description).toBe("review:bugs");
   });
 
-  it("passes the run's abort signal down to the spawn and drops the ignored isolation option", async () => {
+  it("passes isolation and the run's abort signal down to the spawn", async () => {
     const stub = stubManager();
     const controller = new AbortController();
     const host = createWorkflowHost({
@@ -142,9 +136,8 @@ describe("createWorkflowHost — spawn mapping", () => {
     await host.spawnAgent(request({ isolation: "worktree" }));
 
     const options = stub.spawnAndWait.mock.calls[0][4];
-    expect(options).not.toHaveProperty("isolation");
-    expect(options.signal).toBeInstanceOf(AbortSignal);
-    expect(options.signal.aborted).toBe(false);
+    expect(options.isolation).toBe("worktree");
+    expect(options.signal).toBe(controller.signal);
     expect(options.rootSessionId).toBe("root-1");
   });
 
@@ -477,7 +470,7 @@ describe("createWorkflowHost — worktree cwd propagation", () => {
 
   it("reports the directory the child ran in, so a gate verifies that tree", async () => {
     const stub = stubManager(() =>
-      record({ taskSnapshot: declareTask(worktree, "tool-workflow"), worktree: { path: "/legacy", branch: "b", baseSha: "sha", workPath: "/legacy" } }),
+      record({ worktree: { path: worktree, branch: "b", baseSha: "sha", workPath: worktree } }),
     );
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
@@ -541,7 +534,7 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     await host.spawnAgent(request({ agentId: "wf-agent-0" }));
     const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
 
-    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", expect.any(AbortSignal), expect.objectContaining({ onBeforeTaskSettlement: expect.any(Function) }));
+    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined);
     expect(resumed).toMatchObject({ ok: true, text: "resumed" });
   });
 
@@ -555,23 +548,63 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     expect(stub.resume).not.toHaveBeenCalled();
   });
 
-  it("asks the manager for a held task settlement hook only when the agent is gated", async () => {
+  it("asks the manager for a pre-cleanup hook only when the agent is gated", async () => {
+    // The hook is how a gate reaches the child's worktree before it is deleted
+    // (see workflow-gate-worktree.test.ts). An ungated agent must not acquire
+    // one: nothing would run in it, and the manager's settle path is shared
+    // with every other spawn.
     const stub = stubManager();
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
     await host.spawnAgent(request({ isolation: "worktree" }));
-    expect(stub.spawnAndWait.mock.calls[0][4].onBeforeTaskSettlement).toBeUndefined();
+    expect(stub.spawnAndWait.mock.calls[0][4].onBeforeWorktreeCleanup).toBeUndefined();
 
     await host.spawnAgent(request({ isolation: "worktree", gate: "npm test" }));
-    expect(stub.spawnAndWait.mock.calls[1][4].onBeforeTaskSettlement).toBeInstanceOf(Function);
+    expect(stub.spawnAndWait.mock.calls[1][4].onBeforeWorktreeCleanup).toBeInstanceOf(Function);
   });
 
-  it("refuses to execute a gate after the child claim is released, without parent-cwd fallback", async () => {
-    const exec = vi.fn(async () => execResult({ stdout: "unowned success" }));
+  it("runs a gate through pi.exec in the child's own tree", async () => {
+    const exec = vi.fn(async () => execResult({ stdout: "3 passing" }));
+    const host = createWorkflowHost({
+      pi: { exec } as any,
+      ctx: ctx({ cwd: "/session" }),
+      manager: stubManager().manager,
+    });
+
+    const gate = await host.runGate?.("npm test", { agentId: "wf-agent-0", cwd: "/worktree" });
+
+    expect(gate).toEqual({ ok: true, output: "3 passing" });
+    expect(exec.mock.calls[0][2]).toMatchObject({ cwd: "/worktree" });
+  });
+
+  it("falls back to the session's cwd when the child had no tree of its own", async () => {
+    const exec = vi.fn(async () => execResult());
+    const host = createWorkflowHost({
+      pi: { exec } as any,
+      ctx: ctx({ cwd: "/session" }),
+      manager: stubManager().manager,
+    });
+
+    await host.runGate?.("npm test", { agentId: "wf-agent-0" });
+
+    expect(exec.mock.calls[0][2]).toMatchObject({ cwd: "/session" });
+  });
+
+  it("fails a gate on a non-zero exit and surfaces its output", async () => {
+    const exec = vi.fn(async () => execResult({ code: 1, stderr: "1 failing" }));
     const host = createWorkflowHost({ pi: { exec } as any, ctx: ctx(), manager: stubManager().manager });
-    const gate = await host.runGate?.("npm test", { agentId: "wf-agent-0", cwd: "/forged" });
-    expect(gate).toEqual({ ok: false, output: "Gate was not executed while the child task claim was held: npm test" });
-    expect(exec).not.toHaveBeenCalled();
+
+    expect(await host.runGate?.("npm test", { agentId: "wf-agent-0" })).toEqual({ ok: false, output: "1 failing" });
+  });
+
+  it("fails a gate that was killed, which pi.exec reports with exit code 0", async () => {
+    const exec = vi.fn(async () => execResult({ killed: true, code: 0 }));
+    const host = createWorkflowHost({ pi: { exec } as any, ctx: ctx(), manager: stubManager().manager });
+
+    const gate = await host.runGate?.("sleep 999", { agentId: "wf-agent-0" });
+
+    expect(gate?.ok).toBe(false);
+    expect(gate?.output).toMatch(/timed out/);
   });
 });
 
@@ -954,9 +987,9 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     );
 
     await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
-    expect(startedTaskId(result)).toBeTruthy();
-    await new Promise(resolve => setTimeout(resolve, 250));
-    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
+
+    const sent = await awaitNotification(startedTaskId(result));
+    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {

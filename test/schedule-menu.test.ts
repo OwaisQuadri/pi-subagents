@@ -29,7 +29,7 @@ function makeCtx(opts: { pick?: (labels: string[]) => string | undefined; confir
   return { ctx: { ui: { select, confirm, notify } } as any, select, confirm, notify };
 }
 
-describe("showSchedulesMenu", async () => {
+describe("showSchedulesMenu", () => {
   let dir: string;
   let scheduler: SubagentScheduler;
 
@@ -39,7 +39,7 @@ describe("showSchedulesMenu", async () => {
     scheduler.start(
       { events: { emit: vi.fn() } } as any,
       { cwd: dir } as any,
-      { spawn: vi.fn(), getRecord: vi.fn(), getTaskBinding: () => ({ repository: dir, task_id: "explicit-schedule-menu-fixture", generation: 1, repository_id: "fixture", base_oid: "a".repeat(40), checkout: dir, access: "write", configCwd: dir }) } as any,
+      { spawn: vi.fn(), getRecord: vi.fn() } as any,
       new ScheduleStore(join(dir, "jobs.json")),
     );
   });
@@ -74,8 +74,8 @@ describe("showSchedulesMenu", async () => {
   });
 
   it("cancels the job the user selected", async () => {
-    const a = await addJob("alpha job");
-    const b = await addJob("beta job");
+    const a = addJob("alpha job");
+    const b = addJob("beta job");
     const { ctx } = makeCtx({ pick: (labels) => labels[1] });
 
     await showSchedulesMenu(ctx, scheduler);
@@ -88,14 +88,14 @@ describe("showSchedulesMenu", async () => {
   // LLM-authored `Agent` description, so two rows formatting identically is
   // ordinary. Resolving the pick by string match then cancelled whichever came
   // first — silently, with the confirm dialog showing the wrong job's details.
-  describe("rows that format identically after truncation", async () => {
+  describe("rows that format identically after truncation", () => {
     const NAME_A = "review the auth module A";
     const NAME_B = "review the auth module B";
 
-    it("gives every row a distinct label", async () => {
+    it("gives every row a distinct label", () => {
       // The invariant the fix rests on. Everything below depends on it.
-      await addJob(NAME_A);
-      await addJob(NAME_B);
+      addJob(NAME_A);
+      addJob(NAME_B);
       const { ctx, select } = makeCtx({ pick: () => undefined });
       return showSchedulesMenu(ctx, scheduler).then(() => {
         const labels = select.mock.calls[0][1] as string[];
@@ -104,8 +104,8 @@ describe("showSchedulesMenu", async () => {
     });
 
     it("cancels the second job when the second row is picked", async () => {
-      const first = await addJob(NAME_A);
-      const second = await addJob(NAME_B);
+      const first = addJob(NAME_A);
+      const second = addJob(NAME_B);
       const { ctx } = makeCtx({ pick: (labels) => labels[1] });
 
       await showSchedulesMenu(ctx, scheduler);
@@ -117,8 +117,8 @@ describe("showSchedulesMenu", async () => {
     it("cancels the first job when the first row is picked", async () => {
       // The other direction — an off-by-one or a last-match resolver would pass
       // the test above and fail this one.
-      const first = await addJob(NAME_A);
-      const second = await addJob(NAME_B);
+      const first = addJob(NAME_A);
+      const second = addJob(NAME_B);
       const { ctx } = makeCtx({ pick: (labels) => labels[0] });
 
       await showSchedulesMenu(ctx, scheduler);
@@ -130,8 +130,8 @@ describe("showSchedulesMenu", async () => {
     it("shows the SELECTED job's untruncated details in the confirm dialog", async () => {
       // Guards the half of the bug the user could never catch: deleting the
       // right job while confirming against the wrong one, or vice versa.
-      await addJob(NAME_A);
-      await addJob(NAME_B);
+      addJob(NAME_A);
+      addJob(NAME_B);
       const { ctx, confirm } = makeCtx({ pick: (labels) => labels[1] });
 
       await showSchedulesMenu(ctx, scheduler);
@@ -143,7 +143,7 @@ describe("showSchedulesMenu", async () => {
     it("cancels the right job past the single-digit boundary", async () => {
       // 11 rows: insurance against any refactor that parses the number back out
       // of the label and confuses "1" with "11".
-      const jobs = await Promise.all(Array.from({ length: 11 }, (_, i) => addJob(`review the auth module ${i}`)));
+      const jobs = Array.from({ length: 11 }, (_, i) => addJob(`review the auth module ${i}`));
       const { ctx } = makeCtx({ pick: (labels) => labels[10] });
 
       await showSchedulesMenu(ctx, scheduler);
@@ -155,7 +155,7 @@ describe("showSchedulesMenu", async () => {
   });
 
   it("cancels nothing when the picker returns a label we never offered", async () => {
-    await addJob("alpha job");
+    addJob("alpha job");
     const { ctx, confirm } = makeCtx({ pick: () => "something else entirely" });
 
     await showSchedulesMenu(ctx, scheduler);
@@ -165,8 +165,8 @@ describe("showSchedulesMenu", async () => {
   });
 
   it("leaves every job intact when the user escapes the picker", async () => {
-    await addJob("alpha job");
-    await addJob("beta job");
+    addJob("alpha job");
+    addJob("beta job");
     const { ctx, confirm } = makeCtx({ pick: () => undefined });
 
     await showSchedulesMenu(ctx, scheduler);
@@ -176,7 +176,7 @@ describe("showSchedulesMenu", async () => {
   });
 
   it("leaves the job intact when the user declines the confirm", async () => {
-    await addJob("alpha job");
+    addJob("alpha job");
     const { ctx, notify } = makeCtx({ pick: (labels) => labels[0], confirm: false });
 
     await showSchedulesMenu(ctx, scheduler);

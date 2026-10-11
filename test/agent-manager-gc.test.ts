@@ -5,40 +5,21 @@
 // the running/queued skip disposes a LIVE agent's session mid-run.
 //
 // It lives in its own file because vi.useFakeTimers() has to be installed
-// BEFORE `fixtureManager()` (the constructor starts the interval), and fake
+// BEFORE `new AgentManager()` (the constructor starts the interval), and fake
 // timers are hostile to the promise-settling style of the main suite.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
-import type * as TaskRuntime from "../src/task-worktree.js";
-
-vi.mock("../src/task-worktree.js", async importOriginal => {
-  const actual = await importOriginal<typeof TaskRuntime>();
-  return { ...actual, TaskAuthority: class {
-    private record?: TaskRuntime.TaskRecord;
-    async claim(identity: TaskRuntime.TaskIdentity, access: TaskRuntime.TaskAccess) {
-      this.record = { version: 1, repository_id: "fixture-repository", task_id: identity.task_id, generation: identity.generation,
-        checkout: identity.repository, branch: "fixture", base_oid: "a".repeat(40), head_oid: "a".repeat(40),
-        private_git_dir: "/tmp/fixture-git", checkout_dev: 1, checkout_ino: 1, private_dev: 1, private_ino: 1,
-        state: "open", scratch: "/tmp/fixture-scratch", evidence: "/tmp/fixture-evidence", preservation: null, disposable_targets: [], token: "fixture-token", access };
-      return this.record;
-    }
-    async verify() { return this.record; }
-    async release() {}
-    async close() {}
-  } };
-});
-
-function fixtureManager(...args: ConstructorParameters<typeof AgentManager>): AgentManager {
-  const manager = new AgentManager(...args);
-  manager.setTaskBinding({ repository: "/tmp", repository_id: "fixture-repository", task_id: "explicit-gc-fixture", generation: 1,
-    checkout: "/tmp", base_oid: "a".repeat(40), access: "write", configCwd: "/tmp" });
-  return manager;
-}
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+}));
+
+vi.mock("../src/worktree.js", () => ({
+  createWorktree: vi.fn(),
+  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
+  pruneWorktrees: vi.fn(),
 }));
 
 import { runAgent } from "../src/agent-runner.js";
@@ -70,14 +51,14 @@ describe("AgentManager — record GC", () => {
       aborted: false,
       steered: false,
     } as any);
-    manager ??= fixtureManager();
+    manager ??= new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", prompt, { description: prompt, isBackground: true });
     await manager.getRecord(id)!.promise;
     return { id, record: manager.getRecord(id)! };
   }
 
   it("keeps a record that completed inside the retention window", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     const { id, record } = await settled("recent");
     // Age at sweep time is (TEN_MINUTES - 2*TICK) + TICK — just inside the window.
     // Advancing the timers moves Date.now() too, so the margin has to outlast it.
@@ -89,7 +70,7 @@ describe("AgentManager — record GC", () => {
   });
 
   it("evicts a record that completed before the cutoff and disposes its session", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     const { id, record } = await settled("stale");
     const dispose = vi.fn();
     record.session = { dispose } as any;
@@ -107,7 +88,7 @@ describe("AgentManager — record GC", () => {
     // subagent finishes. Disposing only invalidates the ExtensionRunner, so whatever
     // an extension armed in `session_start` stayed armed — and its next tick threw
     // `assertActive()` from a bare timer callback, killing interactive pi.
-    manager = fixtureManager();
+    manager = new AgentManager();
     const { id, record } = await settled("stale");
     const emit = vi.fn(async () => {});
     const dispose = vi.fn();
@@ -130,7 +111,7 @@ describe("AgentManager — record GC", () => {
     // A live agent's session being disposed mid-run is the worst failure this
     // guard prevents, and `completedAt` on a running record is meaningless.
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    manager = fixtureManager();
+    manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "live", { description: "live", isBackground: true });
     const record = manager.getRecord(id)!;
     expect(record.status).toBe("running");
@@ -146,7 +127,7 @@ describe("AgentManager — record GC", () => {
 
   it("never evicts a queued agent", async () => {
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    manager = fixtureManager(undefined, 1);
+    manager = new AgentManager(undefined, 1);
     manager.spawn(mockPi, mockCtx, "X", "holder", { description: "holder", isBackground: true });
     const queuedId = manager.spawn(mockPi, mockCtx, "X", "waiter", { description: "waiter", isBackground: true });
     const queued = manager.getRecord(queuedId)!;
@@ -161,7 +142,7 @@ describe("AgentManager — record GC", () => {
   it("sweeps repeatedly, not just once", async () => {
     // The interval must keep firing: a record that ages past the cutoff on a
     // later tick has to be collected too.
-    manager = fixtureManager();
+    manager = new AgentManager();
     const { id, record } = await settled("ages-out");
     record.completedAt = Date.now() - (TEN_MINUTES - 3 * TICK);
 
@@ -193,7 +174,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
       aborted: false,
       steered: false,
     } as any);
-    manager ??= fixtureManager();
+    manager ??= new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, type, prompt, { description: prompt, isBackground: true });
     const record = manager.getRecord(id)!;
     await record.promise;
@@ -203,7 +184,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   }
 
   it("keeps an evicted agent reachable by name when its session is on disk", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "audit the RPC path", "/sessions/explore.jsonl");
 
     await vi.advanceTimersByTimeAsync(TICK);
@@ -218,7 +199,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   it("leaves nothing behind when the session was only ever in memory", async () => {
     // Without a file there is no conversation to reopen, so promising a resume
     // would be a lie — the mention has to fall through to starting a new agent.
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "ephemeral", undefined);
 
     await vi.advanceTimersByTimeAsync(TICK);
@@ -228,7 +209,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   });
 
   it("holds the evicted handle so a later agent of the same type can't shadow it", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "first", "/sessions/first.jsonl");
     await vi.advanceTimersByTimeAsync(TICK);
 
@@ -240,7 +221,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   });
 
   it("prefers a live agent over a tombstone holding the same name", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "old", "/sessions/old.jsonl");
     await vi.advanceTimersByTimeAsync(TICK);
     // Give the live agent the tombstone's name directly: the collision this
@@ -255,7 +236,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   });
 
   it("drops the oldest once the cap is reached, keeping the most recent", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     for (let i = 0; i < 101; i++) {
       const { record } = await evictable("Explore", `run-${i}`, `/sessions/${i}.jsonl`);
       // Distinct ages so "oldest" is well defined; run-0 is the oldest. Set on
@@ -273,7 +254,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   it("hands a reclaimed name straight back, numbering nothing", async () => {
     // The resume path's whole contract: `handleBase(type)` cannot reproduce a
     // numbered handle, so the spawn takes the tombstone's names verbatim.
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "first", "/sessions/first.jsonl");
     manager.spawn(mockPi, mockCtx, "Explore", "second", { description: "second", isBackground: true });
     await vi.advanceTimersByTimeAsync(TICK);
@@ -289,11 +270,10 @@ describe("AgentManager — tombstones outliving the GC", () => {
   });
 
   it("ignores a reclaim on a nested child, which has no name to hold", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
     const id = manager.spawn(mockPi, mockCtx, "Explore", "child", {
       description: "child",
-      taskSnapshot: manager.getTaskBinding(),
       parentAgentId: "parent-id",
       reclaim: { handle: "explore", alias: "auth-audit" },
     } as any);
@@ -302,7 +282,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   });
 
   it("stops answering a name once its tombstone is dropped", async () => {
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "done", "/sessions/done.jsonl");
     await vi.advanceTimersByTimeAsync(TICK);
     expect(manager.resolveMention("explore")?.kind).toBe("tombstone");
@@ -316,7 +296,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   it("frees a dropped name for the next agent of that type", async () => {
     // Otherwise a resumed agent's own handle stays reserved by the corpse and
     // every later spawn climbs: explore-2, explore-3, …
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "done", "/sessions/done.jsonl");
     await vi.advanceTimersByTimeAsync(TICK);
     manager.dropTombstone("explore");
@@ -330,7 +310,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
   it("forgets every name when the session ends", async () => {
     // A handle from a conversation the user has left must not resolve, or
     // `@explore` reaches an agent they have no memory of starting.
-    manager = fixtureManager();
+    manager = new AgentManager();
     await evictable("Explore", "prior session", "/sessions/prior.jsonl");
     await vi.advanceTimersByTimeAsync(TICK);
     expect(manager.listTombstones()).toHaveLength(1);

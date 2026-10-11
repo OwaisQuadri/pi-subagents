@@ -11,10 +11,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as TaskRuntime from "../src/task-worktree.js";
-import { declareTask, FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
 
-vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
+vi.mock("../src/worktree.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/worktree.js")>("../src/worktree.js");
+  return { ...actual, createWorktree: vi.fn(() => undefined) };
+});
 
 import subagentsExtension from "../src/index.js";
 
@@ -32,7 +33,6 @@ function boot() {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
-  wiringTasks(pi, ["startup-binding", "startup-worker"]);
   subagentsExtension(pi);
   return tools;
 }
@@ -78,11 +78,6 @@ describe("Agent startup failures fail the tool call (#179)", () => {
   for (const background of [false, true]) {
     it(`rejects instead of returning the diagnostic (run_in_background: ${background})`, async () => {
       const tools = boot();
-      declareTask(cwd, "startup-worker");
-      const owner = new FixtureTaskAuthority();
-      const identity = { repository: cwd, task_id: "startup-worker", generation: 1 };
-      const claim = await owner.claim(identity, "write", "startup-holder");
-      try {
 
       await expect(
         tools.get("Agent").execute(
@@ -96,8 +91,7 @@ describe("Agent startup failures fail the tool call (#179)", () => {
           },
           undefined, undefined, ctx(),
         ),
-      ).rejects.toThrow("TaskBusy");
-      } finally { await owner.release(identity, claim.token!); await owner.close(); }
+      ).rejects.toThrow('Cannot run with isolation: "worktree"');
     });
   }
 });
