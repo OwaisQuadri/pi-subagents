@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Task-owned checkouts** from #12 and #13. `Agent`, `SubagentWorkflow`, RPC spawns, and scheduled runs no longer take `task_id` or `task_access`, and `/agents task bind` is gone. Nothing launches the `worktree-hygiene` helper. Children run in the caller's working directory, or in a temporary git worktree with `isolation: "worktree"`.
+
 ### Added
 
 - **Separate child question tools** keep `ask_parent_question` limited to facts directly determined by permitted parent context and return `unavailable` otherwise. Explicit `ask_user_question` calls the existing root dialog service and preserves all selected answers; isolated children receive neither tool and each tool has its own denylist entry.
