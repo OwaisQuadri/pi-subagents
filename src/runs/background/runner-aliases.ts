@@ -30,7 +30,6 @@ export const HOST_PEER_ALIASES: ReadonlyArray<{ specifier: string; pkg: string; 
 	{ specifier: "typebox/value", pkg: "typebox", subpath: "./value" },
 ];
 
-/** Aliases needed only when the host requires the legacy chord package. */
 const CHORD_PEER_ALIASES = [
 	{ specifier: "@earendil-works/chord", pkg: "@earendil-works/chord", subpath: "." },
 	{ specifier: "@earendil-works/chord/context", pkg: "@earendil-works/chord", subpath: "./context" },
@@ -138,15 +137,13 @@ export function resolveHostPeerAliases(piPackageRoot: string): { aliases: Record
 	const aliases: Record<string, string> = {};
 	const missing: string[] = [];
 	const hostManifest = readManifest(piPackageRoot);
-	// The host's dependency manifest is authoritative; Pi 1.2.0 no longer uses chord.
-	// Without one, retain the known stable pre-chord exemption and otherwise fail closed.
 	const dependencies = hostManifest?.dependencies;
 	const stableVersion = typeof hostManifest?.version === "string" ? /^0\.(\d+)\.\d+$/.exec(hostManifest.version) : null;
 	const isPreChord = stableVersion !== null && Number(stableVersion[1]) < 85;
-	const requiresChord = dependencies && typeof dependencies === "object" && !Array.isArray(dependencies)
+	const isChordRequired = dependencies && typeof dependencies === "object" && !Array.isArray(dependencies)
 		? Object.hasOwn(dependencies, "@earendil-works/chord")
 		: !isPreChord;
-	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(requiresChord ? CHORD_PEER_ALIASES : [])];
+	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(isChordRequired ? CHORD_PEER_ALIASES : [])];
 	for (const { specifier, pkg, subpath, optional } of required) {
 		const packageDir = findPeerPackageDir(piPackageRoot, pkg, hostManifest?.name);
 		const target = packageDir ? resolvePackageSubpath(packageDir, subpath) : undefined;
