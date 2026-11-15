@@ -639,7 +639,7 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
   // Only the owner can read a nested child's result, so once the owner is gone
   // an unread child has no reader left to be spared for.
   it("clearCompleted(true) removes unread nested descendants along with their removed parent", async () => {
-    manager = new AgentManager();
+    manager = fixtureManager();
     resolvedRun();
 
     const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
@@ -668,7 +668,7 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
   });
 
   it("clearCompleted(true) keeps an unread nested child while its parent stays", async () => {
-    manager = new AgentManager();
+    manager = fixtureManager();
     resolvedRun();
 
     const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
@@ -817,7 +817,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
   // The workflow host reads the record inside these hooks to report a running
   // row's counters (#298), so the record must already include the event.
   it("updates the record before forwarding a spawn's activity and usage hooks", async () => {
-    manager = new AgentManager();
+    manager = fixtureManager();
     vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
       // A real child does work first; by then spawn() has returned the id.
       await new Promise(resolve => setTimeout(resolve, 0));
@@ -913,7 +913,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
   // same way: a hard abort is "aborted", a wrap-up is "steered".
   describe("resume() turn-limit outcome (#368)", () => {
     async function spawnSettled() {
-      manager = new AgentManager();
+      manager = fixtureManager();
       vi.mocked(runAgent).mockResolvedValue({
         responseText: "first",
         session: mockSession() as any,
@@ -939,7 +939,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     });
 
     it("falls back to the limit the agent was spawned with when the caller passes none", async () => {
-      manager = new AgentManager();
+      manager = fixtureManager();
       vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: mockSession() as any, aborted: false, steered: false });
       const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
         description: "test",
@@ -989,7 +989,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
       await manager.resume(id, "more", cancelled.signal);
 
       expect(manager.getRecord(id)!.status).toBe("stopped");
-      expect(runSignal?.aborted).toBe(true);
+      expect(runSignal).toBeUndefined();
     });
 
     it("inline: a steered resume ends steered, an aborted one aborted", async () => {
@@ -1933,13 +1933,14 @@ describe("AgentManager — pendingSteers flush", () => {
     );
 
     const onSteered = vi.fn();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onSteered);
+    manager = fixtureManager(undefined, undefined, undefined, undefined, undefined, onSteered);
     const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "p", isBackground: true });
     const record = manager.getRecord(id)!;
 
     expect(manager.steer(id, "before session")).toBe(true);
     expect(onSteered).toHaveBeenLastCalledWith(record, "before session");
 
+    await vi.waitFor(() => expect(createSession).toBeDefined());
     createSession!();
     expect(manager.steer(id, "live")).toBe(true);
     expect(steer).toHaveBeenLastCalledWith("live");

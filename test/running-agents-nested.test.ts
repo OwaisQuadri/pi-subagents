@@ -7,6 +7,10 @@
  * Workflow agents stay out: the workflow inspector covers them.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, fixturePromise, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -46,10 +50,11 @@ function boot() {
     settings: { outputTranscript: false, schedulingEnabled: false, defaultJoinMode: "async" },
   });
   const b = makePi();
+  wiringTasks(b.pi, ["nested-binding", "nested-parent", "nested-child", "nested-workflow"]);
   subagentsExtension(b.pi);
   booted = b.lifecycle;
   vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any, opts: any) =>
-    new Promise<any>(() => {
+    fixturePromise<any>(() => {
       opts.onSessionCreated?.({
         dispose: vi.fn(),
         subscribe: vi.fn(() => () => {}),
@@ -59,12 +64,12 @@ function boot() {
       if (prompt !== "parent") return;
       const manager = opts.nestedRuntime.manager;
       manager.spawn(b.pi, ctx(), "Explore", "child", {
-        description: "nested job", parentAgentId: opts.agentId, depth: 2, isBackground: true,
+        description: "nested job", parentAgentId: opts.agentId, depth: 2, isBackground: true, task_id: "nested-child",
       });
       manager.spawn(b.pi, ctx(), "general-purpose", "workflow", {
-        description: "workflow job", workflowId: "wf-1", isBackground: true,
+        description: "workflow job", workflowId: "wf-1", isBackground: true, task_id: "nested-workflow",
       });
-    }) as any,
+    }, opts.signal) as any,
   );
   return b;
 }

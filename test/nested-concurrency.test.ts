@@ -2,6 +2,10 @@
 // spawns over it; see the guard in AgentManager.spawn.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, fixturePromise, settleFixtureWorkers } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 import { AgentManager } from "../src/agent-manager.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
 
@@ -11,9 +15,6 @@ vi.mock("../src/agent-runner.js", () => ({
 }));
 
 vi.mock("../src/worktree.js", () => ({
-  createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
@@ -26,28 +27,32 @@ const mockCtx = { cwd: "/tmp" } as any;
 function controllableRuns() {
   const resolvers = new Map<string, () => void>();
   vi.mocked(runAgent).mockClear();
-  vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any) =>
-    new Promise<any>(resolve => {
+  vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any, options: any) =>
+    fixturePromise<any>(resolve => {
       resolvers.set(prompt as string, () => resolve({
         responseText: `${prompt}-result`,
         session: { dispose: vi.fn() },
         aborted: false,
         steered: false,
       }));
-    }),
+    }, options.signal),
   );
   return resolvers;
 }
 
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
+let taskIndex = 0;
+const taskSnapshot = () => declareTask("/tmp", `nested-concurrency-${taskIndex++}`);
+
 const top = (manager: AgentManager, prompt: string) =>
-  manager.spawn(mockPi, mockCtx, "general-purpose", prompt, { description: prompt, isBackground: true });
+  manager.spawn(mockPi, mockCtx, "general-purpose", prompt, { description: prompt, isBackground: true, taskSnapshot: taskSnapshot() });
 
 const nested = (manager: AgentManager, prompt: string, options: any = {}) =>
   manager.spawn(mockPi, mockCtx, "general-purpose", prompt, {
     description: prompt,
     isBackground: true,
+    taskSnapshot: taskSnapshot(),
     parentAgentId: "parent",
     depth: 2,
     ...options,
@@ -58,8 +63,10 @@ const LIMIT_MESSAGE = /Concurrent nested subagent limit reached\. You can run 2 
 describe("maxConcurrentNested", () => {
   let manager: AgentManager;
 
-  afterEach(() => {
-    manager?.dispose();
+  afterEach(async () => {
+    manager?.abortAll();
+    settleFixtureWorkers();
+    await manager?.dispose();
   });
 
   it("defaults to 10", () => {
@@ -151,13 +158,16 @@ describe("maxConcurrentNested", () => {
       maxSubagentDepth: 3,
       allowedSubagents: "all",
       configCwd: "/tmp",
+      taskSnapshot: declareTask("/tmp", "nested-concurrency-parent"),
     });
+    declareTask("/tmp", "nested-concurrency-child-3");
 
     const result = await (agent as any).execute("call-1", {
       subagent_type: "general-purpose",
       description: "child-3",
       prompt: "child-3",
       run_in_background: runInBackground,
+      task_id: "nested-concurrency-child-3",
     }, undefined, undefined, { cwd: "/tmp", model: undefined, modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] } });
 
     expect(result.isError).toBe(true);

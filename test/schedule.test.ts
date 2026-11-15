@@ -291,7 +291,7 @@ describe("SubagentScheduler — fire path", async () => {
   });
 
   it("a throwing store at completion emits an error instead of an unhandled rejection", async () => {
-    const job = scheduler.addJob({
+    const job = await scheduler.addJob({
       name: "contended-finalize", description: "tick", schedule: "10s",
       subagent_type: "general-purpose", prompt: "tick",
     });
@@ -310,8 +310,8 @@ describe("SubagentScheduler — fire path", async () => {
     expect(manager.spawn).toHaveBeenCalledTimes(1);
   });
 
-  it("a throwing store when a one-shot auto-disables emits an error and no update", () => {
-    const job = scheduler.addJob({
+  it("a throwing store when a one-shot auto-disables emits an error and no update", async () => {
+    const job = await scheduler.addJob({
       name: "contended-once", description: "once", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "once",
     });

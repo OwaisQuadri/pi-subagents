@@ -12,7 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as TaskRuntime from "../src/task-worktree.js";
-import { declareTask, FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+import { declareTask, FixtureTaskAuthority, heldWorker, wiringTasks } from "./helpers/task-fixture.js";
 
 vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
@@ -422,6 +422,7 @@ describe("reporting subagent usage back to the parent session", () => {
           spawned = true;
           const { manager, parentAgentId } = opts.nestedRuntime;
           const childId = manager.spawn(pi, ctx(), "general-purpose", "sub", {
+            taskSnapshot: declareTask(process.cwd(), "usage-clamped-child"),
             description: "clamped",
             isBackground: false,
             parentAgentId,
@@ -458,7 +459,7 @@ describe("reporting subagent usage back to the parent session", () => {
           messages: [],
         };
         opts.onSessionCreated?.(fake);
-        return new Promise(() => {});
+        return heldWorker({ responseText: "held", session: fake, aborted: false, steered: false } as any, undefined, opts.signal);
       });
 
       await tools.get("Agent").execute(
@@ -490,6 +491,7 @@ describe("reporting subagent usage back to the parent session", () => {
           nested = true;
           const { manager, parentAgentId } = opts.nestedRuntime;
           const childId = manager.spawn(pi, ctx(), "general-purpose", "sub", {
+            taskSnapshot: declareTask(process.cwd(), "usage-nested-child"),
             description: "nested",
             isBackground: false,
             parentAgentId,

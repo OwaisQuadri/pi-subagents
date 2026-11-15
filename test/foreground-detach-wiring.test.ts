@@ -16,6 +16,10 @@
  * `conversation-viewer.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, fixturePromise, settleFixtureWorkers, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -69,6 +73,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  settleFixtureWorkers();
   await booted?.get("session_shutdown")?.();
   delete (globalThis as any)[MANAGER_KEY];
   booted = undefined;
@@ -81,6 +86,7 @@ function boot(settings: Record<string, unknown> = {}) {
     settings: { outputTranscript: false, schedulingEnabled: false, defaultJoinMode: "async", ...settings },
   });
   const b = makePi();
+  wiringTasks(b.pi, Array.from({ length: 12 }, (_, i) => `detach-wiring-${i}`));
   subagentsExtension(b.pi);
   booted = b.lifecycle;
   return b;
@@ -92,7 +98,7 @@ function controllableRuns() {
   const options = new Map<string, any>();
   const finishers = new Map<string, (text: string) => void>();
   vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any, opts: any) =>
-    new Promise<any>(resolve => {
+    fixturePromise<any>(resolve => {
       const session = {
         dispose: vi.fn(),
         subscribe: vi.fn(() => () => {}),
@@ -105,7 +111,7 @@ function controllableRuns() {
       finishers.set(prompt, (text: string) => resolve({
         responseText: text, session, aborted: false, steered: false,
       }));
-    }) as any,
+    }, opts.signal) as any,
   );
   return {
     agentId: (prompt: string) => ids.get(prompt)!,

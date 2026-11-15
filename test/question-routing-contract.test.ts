@@ -11,6 +11,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession: mocks.createAgentSession,
   createEventBus: vi.fn(() => ({ emit: vi.fn(), on: vi.fn(() => () => {}) })),
+  createCodemodeExtension: () => () => {},
+  createMcpExtension: () => () => {},
+  createToolSearchExtension: () => () => {},
   defineTool: (definition: unknown) => definition,
   DefaultResourceLoader: class {
     async reload() {}
@@ -35,7 +38,7 @@ vi.mock("../src/agent-types.js", () => ({
   getToolNamesForType: () => ["read"],
 }));
 vi.mock("../src/env.js", () => ({ detectEnv: async () => ({ isGitRepo: false }) }));
-vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: () => "Resolve the source path." }));
+vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: () => "Resolve the source path.", inheritableParentPrompt: (rendered: string) => rendered }));
 vi.mock("../src/nested-tools.js", () => ({ getMaxSubagentDepth: () => 2 }));
 
 interface Result {
@@ -146,6 +149,7 @@ async function childTools(root: ReturnType<typeof service>, isIsolated = false) 
   await runAgent({
     cwd: "/repo",
     modelRegistry: {},
+    isProjectTrusted: () => true,
     getSystemPrompt: () => "Parent system prompt",
     sessionManager: { getBranch },
   } as unknown as ExtensionContext, "question-contract", "Resolve the source path.", {
@@ -280,6 +284,7 @@ describe("distinct child question recipients", () => {
       await runAgent({
         cwd: "/repo",
         modelRegistry: {},
+        isProjectTrusted: () => true,
         getSystemPrompt: () => "Parent system prompt",
         sessionManager: { getBranch },
       } as unknown as ExtensionContext, "question-contract", "Resolve the source path.", {

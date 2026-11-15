@@ -3210,7 +3210,7 @@ describe("agent-runner thinking level inheritance", () => {
     }));
   });
 
-  it("prefers the agent config over the parent session level", async () => {
+  it("prefers the parent session level over the agent config for a new child", async () => {
     const { session } = createSession("CONFIG");
     createAgentSession.mockResolvedValue({ session });
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ thinking: "low" }) as any);
@@ -3218,7 +3218,7 @@ describe("agent-runner thinking level inheritance", () => {
     await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "Say CONFIG", { pi });
 
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      thinkingLevel: "low",
+      thinkingLevel: "medium",
     }));
   });
 

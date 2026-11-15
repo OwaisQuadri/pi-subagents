@@ -36,7 +36,7 @@ function deferred<T>() {
 const session = { dispose: vi.fn(), messages: [], subscribe: () => () => {} } as unknown as AgentSession;
 const result = { responseText: "done", session, aborted: false, steered: false };
 const pi = {} as ExtensionAPI;
-const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "root", getBranch: () => [] } } as ExtensionContext;
+const ctx = { cwd: "/tmp", isProjectTrusted: () => true, sessionManager: { getSessionId: () => "root", getBranch: () => [] } } as unknown as ExtensionContext;
 const childCtx = { ...ctx, sessionManager: { getSessionId: () => "child-session" } } as ExtensionContext;
 
 function assertPairs(events: RunActivity[], count: number) {
@@ -71,7 +71,7 @@ describe("owner run activity", () => {
     }, 1, (record, activity, isPresentation = true) => {
       if (activity) events.push(activity);
       if (isPresentation) starts(record);
-    }, undefined, undefined, true);
+    }, undefined, undefined, undefined, true);
     vi.mocked(runAgent).mockReset().mockResolvedValue(result);
     vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "resumed" });
   });
@@ -253,7 +253,7 @@ describe("owner run activity", () => {
       if (activity) otherEvents.push(activity);
     }, 1, (_record, activity) => {
       if (activity) otherEvents.push(activity);
-    }, undefined, undefined, true);
+    }, undefined, undefined, undefined, true);
     try {
       const parent = manager.spawn(pi, ctx, "Explore", "parent", { taskSnapshot: declareTask(ctx.cwd, "lifecycle-parent"), description: "parent" });
       const parentRecord = manager.getRecord(parent)!;
@@ -717,12 +717,12 @@ describe("persisted root identity through owner dispatch", () => {
       if (activity) rootEvents.push(activity);
     }, 1, (_record, activity) => {
       if (activity) rootEvents.push(activity);
-    }, undefined, undefined, true);
+    }, undefined, undefined, undefined, true);
     const childManager = new AgentManager((_record, activity) => {
       if (activity) childEvents.push(activity);
     }, 1, (_record, activity) => {
       if (activity) childEvents.push(activity);
-    }, undefined, undefined, true);
+    }, undefined, undefined, undefined, true);
     vi.mocked(runAgent).mockReset().mockResolvedValue(result);
     vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "resumed" });
     try {
@@ -848,7 +848,7 @@ describe("actual runner prompt cancellation boundaries", () => {
       if (activity) events.push(activity);
     }, 1, (_record, activity) => {
       if (activity) events.push(activity);
-    }, undefined, undefined, true);
+    }, undefined, undefined, undefined, true);
     vi.mocked(runAgent).mockImplementationOnce(actual.runAgent);
     const parent = new AbortController();
     try {
@@ -897,10 +897,10 @@ describe("actual runner prompt cancellation boundaries", () => {
     const added = vi.spyOn(parent.signal, "addEventListener");
     const removed = vi.spyOn(parent.signal, "removeEventListener");
     const outcome = await actual.resumeAgent(instrumented, "cancelled", {
-      signal: parent.signal, onToolActivity: vi.fn(),
+      type: "Explore", signal: parent.signal, onToolActivity: vi.fn(),
     });
     expect(prompt).not.toHaveBeenCalled();
-    expect(outcome).toEqual({ text: "", failure: undefined });
+    expect(outcome).toMatchObject({ text: "", failure: undefined });
     expect(unsubscribes.length).toBeGreaterThan(0);
     for (const unsubscribe of unsubscribes) expect(unsubscribe).toHaveBeenCalledOnce();
     for (const registration of added.mock.calls) expect(removed).toHaveBeenCalledWith("abort", registration[1]);

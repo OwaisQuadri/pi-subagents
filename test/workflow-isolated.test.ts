@@ -11,6 +11,10 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -18,16 +22,15 @@ vi.mock("../src/agent-runner.js", () => ({
 }));
 
 vi.mock("../src/worktree.js", () => ({
-  createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(async () => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(async () => {}),
   isWorktreeIsolationEnabled: vi.fn(() => false),
 }));
 
 import { AgentManager } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
-import { createWorkflowHost } from "../src/workflow/host.js";
+import { createWorkflowHost as createHost, type WorkflowHostOptions } from "../src/workflow/host.js";
+
+const createWorkflowHost = (options: WorkflowHostOptions) => createHost({ ...options, taskSnapshot: declareTask(options.ctx.cwd, "isolated-workflow") });
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { ctx } from "./helpers/boot-extension.js";
 

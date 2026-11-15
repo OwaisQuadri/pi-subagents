@@ -142,7 +142,7 @@ export function wiringTasks(pi: any, task_ids: readonly string[]): void {
       if (name === "session_start") {
         const [snapshot] = snapshots(ctx.cwd);
         const original = ctx.sessionManager.getBranch.bind(ctx.sessionManager);
-        const bound = { ...ctx, sessionManager: { ...ctx.sessionManager, getBranch: () => [{ type: "custom", customType: "subagents:task-binding", data: { version: 1, snapshot } }, ...original()] } };
+        const bound = Object.assign(Object.create(ctx), { sessionManager: { ...ctx.sessionManager, getBranch: () => [{ type: "custom", customType: "subagents:task-binding", data: { version: 1, snapshot } }, ...original()] } });
         return handler(event, bound);
       }
       const result = handler(event, ctx);

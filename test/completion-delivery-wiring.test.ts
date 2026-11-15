@@ -6,6 +6,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as AgentRunnerModule from "../src/agent-runner.js";
 import type * as WorktreeModule from "../src/worktree.js";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, fixturePromise, settleFixtureWorkers, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof AgentRunnerModule>("../src/agent-runner.js");
@@ -16,15 +20,12 @@ vi.mock("../src/worktree.js", async () => {
   const actual = await vi.importActual<typeof WorktreeModule>("../src/worktree.js");
   return {
     ...actual,
-    createWorktree: vi.fn(),
-    cleanupWorktree: vi.fn(async () => ({ hasChanges: false })),
     isWorktreeIsolationEnabled: vi.fn(() => true),
   };
 });
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
-import { createWorktree } from "../src/worktree.js";
 import { type BootedPi, ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
@@ -33,6 +34,7 @@ let booted: BootedPi | undefined;
 let hermetic: Hermetic | undefined;
 
 afterEach(async () => {
+  settleFixtureWorkers();
   await booted?.lifecycle.get("session_shutdown")?.();
   delete (globalThis as any)[MANAGER_KEY];
   booted = undefined;
@@ -40,7 +42,6 @@ afterEach(async () => {
   hermetic = undefined;
   vi.mocked(runAgent).mockReset();
   vi.mocked(resumeAgent).mockReset();
-  vi.mocked(createWorktree).mockReset();
   vi.useRealTimers();
 });
 
@@ -48,6 +49,7 @@ afterEach(async () => {
 async function boot(settings: Record<string, unknown> = {}) {
   hermetic = hermeticDir({ settings: { outputTranscript: false, schedulingEnabled: false, ...settings } });
   booted = makePi();
+  wiringTasks(booted.pi, Array.from({ length: 12 }, (_, i) => `delivery-${i}`));
   subagentsExtension(booted.pi);
   const parent = { running: true };
   const signal = new AbortController().signal;
@@ -60,15 +62,15 @@ async function boot(settings: Record<string, unknown> = {}) {
 /** Runs that settle only when `settle(description)` is called. */
 function controllableRuns() {
   const finishers = new Map<string, () => void>();
-  vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any) =>
-    new Promise<any>(resolve => {
+  vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any, opts: any) =>
+    fixturePromise<any>(resolve => {
       finishers.set(prompt, () => resolve({
         responseText: `${prompt} done`, session: { dispose: vi.fn(), messages: [] }, aborted: false, steered: false,
       }));
-    }) as any,
+    }, opts?.signal) as any,
   );
-  vi.mocked(resumeAgent).mockImplementation((_s: any, prompt: string) =>
-    new Promise(resolve => { finishers.set(prompt, () => resolve({ text: `${prompt} done` })); }),
+  vi.mocked(resumeAgent).mockImplementation((_s: any, prompt: string, opts: any) =>
+    fixturePromise<any>(resolve => { finishers.set(prompt, () => resolve({ text: `${prompt} done` })); }, opts?.signal),
   );
   return { settle: (prompt: string) => finishers.get(prompt)!() };
 }
@@ -251,37 +253,6 @@ describe("a completion pending while its agent is resumed", () => {
 });
 
 describe("`group` join mode — one notification per turn's batch", () => {
-  /** A worktree copy that takes `ms`, or fails after it. */
-  function worktreeAfter(ms: number, ok = true) {
-    vi.mocked(createWorktree).mockImplementationOnce(async () => {
-      await new Promise((r) => setTimeout(r, ms));
-      return ok ? { path: "/tmp/wt", branch: "b", baseSha: "s", workPath: "/tmp/wt" } as any : undefined;
-    });
-  }
-
-  it("groups a turn's worktree spawns whose copies finish far apart", async () => {
-    vi.useFakeTimers();
-    const runs = controllableRuns();
-    const b = await boot({ defaultJoinMode: "group" });
-    worktreeAfter(0);
-    worktreeAfter(500);
-
-    const calls = Promise.all([
-      spawn(b, b.parentCtx, "fast-copy", { isolation: "worktree" }),
-      spawn(b, b.parentCtx, "slow-copy", { isolation: "worktree" }),
-    ]);
-    await vi.advanceTimersByTimeAsync(500);
-    await calls;
-    turnEnd(b);
-
-    runs.settle("fast-copy");
-    runs.settle("slow-copy");
-    await vi.advanceTimersByTimeAsync(1_000);
-    turnEnd(b);
-
-    expect(sentContents(b)).toEqual([expect.stringContaining("Background agent group completed: 2 agent(s) finished")]);
-  });
-
   it("delivers a batch that finished before its turn ended, once, at that turn's end", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();
@@ -358,27 +329,5 @@ describe("`group` join mode — one notification per turn's batch", () => {
     await vi.advanceTimersByTimeAsync(1_000);
 
     expect(sentContents(b)).toEqual([expect.stringContaining("mentioned done")]);
-  });
-
-  it("does not hold a sibling for a spawn whose worktree failed late", async () => {
-    vi.useFakeTimers();
-    const runs = controllableRuns();
-    const b = await boot({ defaultJoinMode: "group" });
-    worktreeAfter(500, false);
-
-    const calls = Promise.allSettled([
-      spawn(b, b.parentCtx, "doomed", { isolation: "worktree" }),
-      spawn(b, b.parentCtx, "sibling"),
-    ]);
-    await vi.advanceTimersByTimeAsync(500);
-    const [doomed] = await calls;
-    expect(doomed.status).toBe("rejected");
-    turnEnd(b);
-
-    runs.settle("sibling");
-    await vi.advanceTimersByTimeAsync(1_000);
-    turnEnd(b);
-
-    expect(sentContents(b)).toEqual([expect.stringContaining("sibling done")]);
   });
 });

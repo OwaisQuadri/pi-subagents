@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 import type { Context } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentCall, isSubagentContext, type PrintModeRun, runPrintMode } from "./helpers/print-mode-runner.js";
+import { taskHelper, taskHelperTitle } from "./helpers/task-fixture.js";
+
+const TASK_BINARY = taskHelper();
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -24,7 +27,7 @@ function parentHasCompletion(context: Context): boolean {
   );
 }
 
-describe("background completion steering scheduling", () => {
+describe.skipIf(!TASK_BINARY)(taskHelperTitle("background completion steering scheduling"), () => {
   let run: PrintModeRun | undefined;
   let cwd: string | undefined;
   let releaseBlockedTool: (() => void) | undefined;
@@ -94,6 +97,7 @@ describe("background completion steering scheduling", () => {
 
     const runPromise = runPrintMode({
       cwd,
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       hold: false,
       // Pinned faux: the scheduling assertions count scripted model calls, so the
       // pre-publish smoke's global `PI_E2E_LIVE=1` must not swap a real model in.
@@ -189,6 +193,7 @@ describe("background completion steering scheduling", () => {
 
     const runPromise = runPrintMode({
       cwd,
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-binding", "sdk-first", "sdk-second"] },
       hold: false,
       live: false, // scripted on purpose: the blocking tool and the timing are the test
       extensionPaths: [BLOCKING_TOOL_EXTENSION],
@@ -198,8 +203,8 @@ describe("background completion steering scheduling", () => {
         parentModelCalls++;
         if (parentModelCalls === 1) {
           return [
-            agentCall({ description: "first child", prompt: "first", run_in_background: true }, { id: "agent-1" }),
-            agentCall({ description: "second child", prompt: "second", run_in_background: true }, { id: "agent-2" }),
+            agentCall({ task_id: "sdk-first", description: "first child", prompt: "first", run_in_background: true }, { id: "agent-1" }),
+            agentCall({ task_id: "sdk-second", description: "second child", prompt: "second", run_in_background: true }, { id: "agent-2" }),
             { type: "toolCall" as const, id: "blocking-call", name: "blocking_tool", arguments: {} },
           ];
         }

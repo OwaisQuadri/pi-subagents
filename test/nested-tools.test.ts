@@ -57,7 +57,7 @@ function tools(
 
 /** A nested writer needs a task distinct from the parent's; pass `task_id: undefined` to omit it. */
 async function execute(tool: any, params: Record<string, unknown>, executionCwd = cwd) {
-  return tool.execute("call-1", { task_id: "nested-child-fixture", ...params }, undefined, undefined, ctx(executionCwd));
+  return tool.execute("call-1", params.resume ? params : { task_id: "nested-child-fixture", ...params }, undefined, undefined, ctx(executionCwd));
 }
 
 beforeEach(() => {

@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as AgentRunnerModule from "../src/agent-runner.js";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof AgentRunnerModule>("../src/agent-runner.js");
@@ -28,7 +32,7 @@ function makePi() {
   const handlers = new Map<string, (...args: never[]) => unknown>();
 
   return {
-    pi: {
+    pi: withTasks({
       registerMessageRenderer: vi.fn(),
       registerTool: vi.fn((tool: RegisteredTool) => {
         tools.set(tool.name, tool);
@@ -46,10 +50,15 @@ function makePi() {
       },
       appendEntry: vi.fn(),
       sendMessage: vi.fn(),
-    } as never,
+    }) as never,
     tools,
     handlers,
   };
+}
+
+function withTasks<T>(pi: T): T {
+  wiringTasks(pi, ["notify-binding", "notify-A", "notify-B"]);
+  return pi;
 }
 
 function makeHeadlessCtx() {
@@ -77,7 +86,7 @@ function makeHeadlessCtx() {
 function completedRun() {
   return {
     responseText: "done",
-    session: { dispose: vi.fn() },
+    session: { dispose: vi.fn(), messages: [] },
     aborted: false,
     steered: false,
   } as Awaited<ReturnType<typeof runAgent>>;

@@ -18,6 +18,9 @@ import type { Context } from "@earendil-works/pi-ai";
 import { fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentCall, agentToolResults, type PrintModeRun, routeBySession, runPrintMode } from "../helpers/print-mode-runner.js";
+import { taskHelper, taskHelperTitle } from "../helpers/task-fixture.js";
+
+const TASK_BINARY = taskHelper();
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -31,7 +34,7 @@ function toolResult(context: Context, toolName: string): string | undefined {
   return msg ? ((msg.content ?? []) as Array<{ text?: string }>).map((b) => b.text ?? "").join("") : undefined;
 }
 
-describe("bare mcp__ entries in tools: (real pi MCP, stdio server, faux model)", () => {
+describe.skipIf(!TASK_BINARY)(taskHelperTitle("bare mcp__ entries in tools: (real pi MCP, stdio server, faux model)"), () => {
   let run: PrintModeRun | undefined;
   let cwd: string | undefined;
 
@@ -53,6 +56,7 @@ describe("bare mcp__ entries in tools: (real pi MCP, stdio server, faux model)",
     run = await runPrintMode({
       prompt: "Delegate to mcp-test.",
       cwd,
+      taskFixture: { binary: TASK_BINARY, task_ids: ["sdk-native"] },
       live: false,
       // Globals are isolated by now: the agent dir is a temp dir pi's MCP reads.
       beforeRun: () => {

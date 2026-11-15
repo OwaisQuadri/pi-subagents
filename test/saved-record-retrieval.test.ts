@@ -11,6 +11,10 @@
  * same lookup as an evicted record: the manager has no record for the id.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -44,6 +48,7 @@ afterEach(async () => {
 function boot(branch: any[]) {
   const { pi, tools, lifecycle } = makePi();
   pi.appendEntry = vi.fn((customType: string, data: unknown) => branch.push({ type: "custom", customType, data }));
+  wiringTasks(pi, ["saved-binding", "saved-A", "saved-B", "saved-C"]);
   subagentsExtension(pi);
   booted = lifecycle;
   return { tools, lifecycle };
@@ -61,7 +66,7 @@ async function finishedAgent(
 ): Promise<string> {
   vi.mocked(runAgent).mockResolvedValue({
     responseText: "THE-FULL-RESULT",
-    session: { dispose: vi.fn() } as any,
+    session: { dispose: vi.fn(), messages: [] } as any,
     aborted: false,
     steered: false,
     ...run,

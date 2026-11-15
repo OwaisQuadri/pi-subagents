@@ -17,6 +17,10 @@
 // limit. Those are asserted directly.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, fixturePromise, settleFixtureWorkers } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 import { AgentManager } from "../src/agent-manager.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -25,9 +29,6 @@ vi.mock("../src/agent-runner.js", () => ({
 }));
 
 vi.mock("../src/worktree.js", () => ({
-  createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(async () => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(async () => {}),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
@@ -42,7 +43,7 @@ function controllableRuns() {
   const resolvers = new Map<string, (aborted?: boolean) => void>();
   vi.mocked(runAgent).mockClear();
   vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any, options: any) =>
-    new Promise<any>(resolve => {
+    fixturePromise<any>(resolve => {
       const session = mockSession();
       options.onSessionCreated?.(session);
       resolvers.set(prompt as string, (aborted = false) => resolve({
@@ -51,7 +52,7 @@ function controllableRuns() {
         aborted,
         steered: false,
       }));
-    }),
+    }, options.signal),
   );
   return { resolvers };
 }
@@ -59,14 +60,19 @@ function controllableRuns() {
 /** Let queued microtasks (gate resolution, settle handlers) run. */
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
+let taskIndex = 0;
+const taskSnapshot = () => declareTask("/tmp", `detach-${taskIndex++}`);
+
 const fg = (manager: AgentManager, prompt: string, options: any = {}) =>
   manager.spawnAndWait(mockPi, mockCtx, "general-purpose", prompt, {
+    taskSnapshot: taskSnapshot(),
     description: prompt,
     ...options,
   });
 
 const bg = (manager: AgentManager, prompt: string, options: any = {}) =>
   manager.spawn(mockPi, mockCtx, "general-purpose", prompt, {
+    taskSnapshot: taskSnapshot(),
     description: prompt,
     isBackground: true,
     ...options,
@@ -86,6 +92,8 @@ describe("AgentManager.sendToBackground", () => {
   });
 
   afterEach(async () => {
+    manager?.abortAll();
+    settleFixtureWorkers();
     await manager?.dispose();
   });
 
@@ -264,6 +272,7 @@ describe("AgentManager.sendToBackground", () => {
     const workflowWait = fg(manager, "workflow-child", { workflowId: "wf-1" });
     // Detached `isBackground: false` (RPC / @handle / registry): nobody blocks on it.
     manager.spawn(mockPi, mockCtx, "general-purpose", "detached", {
+      taskSnapshot: taskSnapshot(),
       description: "detached",
       isBackground: false,
     });

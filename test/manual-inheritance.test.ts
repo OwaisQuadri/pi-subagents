@@ -24,7 +24,7 @@ vi.mock("@earendil-works/pi-coding-agent", async importOriginal => ({
   getAgentDir: () => process.cwd(),
   createEventBus: () => ({ on: () => () => {}, emit: () => {} }),
   SettingsManager: { create: () => ({ getSessionDir: () => undefined }) },
-  SessionManager: { create: () => ({}), inMemory: () => ({}), open: vi.fn(() => ({})) },
+  SessionManager: { create: () => ({}), inMemory: () => ({}), open: vi.fn(() => ({ getHeader: () => undefined })) },
   DefaultResourceLoader: class {
     async reload() {}
     getExtensions() { return { extensions: [] }; }
@@ -48,7 +48,7 @@ vi.mock("@earendil-works/pi-coding-agent", async importOriginal => ({
   },
 }));
 vi.mock("../src/env.js", () => ({ detectEnv: async () => ({ isGitRepo: false, branch: "", platform: "test" }) }));
-vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: () => "test" }));
+vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: () => "test", inheritableParentPrompt: (rendered: string) => rendered }));
 vi.mock("../src/custom-agents.js", () => ({ loadCustomAgents: () => definitions }));
 vi.mock("../src/settings.js", () => ({
   loadSettings: () => ({}),
@@ -93,7 +93,7 @@ beforeEach(() => {
   definitions.clear();
   setAgentOverrides({});
   registerAgents(definitions);
-  parent = makeContext({ model: models[0], thinkingLevel: "high", modelRegistry: registry });
+  parent = makeContext({ model: models[0], thinkingLevel: "high", modelRegistry: registry, isProjectTrusted: () => true });
   boot = makePi();
   boot.pi.getThinkingLevel = vi.fn(() => "low");
   boot.pi.exec = vi.fn(() => { throw new Error("Process execution forbidden"); });
@@ -235,7 +235,7 @@ it.each([false, true])("nested tool inherits its immediate caller, not root or p
     manager, pi: boot.pi, parentAgentId: "owner", depth: 1, maxSubagentDepth: 2,
     allowedSubagents: ["general-purpose"], configCwd: parent.cwd, taskSnapshot: declareTask(parent.cwd, "manual-parent"),
   }).find(tool => tool.name === "Agent")!;
-  const caller = makeContext({ model: models[1], thinkingLevel: "off", modelRegistry: registry });
+  const caller = makeContext({ model: models[1], thinkingLevel: "off", modelRegistry: registry, isProjectTrusted: () => true });
   for (const choices of [{}, { model: "fixture/explicit", thinking: "low" }, {}]) {
     const count = captures.length;
     await nested.execute("nested", {
@@ -280,7 +280,7 @@ it("runner injects nested tools without changing role permissions", async () => 
   expect(captures[0].tools).not.toContain("write");
   const nested = captures[0].customTools?.find((tool: ToolDefinition) => tool.name === "Agent");
   expect(nested).toBeDefined();
-  const caller = makeContext({ model: models[1], thinkingLevel: "low", modelRegistry: registry });
+  const caller = makeContext({ model: models[1], thinkingLevel: "low", modelRegistry: registry, isProjectTrusted: () => true });
   await nested!.execute("nested", { task_id: "manual-child", subagent_type: "Explore", prompt: "test", description: "test", isolated: true }, undefined, undefined, caller);
   expect(captures).toHaveLength(2);
   expect(captures[1].model).toBe(models[1]);

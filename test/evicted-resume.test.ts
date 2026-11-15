@@ -11,6 +11,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as TaskRuntime from "../src/task-worktree.js";
+import { declareTask, FixtureTaskAuthority, wiringTasks } from "./helpers/task-fixture.js";
+
+vi.mock("../src/task-worktree.js", async importOriginal => ({ ...await importOriginal<typeof TaskRuntime>(), TaskAuthority: FixtureTaskAuthority }));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -22,7 +26,7 @@ import { agentRecordEntryData, worktreeLost } from "../src/agent-record-entry.js
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import type { AgentRecord } from "../src/types.js";
-import { createWorkflowHost } from "../src/workflow/host.js";
+import { createWorkflowHost as createHost, type WorkflowHostOptions } from "../src/workflow/host.js";
 import { ctx, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
@@ -71,6 +75,7 @@ function settleWith(text: string, file: string | undefined) {
 function boot(branch: any[]) {
   const { pi, tools, lifecycle } = makePi();
   pi.appendEntry = vi.fn((customType: string, data: unknown) => branch.push({ type: "custom", customType, data }));
+  wiringTasks(pi, ["evicted-binding", "evicted-A", "evicted-B", "evicted-C"]);
   subagentsExtension(pi);
   booted = lifecycle;
   const context = ctx({ sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => branch) } });
@@ -275,10 +280,11 @@ describe("reclaiming an id", () => {
   it("refuses an id that is still live, rather than replacing its record", async () => {
     settleWith("FIRST-RUN", sessionFile);
     const manager = new AgentManager();
-    const { id } = await manager.spawnAndWait({} as any, ctx(), "general-purpose", "go", { description: "first" });
+    const taskSnapshot = declareTask(ctx().cwd, "evicted-reclaim");
+    const { id } = await manager.spawnAndWait({} as any, ctx(), "general-purpose", "go", { description: "first", taskSnapshot });
 
     expect(() =>
-      manager.spawn({} as any, ctx(), "general-purpose", "again", { description: "second", reclaim: { id }, resumeSessionFile: sessionFile }),
+      manager.spawn({} as any, ctx(), "general-purpose", "again", { description: "second", reclaim: { id }, resumeSessionFile: sessionFile, taskSnapshot }),
     ).toThrow(id);
     expect(manager.getRecord(id)?.description).toBe("first");
     manager.dispose();
@@ -324,6 +330,7 @@ describe("a workflow's resume once the manager evicted the child", () => {
   }
 
   const request = { agentId: "wf-agent-0", index: 0, prompt: "build it", label: "worker", agentType: "general-purpose" };
+  const createWorkflowHost = (options: WorkflowHostOptions) => createHost({ ...options, taskSnapshot: declareTask(options.ctx.cwd, "evicted-workflow") });
 
   it("reopens the child's saved session under the same id, still owned by the run", async () => {
     const stub = evictingManager(sessionFile);
